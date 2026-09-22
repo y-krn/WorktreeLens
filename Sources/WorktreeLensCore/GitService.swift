@@ -45,6 +45,14 @@ public final class GitService: @unchecked Sendable {
         _ = try run(["-C", repositoryPath, "branch", "-d", branch])
     }
 
+    public func deleteBranchVerified(repositoryPath: String, branch: String, expectedOldSHA: String) throws {
+        _ = try run(["-C", repositoryPath, "update-ref", "-d", "refs/heads/\(branch)", expectedOldSHA])
+    }
+
+    public func defaultBranchName(repositoryPath: String) throws -> String? {
+        try resolveDefaultBranch(canonicalRepositoryPath(repositoryPath))?.name
+    }
+
     /// Revalidates one branch without rebuilding the repository-wide snapshot.
     public func cleanupBranch(repositoryPath: String, name: String) throws -> BranchInfo? {
         let root = try canonicalRepositoryPath(repositoryPath)
@@ -132,7 +140,7 @@ public final class GitService: @unchecked Sendable {
         let branchWorktrees = worktrees.filter { $0.branch == name }
         let relation = defaultBranch.flatMap { defaultDelta(root: root, branch: name, defaultRef: $0.ref) } ?? (ahead: 0, behind: 0)
         let merged = defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false
-        return BranchInfo(id: name, name: name, sha: fields[1], upstream: fields[2].isEmpty ? nil : fields[2], ahead: aheadBehind.ahead, behind: aheadBehind.behind, isMerged: merged, remoteGone: tracking.contains("gone"), lastCommitAt: strictDate(fields[4]), isDefaultBranch: defaultBranch?.name == name, defaultAhead: relation.ahead, defaultBehind: relation.behind, worktrees: branchWorktrees)
+        return BranchInfo(id: name, name: name, sha: fields[1], upstream: fields[2].isEmpty ? nil : fields[2], ahead: aheadBehind.ahead, behind: aheadBehind.behind, isMerged: merged, remoteGone: tracking.contains("gone"), lastCommitAt: strictDate(fields[4]), isDefaultBranch: defaultBranch?.name == name, defaultAhead: relation.ahead, defaultBehind: relation.behind, worktrees: branchWorktrees, mergeEvidence: merged ? .gitAncestor : MergeEvidence.none)
     }
 
     private func worktreeList(repositoryPath: String, defaultBranch: DefaultBranch?, sessions: [SessionRecord]) throws -> [WorktreeInfo] {

@@ -78,7 +78,18 @@ public final class RepositoryScanService: @unchecked Sendable {
             return statuses
         }
         let enrichedBranches = local.snapshot.branches.map { branch in
-            BranchInfo(id: branch.id, name: branch.name, sha: branch.sha, upstream: branch.upstream, ahead: branch.ahead, behind: branch.behind, isMerged: branch.isMerged, remoteGone: branch.remoteGone, lastCommitAt: branch.lastCommitAt, isDefaultBranch: branch.isDefaultBranch, isDetachedGroup: branch.isDetachedGroup, defaultAhead: branch.defaultAhead, defaultBehind: branch.defaultBehind, worktrees: branch.worktrees, github: githubStatuses[branch.id] ?? .unavailable)
+            let status = githubStatuses[branch.id] ?? .unavailable
+            let evidence: MergeEvidence
+            if branch.mergeEvidence.isMerged {
+                evidence = branch.mergeEvidence
+            } else if let defaultBranch = local.snapshot.defaultBranch,
+                      let pullRequest = status.verifiedMergedPullRequest(defaultBranch: defaultBranch, branchName: branch.name, localSHA: branch.sha) {
+                evidence = .githubVerified(prNumber: pullRequest.number, mergedAt: pullRequest.mergedAt!)
+            } else {
+                evidence = .none
+            }
+            return BranchInfo(id: branch.id, name: branch.name, sha: branch.sha, upstream: branch.upstream, ahead: branch.ahead, behind: branch.behind, isMerged: branch.isMerged, remoteGone: branch.remoteGone, lastCommitAt: branch.lastCommitAt, isDefaultBranch: branch.isDefaultBranch, isDetachedGroup: branch.isDetachedGroup, defaultAhead: branch.defaultAhead, defaultBehind: branch.defaultBehind, worktrees: branch.worktrees, github: status)
+                .withMergeEvidence(evidence, github: status)
         }
         return RepositorySnapshot(path: local.snapshot.path, defaultBranch: local.snapshot.defaultBranch, branches: enrichedBranches)
     }

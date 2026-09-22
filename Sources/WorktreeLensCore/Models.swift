@@ -81,7 +81,7 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
     public let upstream: String?
     public let ahead: Int
     public let behind: Int
-    public let isMerged: Bool
+    public let mergeEvidence: MergeEvidence
     public let remoteGone: Bool
     public let lastCommitAt: Date?
     public let isDefaultBranch: Bool
@@ -91,14 +91,14 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
     public let worktrees: [WorktreeInfo]
     public let github: GitHubStatus
 
-    public init(id: String, name: String, sha: String, upstream: String?, ahead: Int, behind: Int, isMerged: Bool, remoteGone: Bool, lastCommitAt: Date?, isDefaultBranch: Bool = false, isDetachedGroup: Bool = false, defaultAhead: Int = 0, defaultBehind: Int = 0, worktrees: [WorktreeInfo], github: GitHubStatus = .unavailable) {
+    public init(id: String, name: String, sha: String, upstream: String?, ahead: Int, behind: Int, isMerged: Bool, remoteGone: Bool, lastCommitAt: Date?, isDefaultBranch: Bool = false, isDetachedGroup: Bool = false, defaultAhead: Int = 0, defaultBehind: Int = 0, worktrees: [WorktreeInfo], github: GitHubStatus = .unavailable, mergeEvidence: MergeEvidence? = nil) {
         self.id = id
         self.name = name
         self.sha = sha
         self.upstream = upstream
         self.ahead = ahead
         self.behind = behind
-        self.isMerged = isMerged
+        self.mergeEvidence = mergeEvidence ?? (isMerged ? .gitAncestor : .none)
         self.remoteGone = remoteGone
         self.lastCommitAt = lastCommitAt
         self.isDefaultBranch = isDefaultBranch
@@ -107,6 +107,35 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
         self.defaultBehind = defaultBehind
         self.worktrees = worktrees
         self.github = github
+    }
+
+    public var isMerged: Bool { mergeEvidence.isMerged }
+
+    public var mergeStatus: String {
+        switch mergeEvidence {
+        case .gitAncestor: return "Merged · Git"
+        case .githubVerified(let prNumber, _): return "Merged · GitHub verified · PR #\(prNumber)"
+        case .none: return github.isLoaded ? "Not merged" : "GitHub verification unavailable"
+        }
+    }
+
+    public func withMergeEvidence(_ evidence: MergeEvidence, github: GitHubStatus? = nil) -> BranchInfo {
+        BranchInfo(id: id, name: name, sha: sha, upstream: upstream, ahead: ahead, behind: behind, isMerged: evidence.isMerged, remoteGone: remoteGone, lastCommitAt: lastCommitAt, isDefaultBranch: isDefaultBranch, isDetachedGroup: isDetachedGroup, defaultAhead: defaultAhead, defaultBehind: defaultBehind, worktrees: worktrees, github: github ?? self.github, mergeEvidence: evidence)
+    }
+
+    public func withRemoteGone(_ value: Bool) -> BranchInfo {
+        BranchInfo(id: id, name: name, sha: sha, upstream: upstream, ahead: ahead, behind: behind, isMerged: isMerged, remoteGone: value, lastCommitAt: lastCommitAt, isDefaultBranch: isDefaultBranch, isDetachedGroup: isDetachedGroup, defaultAhead: defaultAhead, defaultBehind: defaultBehind, worktrees: worktrees, github: github, mergeEvidence: mergeEvidence)
+    }
+}
+
+public enum MergeEvidence: Hashable, Sendable {
+    case gitAncestor
+    case githubVerified(prNumber: Int, mergedAt: Date)
+    case none
+
+    public var isMerged: Bool {
+        if case .none = self { return false }
+        return true
     }
 }
 
@@ -136,14 +165,27 @@ public struct GitHubStatus: Hashable, Sendable {
     public let pullRequests: [GitHubPullRequest]
     public let actions: [GitHubActionRun]
     public let error: String?
+    public let isLoaded: Bool
 
-    public static let unavailable = GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil)
+    public static let unavailable = GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil, isLoaded: false)
 
-    public init(issues: [GitHubIssue], pullRequests: [GitHubPullRequest], actions: [GitHubActionRun], error: String?) {
+    public init(issues: [GitHubIssue], pullRequests: [GitHubPullRequest], actions: [GitHubActionRun], error: String?, isLoaded: Bool = true) {
         self.issues = issues
         self.pullRequests = pullRequests
         self.actions = actions
         self.error = error
+        self.isLoaded = isLoaded
+    }
+
+    public func verifiedMergedPullRequest(defaultBranch: String, branchName: String, localSHA: String) -> GitHubPullRequest? {
+        guard isLoaded, error == nil else { return nil }
+        return pullRequests.first { pullRequest in
+            pullRequest.state.uppercased() == "MERGED" &&
+            pullRequest.mergedAt != nil &&
+            pullRequest.baseRefName == defaultBranch &&
+            pullRequest.headRefName == branchName &&
+            pullRequest.headRefOid == localSHA
+        }
     }
 }
 
@@ -161,8 +203,24 @@ public struct GitHubPullRequest: Identifiable, Hashable, Sendable {
     public let title: String
     public let state: String
     public let isDraft: Bool
+    public let baseRefName: String?
+    public let headRefName: String?
+    public let headRefOid: String?
     public let mergedAt: Date?
     public let url: URL?
+
+    public init(id: String, number: Int, title: String, state: String, isDraft: Bool, baseRefName: String?, headRefName: String?, headRefOid: String?, mergedAt: Date?, url: URL?) {
+        self.id = id
+        self.number = number
+        self.title = title
+        self.state = state
+        self.isDraft = isDraft
+        self.baseRefName = baseRefName
+        self.headRefName = headRefName
+        self.headRefOid = headRefOid
+        self.mergedAt = mergedAt
+        self.url = url
+    }
 }
 
 public struct GitHubActionRun: Identifiable, Hashable, Sendable {
@@ -203,6 +261,7 @@ public enum CleanupBlockReason: Equatable, Sendable {
     case detachedWorktree
     case defaultBranch
     case worktreeAttached
+    case githubVerificationUnavailable
     case commandFailed(String)
 
     public var message: String {
@@ -218,6 +277,7 @@ public enum CleanupBlockReason: Equatable, Sendable {
         case .detachedWorktree: return "Detached worktree"
         case .defaultBranch: return "Default branch cannot be deleted"
         case .worktreeAttached: return "Branch has worktree"
+        case .githubVerificationUnavailable: return "GitHub verification unavailable"
         case .commandFailed(let message): return message
         }
     }
@@ -237,12 +297,16 @@ public struct CleanupPreviewItem: Identifiable, Sendable {
     public let target: String
     public let allowed: Bool
     public let reason: CleanupBlockReason?
+    public let detail: String?
+    public let expectedSHA: String?
 
-    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil) {
+    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil, detail: String? = nil, expectedSHA: String? = nil) {
         self.id = id
         self.target = target
         self.allowed = allowed
         self.reason = reason
+        self.detail = detail
+        self.expectedSHA = expectedSHA
     }
 }
 

@@ -428,7 +428,7 @@ struct BranchRow: View {
                 }
             }
             Spacer()
-            if branch.isMerged { Badge(text: "merged", color: .green) }
+            Badge(text: branch.mergeStatus, color: branch.isMerged ? .green : .orange)
             if branch.remoteGone { Badge(text: "remote gone", color: .orange) }
         }
         .padding(.vertical, 3)
@@ -491,7 +491,7 @@ struct BranchDetail: View {
             LabeledContent("Name", value: branch.name)
             LabeledContent("SHA", value: String(branch.sha.prefix(12)))
             LabeledContent("Default", value: branch.isDefaultBranch ? "Yes" : (defaultBranch ?? "Unknown"))
-            LabeledContent("Merged into default", value: branch.isMerged ? "Yes" : "No")
+            LabeledContent("Merge status", value: branch.mergeStatus)
             LabeledContent("Default diff", value: "+\(branch.defaultAhead) / -\(branch.defaultBehind)")
             Divider()
             GitHubDetail(status: branch.github)
@@ -553,6 +553,9 @@ struct GitHubDetail: View {
             Text("Issue \(status.issues.count) · PR \(status.pullRequests.count) · Actions \(status.actions.count)").font(.caption)
             ForEach(status.pullRequests) { pr in
                 Text("PR #\(pr.number) · \(pr.state)\(pr.mergedAt == nil ? "" : " · merged")").font(.caption)
+                if let base = pr.baseRefName, let head = pr.headRefName {
+                    Text("    \(head) → \(base) · SHA \(String((pr.headRefOid ?? "unknown").prefix(12)))").font(.caption2).foregroundStyle(.secondary)
+                }
             }
             ForEach(status.actions) { run in
                 Text("Action · \(run.name) · \(run.conclusion ?? run.status)").font(.caption)
@@ -580,6 +583,7 @@ struct CleanupConfirmationView: View {
                                 .foregroundStyle(item.allowed ? .green : .orange)
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(item.target).lineLimit(2)
+                                if let detail = item.detail { Text(detail).font(.caption).foregroundStyle(item.allowed ? .green : .secondary) }
                                 if let reason = item.reason { Text(reason.message).font(.caption).foregroundStyle(.orange) }
                             }
                         }
