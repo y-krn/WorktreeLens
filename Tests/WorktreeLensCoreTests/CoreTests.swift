@@ -271,6 +271,44 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(CleanupService().decide(worktree: worktree, branch: branch).allowed)
     }
 
+    func testStandaloneRemoveHandlesMultipleDetachedWorktreesWithDifferentHEADs() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-detached-\(UUID().uuidString)")
+        let repository = root.appendingPathComponent("repository")
+        let firstPath = root.appendingPathComponent("detached-first")
+        let secondPath = root.appendingPathComponent("detached-second")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        _ = try runGit(["init", "-b", "main", repository.path])
+        _ = try runGit(["-C", repository.path, "config", "user.email", "worktree-lens@example.invalid"])
+        _ = try runGit(["-C", repository.path, "config", "user.name", "Worktree Lens Test"])
+        for (name, contents) in [("one.txt", "one\n"), ("two.txt", "two\n"), ("three.txt", "three\n")] {
+            try Data(contents.utf8).write(to: repository.appendingPathComponent(name))
+            _ = try runGit(["-C", repository.path, "add", "."])
+            _ = try runGit(["-C", repository.path, "commit", "-m", name])
+        }
+        _ = try runGit(["-C", repository.path, "worktree", "add", "--detach", firstPath.path, "HEAD~1"])
+        _ = try runGit(["-C", repository.path, "worktree", "add", "--detach", secondPath.path, "HEAD~2"])
+
+        let git = GitService()
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: root.appendingPathComponent("no-sessions").path))
+        let snapshot = try git.snapshot(repositoryPath: repository.path)
+        let detached = try XCTUnwrap(snapshot.branches.first(where: \.isDetachedGroup))
+        let first = try XCTUnwrap(detached.worktrees.first { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path == firstPath.resolvingSymlinksInPath().path })
+        let second = try XCTUnwrap(detached.worktrees.first { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path == secondPath.resolvingSymlinksInPath().path })
+        XCTAssertNotEqual(first.head, second.head)
+
+        let firstPreview = cleanup.previewRemoveWorktree(snapshot: snapshot, path: first.path)
+        let secondPreview = cleanup.previewRemoveWorktree(snapshot: snapshot, path: second.path)
+        XCTAssertEqual(firstPreview.items[0].expectedSHA, first.head)
+        XCTAssertEqual(secondPreview.items[0].expectedSHA, second.head)
+        XCTAssertEqual(cleanup.execute(firstPreview), [first.path])
+        XCTAssertEqual(cleanup.execute(secondPreview), [second.path])
+
+        let remaining = try git.snapshot(repositoryPath: repository.path).branches.flatMap(\.worktrees)
+        XCTAssertFalse(remaining.contains { $0.path == first.path || $0.path == second.path })
+    }
+
     func testCleanupPreviewUsesProvidedSnapshotWithoutGitScan() {
         final class Counter: @unchecked Sendable {
             var value = 0
@@ -634,6 +672,7 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(cleanup.execute(preview).isEmpty)
         XCTAssertTrue(failingRunner.arguments.contains { $0.contains("worktree") && $0.contains("remove") })
         XCTAssertFalse(failingRunner.arguments.contains { $0.contains("branch") && $0.contains("-d") })
+        XCTAssertFalse(failingRunner.arguments.contains { $0.contains("update-ref") && $0.contains("-d") })
         XCTAssertTrue((try readWriteGit.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
         XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
     }

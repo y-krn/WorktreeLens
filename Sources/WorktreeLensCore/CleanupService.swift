@@ -32,7 +32,7 @@ public final class CleanupService: @unchecked Sendable {
             return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [CleanupPreviewItem(id: path, target: path, allowed: false, reason: .missingBranch)])
         }
         let decision = decide(worktree: match.worktree, branch: match.branch)
-        return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [item(id: path, target: path, decision: decision, detail: match.branch.mergeStatus, expectedSHA: match.branch.sha)])
+        return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [item(id: path, target: path, decision: decision, detail: match.branch.mergeStatus, expectedSHA: match.worktree.head)])
     }
 
     public func previewDeleteBranch(snapshot: RepositorySnapshot, name: String) -> CleanupPreview {
@@ -175,7 +175,7 @@ public final class CleanupService: @unchecked Sendable {
     private func executeRemoveWorktree(repositoryPath: String, path: String, expectedSHA: String?, sessions: [SessionRecord]) -> Bool {
         guard let match = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: sessions) else { return false }
         guard let expectedSHA, match.worktree.head == expectedSHA else { return false }
-        let branch = revalidatedBranch(repositoryPath: repositoryPath, branch: match.branch, expectedSHA: expectedSHA)
+        let branch = match.worktree.isDetached ? match.branch : revalidatedBranch(repositoryPath: repositoryPath, branch: match.branch, expectedSHA: expectedSHA)
         guard decide(worktree: match.worktree, branch: branch).allowed else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
     }
