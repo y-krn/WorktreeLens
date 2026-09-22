@@ -34,7 +34,7 @@ public final class GitService: @unchecked Sendable {
     }
 
     public func removeWorktree(repositoryPath: String, path: String) throws {
-        _ = try run(["-C", repositoryPath, "worktree", "remove", "--quiet", path])
+        _ = try run(["-C", repositoryPath, "worktree", "remove", path])
     }
 
     public func pruneWorktrees(repositoryPath: String) throws {

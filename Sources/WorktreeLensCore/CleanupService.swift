@@ -32,7 +32,7 @@ public final class CleanupService: @unchecked Sendable {
             return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [CleanupPreviewItem(id: path, target: path, allowed: false, reason: .missingBranch)])
         }
         let decision = decide(worktree: match.worktree, branch: match.branch)
-        return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [item(id: path, target: path, decision: decision)])
+        return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [item(id: path, target: path, decision: decision, detail: match.branch.mergeStatus, expectedSHA: match.branch.sha)])
     }
 
     public func previewDeleteBranch(snapshot: RepositorySnapshot, name: String) -> CleanupPreview {
@@ -60,7 +60,7 @@ public final class CleanupService: @unchecked Sendable {
     public func previewStaleWorktrees(snapshot: RepositorySnapshot, staleDays: Int, now: Date = Date()) -> CleanupPreview {
         let items = snapshot.branches.flatMap { branch in
             branch.worktrees.map { worktree in
-                item(id: worktree.path, target: worktree.path, decision: decide(worktree: worktree, branch: branch, requireMerged: true, now: now, staleDays: staleDays))
+                item(id: worktree.path, target: worktree.path, decision: decide(worktree: worktree, branch: branch, requireMerged: true, now: now, staleDays: staleDays), detail: branch.mergeStatus, expectedSHA: branch.sha)
             }
         }
         return CleanupPreview(operation: .removeStaleWorktrees, repositoryPath: snapshot.path, items: items, staleDays: staleDays)
@@ -79,7 +79,7 @@ public final class CleanupService: @unchecked Sendable {
         for target in preview.allowedItems {
             switch preview.operation {
             case .removeWorktree:
-                if executeRemoveWorktree(repositoryPath: preview.repositoryPath, path: target.id, sessions: currentSessions) { completed.append(target.id) }
+                if executeRemoveWorktree(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, sessions: currentSessions) { completed.append(target.id) }
             case .deleteBranch:
                 if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) { completed.append(target.id) }
             case .prune:
@@ -87,7 +87,7 @@ public final class CleanupService: @unchecked Sendable {
             case .deleteMergedBranches:
                 if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) { completed.append(target.id) }
             case .removeStaleWorktrees:
-                if executeRemoveStale(repositoryPath: preview.repositoryPath, path: target.id, staleDays: preview.staleDays ?? 7, sessions: currentSessions) { completed.append(target.id) }
+                if executeRemoveStale(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, staleDays: preview.staleDays ?? 7, sessions: currentSessions) { completed.append(target.id) }
             case .deleteRemoteGoneBranches:
                 if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) { completed.append(target.id) }
             }
@@ -105,8 +105,10 @@ public final class CleanupService: @unchecked Sendable {
         return CleanupDecision(allowed: false, reason: .unmergedBranch)
     }
 
-    private func executeRemoveWorktree(repositoryPath: String, path: String, sessions: [SessionRecord]) -> Bool {
-        guard let match = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: sessions), decide(worktree: match.worktree, branch: match.branch).allowed else { return false }
+    private func executeRemoveWorktree(repositoryPath: String, path: String, expectedSHA: String?, sessions: [SessionRecord]) -> Bool {
+        guard let match = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: sessions) else { return false }
+        let branch = revalidatedBranch(repositoryPath: repositoryPath, branch: match.branch, expectedSHA: expectedSHA)
+        guard decide(worktree: match.worktree, branch: branch).allowed else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
     }
 
@@ -129,10 +131,21 @@ public final class CleanupService: @unchecked Sendable {
         return (try? git.deleteBranchVerified(repositoryPath: repositoryPath, branch: name, expectedOldSHA: expectedSHA)) != nil
     }
 
-    private func executeRemoveStale(repositoryPath: String, path: String, staleDays: Int, sessions: [SessionRecord]) -> Bool {
+    private func executeRemoveStale(repositoryPath: String, path: String, expectedSHA: String?, staleDays: Int, sessions: [SessionRecord]) -> Bool {
         guard let match = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: sessions) else { return false }
-        guard decide(worktree: match.worktree, branch: match.branch, requireMerged: true, now: Date(), staleDays: staleDays).allowed else { return false }
+        let branch = revalidatedBranch(repositoryPath: repositoryPath, branch: match.branch, expectedSHA: expectedSHA)
+        guard decide(worktree: match.worktree, branch: branch, requireMerged: true, now: Date(), staleDays: staleDays).allowed else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
+    }
+
+    private func revalidatedBranch(repositoryPath: String, branch: BranchInfo?, expectedSHA: String?) -> BranchInfo? {
+        guard let branch else { return nil }
+        guard let expectedSHA, branch.sha == expectedSHA else { return nil }
+        if branch.mergeEvidence == .gitAncestor { return branch }
+        guard let defaultBranch = try? git.defaultBranchName(repositoryPath: repositoryPath) else { return nil }
+        let status = github.status(repositoryPath: repositoryPath, branch: branch.name)
+        guard let verified = status.verifiedMergedPullRequest(defaultBranch: defaultBranch, branchName: branch.name, localSHA: branch.sha), let mergedAt = verified.mergedAt else { return nil }
+        return branch.withMergeEvidence(.githubVerified(prNumber: verified.number, mergedAt: mergedAt), github: status)
     }
 
     private func locateWorktree(_ snapshot: RepositorySnapshot, path: String) -> (worktree: WorktreeInfo, branch: BranchInfo)? {
