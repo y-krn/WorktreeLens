@@ -115,12 +115,16 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
         switch mergeEvidence {
         case .gitAncestor: return "Merged · Git"
         case .githubVerified(let prNumber, _): return "Merged · GitHub verified · PR #\(prNumber)"
-        case .none: return github.isLoaded ? "Not merged" : "GitHub verification unavailable"
+        case .none: return github.mergeEvidenceLoaded ? "Not merged" : "GitHub verification unavailable"
         }
     }
 
     public func withMergeEvidence(_ evidence: MergeEvidence, github: GitHubStatus? = nil) -> BranchInfo {
         BranchInfo(id: id, name: name, sha: sha, upstream: upstream, ahead: ahead, behind: behind, isMerged: evidence.isMerged, remoteGone: remoteGone, lastCommitAt: lastCommitAt, isDefaultBranch: isDefaultBranch, isDetachedGroup: isDetachedGroup, defaultAhead: defaultAhead, defaultBehind: defaultBehind, worktrees: worktrees, github: github ?? self.github, mergeEvidence: evidence)
+    }
+
+    public func withGitHubStatus(_ status: GitHubStatus) -> BranchInfo {
+        BranchInfo(id: id, name: name, sha: sha, upstream: upstream, ahead: ahead, behind: behind, isMerged: isMerged, remoteGone: remoteGone, lastCommitAt: lastCommitAt, isDefaultBranch: isDefaultBranch, isDetachedGroup: isDetachedGroup, defaultAhead: defaultAhead, defaultBehind: defaultBehind, worktrees: worktrees, github: status, mergeEvidence: mergeEvidence)
     }
 
     public func withRemoteGone(_ value: Bool) -> BranchInfo {
@@ -137,6 +141,18 @@ public enum MergeEvidence: Hashable, Sendable {
         if case .none = self { return false }
         return true
     }
+}
+
+public struct GitHubMergeEvidence: Sendable {
+    public let pullRequests: [GitHubPullRequest]
+    public let error: String?
+
+    public init(pullRequests: [GitHubPullRequest], error: String? = nil) {
+        self.pullRequests = pullRequests
+        self.error = error
+    }
+
+    public var isLoaded: Bool { error == nil }
 }
 
 public enum RepositorySelection: Hashable, Sendable {
@@ -166,19 +182,21 @@ public struct GitHubStatus: Hashable, Sendable {
     public let actions: [GitHubActionRun]
     public let error: String?
     public let isLoaded: Bool
+    public let mergeEvidenceLoaded: Bool
 
-    public static let unavailable = GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil, isLoaded: false)
+    public static let unavailable = GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil, isLoaded: false, mergeEvidenceLoaded: false)
 
-    public init(issues: [GitHubIssue], pullRequests: [GitHubPullRequest], actions: [GitHubActionRun], error: String?, isLoaded: Bool = true) {
+    public init(issues: [GitHubIssue], pullRequests: [GitHubPullRequest], actions: [GitHubActionRun], error: String?, isLoaded: Bool = true, mergeEvidenceLoaded: Bool? = nil) {
         self.issues = issues
         self.pullRequests = pullRequests
         self.actions = actions
         self.error = error
         self.isLoaded = isLoaded
+        self.mergeEvidenceLoaded = mergeEvidenceLoaded ?? isLoaded
     }
 
     public func verifiedMergedPullRequest(defaultBranch: String, branchName: String, localSHA: String) -> GitHubPullRequest? {
-        guard isLoaded, error == nil else { return nil }
+        guard mergeEvidenceLoaded, error == nil else { return nil }
         return pullRequests.first { pullRequest in
             pullRequest.state.uppercased() == "MERGED" &&
             pullRequest.mergedAt != nil &&
