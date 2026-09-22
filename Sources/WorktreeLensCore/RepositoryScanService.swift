@@ -47,38 +47,20 @@ public final class RepositoryScanService: @unchecked Sendable {
 
     public func enrichGitHub(local: RepositoryLocalScanResult, progress: @escaping @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in }) async -> RepositorySnapshot {
         let branches = local.snapshot.branches.filter { !$0.isDetachedGroup }
-        let total = branches.count
-        guard total > 0 else { return local.snapshot }
-        let maxConcurrent = 4
-        let githubStatuses = await withTaskGroup(of: (String, GitHubStatus).self, returning: [String: GitHubStatus].self) { group in
-            var statuses: [String: GitHubStatus] = [:]
-            var nextIndex = 0
-            var completed = 0
-
-            func addNextTask() {
-                guard nextIndex < branches.count else { return }
-                let branch = branches[nextIndex]
-                nextIndex += 1
-                group.addTask {
-                    (branch.id, await self.github.statusAsync(repositoryPath: local.snapshot.path, branch: branch.name))
-                }
-            }
-
-            for _ in 0..<min(maxConcurrent, branches.count) { addNextTask() }
-            while let result = await group.next() {
-                statuses[result.0] = result.1
-                completed += 1
-                progress(completed, total)
-                if Task.isCancelled {
-                    group.cancelAll()
-                    break
-                }
-                addNextTask()
-            }
-            return statuses
-        }
+        guard !branches.isEmpty else { return local.snapshot }
+        let evidence = await github.mergeEvidenceAsync(repositoryPath: local.snapshot.path)
+        progress(1, 1)
         let enrichedBranches = local.snapshot.branches.map { branch in
-            let status = githubStatuses[branch.id] ?? .unavailable
+            guard !branch.isDetachedGroup else { return branch }
+            let branchPullRequests = evidence.pullRequests.filter { $0.headRefName == branch.name }
+            let status = GitHubStatus(
+                issues: [],
+                pullRequests: branchPullRequests,
+                actions: [],
+                error: evidence.error,
+                isLoaded: false,
+                mergeEvidenceLoaded: evidence.isLoaded
+            )
             let evidence: MergeEvidence
             if branch.mergeEvidence.isMerged {
                 evidence = branch.mergeEvidence

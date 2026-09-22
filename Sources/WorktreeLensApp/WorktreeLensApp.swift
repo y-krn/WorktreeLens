@@ -53,6 +53,8 @@ final class ApplicationModel: ObservableObject {
     lazy var cleanup = CleanupService(git: git, sessions: sessions, github: github)
     private var refreshToken = UUID()
     private var refreshTask: Task<Void, Never>?
+    private var githubDetailToken = UUID()
+    private var githubDetailTask: Task<Void, Never>?
     private var cleanupPreviewToken = UUID()
     private var cleanupPreviewProgressTask: Task<Void, Never>?
 
@@ -85,6 +87,8 @@ final class ApplicationModel: ObservableObject {
 
     func refresh(path: String) {
         refreshTask?.cancel()
+        githubDetailTask?.cancel()
+        githubDetailToken = UUID()
         let token = UUID()
         refreshToken = token
         isLoading = true
@@ -101,14 +105,23 @@ final class ApplicationModel: ObservableObject {
                 let local = try scanner.readGit(repositoryPath: path, discovery: discovery)
                 await MainActor.run {
                     guard self.refreshToken == token else { return }
+                    let previousSelection = self.snapshot?.path == local.snapshot.path ? self.selection : nil
                     self.snapshot = local.snapshot
                     self.sessionNotes = local.sessionNotes
-                    self.selection = local.snapshot.branches.first.flatMap { branch in
+                    self.selection = previousSelection.flatMap { selection in
+                        guard let branchID = selection.branchID(in: local.snapshot) else { return nil }
+                        switch selection {
+                        case .branch:
+                            return .branch(branchID)
+                        case .worktree(let worktreeID):
+                            return local.snapshot.branches.flatMap(\.worktrees).contains { $0.id == worktreeID } ? .worktree(worktreeID) : .branch(branchID)
+                        }
+                    } ?? local.snapshot.branches.first.flatMap { branch in
                         branch.worktrees.first.map { .worktree($0.id) } ?? .branch(branch.id)
                     }
                     self.errorMessage = nil
                     self.canCancelGitHub = true
-                    let total = local.snapshot.branches.filter { !$0.isDetachedGroup }.count
+                    let total = local.snapshot.branches.contains { !$0.isDetachedGroup } ? 1 : 0
                     self.scanPhase = "Loading GitHub 0/\(total)…"
                 }
                 let enriched = await scanner.enrichGitHub(local: local) { completed, total in
@@ -124,6 +137,7 @@ final class ApplicationModel: ObservableObject {
                     self.canCancelGitHub = false
                     self.scanPhase = nil
                     self.statusMessage = Task.isCancelled ? "GitHub loading cancelled" : nil
+                    self.loadGitHubDetailForCurrentSelection()
                 }
             } catch {
                 await MainActor.run {
@@ -163,6 +177,7 @@ final class ApplicationModel: ObservableObject {
             return
         }
         selection = .branch(id)
+        loadGitHubDetailForCurrentSelection()
     }
 
     func selectWorktree(id: String) {
@@ -171,6 +186,43 @@ final class ApplicationModel: ObservableObject {
             return
         }
         selection = .worktree(id)
+        loadGitHubDetailForCurrentSelection()
+    }
+
+    func selectionDidChange() {
+        loadGitHubDetailForCurrentSelection()
+    }
+
+    private func loadGitHubDetailForCurrentSelection() {
+        guard !isLoading,
+              let path = selectedPath,
+              let snapshot,
+              snapshot.path == path,
+              let branchID = selectedBranchID,
+              let branch = snapshot.branches.first(where: { $0.id == branchID }),
+              !branch.github.isLoaded else { return }
+
+        githubDetailTask?.cancel()
+        let token = UUID()
+        githubDetailToken = token
+        let refreshToken = self.refreshToken
+        let github = self.github
+        githubDetailTask = Task.detached(priority: .utility) {
+            let status = await github.statusAsync(repositoryPath: path, branch: branch.name)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard self.githubDetailToken == token,
+                      self.refreshToken == refreshToken,
+                      self.selectedPath == path,
+                      self.selectedBranchID == branchID,
+                      self.snapshot?.path == path else { return }
+                guard let snapshot = self.snapshot,
+                      let index = snapshot.branches.firstIndex(where: { $0.id == branchID }) else { return }
+                var branches = snapshot.branches
+                branches[index] = branches[index].withGitHubStatus(status)
+                self.snapshot = RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: branches, refreshedAt: snapshot.refreshedAt)
+            }
+        }
     }
 
     func selectedWorktree() -> WorktreeInfo? {
@@ -392,6 +444,7 @@ struct ContentView: View {
                     }
                 }
                 .listStyle(.sidebar)
+                .onChange(of: model.selection) { _ in model.selectionDidChange() }
             } else {
                 EmptyStateView(title: "No snapshot", systemImage: "arrow.triangle.2.circlepath", message: "Refresh after registering a Git repository")
             }
@@ -577,18 +630,23 @@ struct GitHubDetail: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("GitHub").font(.headline)
             if let error = status.error { Text(error).font(.caption).foregroundStyle(.secondary) }
-            Text("Issue \(status.issues.count) · PR \(status.pullRequests.count) · Actions \(status.actions.count)").font(.caption)
-            ForEach(status.pullRequests) { pr in
-                Text("PR #\(pr.number) · \(pr.state)\(pr.mergedAt == nil ? "" : " · merged")").font(.caption)
-                if let base = pr.baseRefName, let head = pr.headRefName {
-                    Text("    \(head) → \(base) · SHA \(String((pr.headRefOid ?? "unknown").prefix(12)))").font(.caption2).foregroundStyle(.secondary)
+            if !status.isLoaded {
+                Text(status.mergeEvidenceLoaded ? "Merge evidence loaded · Branch details load on selection" : "GitHub details unavailable")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("Issue \(status.issues.count) · PR \(status.pullRequests.count) · Actions \(status.actions.count)").font(.caption)
+                ForEach(status.pullRequests) { pr in
+                    Text("PR #\(pr.number) · \(pr.state)\(pr.mergedAt == nil ? "" : " · merged")").font(.caption)
+                    if let base = pr.baseRefName, let head = pr.headRefName {
+                        Text("    \(head) → \(base) · SHA \(String((pr.headRefOid ?? "unknown").prefix(12)))").font(.caption2).foregroundStyle(.secondary)
+                    }
                 }
-            }
-            ForEach(status.actions) { run in
-                Text("Action · \(run.name) · \(run.conclusion ?? run.status)").font(.caption)
-            }
-            ForEach(status.issues) { issue in
-                Text("Issue #\(issue.number) · \(issue.title)").font(.caption)
+                ForEach(status.actions) { run in
+                    Text("Action · \(run.name) · \(run.conclusion ?? run.status)").font(.caption)
+                }
+                ForEach(status.issues) { issue in
+                    Text("Issue #\(issue.number) · \(issue.title)").font(.caption)
+                }
             }
         }
     }

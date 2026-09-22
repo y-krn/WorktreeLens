@@ -11,6 +11,25 @@ public final class GitHubService: @unchecked Sendable {
 
     public static let requestTimeout: TimeInterval = 10
 
+    /// Fetches all PR metadata needed to verify merge evidence for every local branch.
+    /// The large limit makes gh paginate instead of silently using its default 30-item page.
+    private static let mergeEvidenceLimit = "100000"
+
+    public func mergeEvidence(repositoryPath: String, timeout: TimeInterval = GitHubService.requestTimeout) -> GitHubMergeEvidence {
+        do {
+            let prs = try query(repositoryPath: repositoryPath, arguments: ["pr", "list", "--state", "all", "--limit", Self.mergeEvidenceLimit, "--json", "number,title,state,isDraft,baseRefName,headRefName,headRefOid,mergedAt,url"], timeout: timeout)
+            return GitHubMergeEvidence(pullRequests: prs.compactMap(pullRequest))
+        } catch {
+            return GitHubMergeEvidence(pullRequests: [], error: error.localizedDescription)
+        }
+    }
+
+    public func mergeEvidenceAsync(repositoryPath: String, timeout: TimeInterval = GitHubService.requestTimeout) async -> GitHubMergeEvidence {
+        await Task.detached(priority: .utility) {
+            self.mergeEvidence(repositoryPath: repositoryPath, timeout: timeout)
+        }.value
+    }
+
     public func status(repositoryPath: String, branch: String, timeout: TimeInterval = GitHubService.requestTimeout) -> GitHubStatus {
         do {
             let deadline = Date().addingTimeInterval(timeout)
@@ -64,7 +83,9 @@ public final class GitHubService: @unchecked Sendable {
         let fallback = try runner.run(executable, arguments: arguments, currentDirectory: repositoryPath, timeout: timeout)
         if fallback.timedOut { throw ProcessRunnerError.timedOut("gh") }
         guard fallback.succeeded else { throw ProcessRunnerError.failed(fallback.stderr.trimmingCharacters(in: .whitespacesAndNewlines)) }
-        guard let data = fallback.stdout.data(using: .utf8), let json = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        guard let data = fallback.stdout.data(using: .utf8), let json = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw ProcessRunnerError.failed("Invalid JSON from gh")
+        }
         return json
     }
 

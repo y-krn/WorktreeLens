@@ -501,6 +501,71 @@ final class CoreTests: XCTestCase {
         XCTAssertNil(GitHubStatus(issues: [], pullRequests: [makePR("MERGED", "main", "abc")], actions: [], error: "offline", isLoaded: false).verifiedMergedPullRequest(defaultBranch: "main", branchName: "feature", localSHA: "abc"))
     }
 
+    func testRefreshBulkFetchesMergeEvidenceOnceForManyBranches() async throws {
+        final class Counter: @unchecked Sendable {
+            var arguments: [[String]] = []
+        }
+
+        let counter = Counter()
+        let featurePR = "[{\"number\":201,\"title\":\"old feature\",\"state\":\"MERGED\",\"isDraft\":false,\"baseRefName\":\"main\",\"headRefName\":\"feature-99\",\"headRefOid\":\"sha-99\",\"mergedAt\":\"2026-01-01T00:00:00Z\",\"url\":\"https://github.com/example/repo/pull/201\"}]"
+        let runner = RoutingRunner { arguments in
+            counter.arguments.append(arguments)
+            if arguments.starts(with: ["pr", "list"]) { return ProcessResult(status: 0, stdout: featurePR) }
+            XCTFail("unexpected GitHub command: \(arguments.joined(separator: " "))")
+            return ProcessResult(status: 1)
+        }
+        let branches = [
+            BranchInfo(id: "main", name: "main", sha: "main-sha", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: false, lastCommitAt: nil, isDefaultBranch: true, worktrees: [])
+        ] + (0..<100).map { index in
+            BranchInfo(id: "feature-\(index)", name: "feature-\(index)", sha: "sha-\(index)", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])
+        }
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: branches), sessionNotes: [])
+        let scanner = RepositoryScanService(github: GitHubService(runner: runner, executable: "gh"))
+
+        let enriched = await scanner.enrichGitHub(local: local)
+
+        XCTAssertEqual(counter.arguments.filter { $0.starts(with: ["pr", "list"]) }.count, 1)
+        XCTAssertTrue(counter.arguments.allSatisfy { !$0.starts(with: ["pr", "view"]) && !$0.starts(with: ["run", "list"]) })
+        let verified = try XCTUnwrap(enriched.branches.first { $0.name == "feature-99" })
+        XCTAssertTrue(verified.isMerged)
+        XCTAssertTrue(verified.github.mergeEvidenceLoaded)
+        XCTAssertFalse(verified.github.isLoaded)
+        XCTAssertEqual(verified.mergeEvidence, .githubVerified(prNumber: 201, mergedAt: try XCTUnwrap(verified.github.pullRequests.first?.mergedAt)))
+    }
+
+    func testRefreshGitHubFailureKeepsLocalSnapshotAndFailsClosed() async {
+        let branch = BranchInfo(id: "feature", name: "feature", sha: "feature-sha", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [branch]), sessionNotes: ["local"])
+        let runner = RoutingRunner { _ in throw ProcessRunnerError.failed("offline") }
+        let scanner = RepositoryScanService(github: GitHubService(runner: runner, executable: "gh"))
+
+        let enriched = await scanner.enrichGitHub(local: local)
+
+        XCTAssertEqual(enriched.path, local.snapshot.path)
+        XCTAssertEqual(enriched.branches.map(\.id), local.snapshot.branches.map(\.id))
+        XCTAssertEqual(enriched.branches.first?.worktrees, local.snapshot.branches.first?.worktrees)
+        XCTAssertFalse(enriched.branches[0].github.mergeEvidenceLoaded)
+        XCTAssertFalse(enriched.branches[0].isMerged)
+        XCTAssertEqual(enriched.branches[0].mergeStatus, "GitHub verification unavailable")
+        XCTAssertFalse(CleanupService().previewDeleteBranch(snapshot: enriched, name: "feature").items[0].allowed)
+    }
+
+    func testBulkMergeEvidenceRequiresExactBaseHeadAndSHA() async throws {
+        let branch = BranchInfo(id: "feature", name: "feature", sha: "local-sha", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])
+        let pullRequest = "[{\"number\":202,\"title\":\"feature\",\"state\":\"MERGED\",\"isDraft\":false,\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRefOid\":\"different-sha\",\"mergedAt\":\"2026-01-01T00:00:00Z\",\"url\":\"https://github.com/example/repo/pull/202\"}]"
+        let runner = RoutingRunner { arguments in
+            ProcessResult(status: 0, stdout: arguments.starts(with: ["pr", "list"]) ? pullRequest : "[]")
+        }
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [branch]), sessionNotes: [])
+        let scanner = RepositoryScanService(github: GitHubService(runner: runner, executable: "gh"))
+
+        let enriched = await scanner.enrichGitHub(local: local)
+
+        XCTAssertTrue(enriched.branches[0].github.mergeEvidenceLoaded)
+        XCTAssertFalse(enriched.branches[0].isMerged)
+        XCTAssertEqual(enriched.branches[0].mergeStatus, "Not merged")
+    }
+
     func testGitHubUnavailableAndDefaultBranchRemainBlocked() {
         let unavailableBranch = BranchInfo(id: "feature", name: "feature", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])
         let unavailablePreview = CleanupService().previewDeleteBranch(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [unavailableBranch]), name: "feature")
