@@ -26,8 +26,7 @@ final class ApplicationModel: ObservableObject {
     @Published var registeredPaths: [String]
     @Published var selectedPath: String?
     @Published var snapshot: RepositorySnapshot?
-    @Published var selectedWorktreeID: String?
-    @Published var selectedBranchID: String?
+    @Published var selection: RepositorySelection?
     @Published var sessionNotes: [String] = []
     @Published var errorMessage: String?
     @Published var statusMessage: String?
@@ -97,8 +96,9 @@ final class ApplicationModel: ObservableObject {
                     guard self.refreshToken == token else { return }
                     self.snapshot = local.snapshot
                     self.sessionNotes = local.sessionNotes
-                    self.selectedBranchID = local.snapshot.branches.first?.id
-                    self.selectedWorktreeID = local.snapshot.branches.first?.worktrees.first?.id
+                    self.selection = local.snapshot.branches.first.flatMap { branch in
+                        branch.worktrees.first.map { .worktree($0.id) } ?? .branch(branch.id)
+                    }
                     self.errorMessage = nil
                     self.canCancelGitHub = true
                     let total = local.snapshot.branches.filter { !$0.isDetachedGroup }.count
@@ -138,6 +138,32 @@ final class ApplicationModel: ObservableObject {
 
     func branch(for worktree: WorktreeInfo) -> BranchInfo? {
         snapshot?.branches.first { $0.worktrees.contains { $0.id == worktree.id } }
+    }
+
+    var selectedBranchID: String? {
+        guard let snapshot, let selection else { return nil }
+        return selection.branchID(in: snapshot)
+    }
+
+    var selectedWorktreeID: String? {
+        guard let snapshot, let selection else { return nil }
+        return selection.worktreeID(in: snapshot)
+    }
+
+    func selectBranch(id: String) {
+        guard snapshot?.branches.contains(where: { $0.id == id }) == true else {
+            selection = nil
+            return
+        }
+        selection = .branch(id)
+    }
+
+    func selectWorktree(id: String) {
+        guard let snapshot, snapshot.branches.flatMap(\.worktrees).contains(where: { $0.id == id }) else {
+            selection = nil
+            return
+        }
+        selection = .worktree(id)
     }
 
     func selectedWorktree() -> WorktreeInfo? {
@@ -311,7 +337,7 @@ struct ContentView: View {
             .padding()
             Divider()
             if let snapshot = model.snapshot {
-                List(selection: $model.selectedWorktreeID) {
+                List(selection: $model.selection) {
                     Section {
                         ForEach(snapshot.branches) { branch in
                             DisclosureGroup {
@@ -323,12 +349,13 @@ struct ContentView: View {
                                     } label: {
                                         WorktreeRow(worktree: worktree)
                                     }
-                                    .tag(Optional(worktree.id))
+                                    .tag(RepositorySelection.worktree(worktree.id))
                                 }
                             } label: {
                                 BranchRow(branch: branch)
                                     .contentShape(Rectangle())
-                                    .onTapGesture { model.selectedBranchID = branch.id }
+                                    .tag(RepositorySelection.branch(branch.id))
+                                    .onTapGesture { model.selectBranch(id: branch.id) }
                             }
                         }
                     } header: {
@@ -338,10 +365,6 @@ struct ContentView: View {
                     }
                 }
                 .listStyle(.sidebar)
-                .onChange(of: model.selectedWorktreeID) { newValue in
-                    guard let newValue else { return }
-                    model.selectedBranchID = snapshot.branches.first { $0.worktrees.contains { $0.id == newValue } }?.id
-                }
             } else {
                 EmptyStateView(title: "No snapshot", systemImage: "arrow.triangle.2.circlepath", message: "Refresh after registering a Git repository")
             }

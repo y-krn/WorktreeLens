@@ -9,6 +9,29 @@ final class CoreTests: XCTestCase {
         }
     }
 
+    func testRepositorySelectionKeepsBranchAndWorktreeInSync() {
+        let worktree = WorktreeInfo(id: "/tmp/alpha", path: "/tmp/alpha", branch: "alpha", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)
+        let branches = ["alpha", "beta", "charlie"].map { name in
+            BranchInfo(id: name, name: name, sha: name, upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: name == "alpha" ? [worktree] : [])
+        }
+        let snapshot = RepositorySnapshot(path: "/tmp/repository", defaultBranch: "alpha", branches: branches)
+
+        var selection = RepositorySelection.branch("alpha")
+        XCTAssertEqual(selection.branchID(in: snapshot), "alpha")
+        selection = .branch("beta")
+        XCTAssertEqual(selection.branchID(in: snapshot), "beta")
+        selection = .branch("charlie")
+        XCTAssertEqual(selection.branchID(in: snapshot), "charlie")
+
+        selection = .worktree(worktree.id)
+        XCTAssertEqual(selection.branchID(in: snapshot), "alpha")
+        XCTAssertEqual(selection.worktreeID(in: snapshot), worktree.id)
+
+        selection = .branch("beta")
+        XCTAssertEqual(selection.branchID(in: snapshot), "beta")
+        XCTAssertNil(selection.worktreeID(in: snapshot))
+    }
+
     func testSessionActivityUsesOnlyExplicitProcessEvidence() {
         let active = ProcessActivityProbe(runner: StaticRunner(output: "123 /usr/local/bin/codex thread-123\n"))
         let activeSnapshot = active.snapshot()
