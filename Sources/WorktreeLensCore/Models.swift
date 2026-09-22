@@ -110,6 +110,27 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
     }
 }
 
+public enum RepositorySelection: Hashable, Sendable {
+    case branch(String)
+    case worktree(String)
+
+    public func branchID(in snapshot: RepositorySnapshot) -> String? {
+        switch self {
+        case .branch(let id):
+            return snapshot.branches.contains { $0.id == id } ? id : nil
+        case .worktree(let id):
+            return snapshot.branches.first { branch in
+                branch.worktrees.contains { $0.id == id }
+            }?.id
+        }
+    }
+
+    public func worktreeID(in snapshot: RepositorySnapshot) -> String? {
+        guard case .worktree(let id) = self else { return nil }
+        return snapshot.branches.flatMap(\.worktrees).contains { $0.id == id } ? id : nil
+    }
+}
+
 public struct GitHubStatus: Hashable, Sendable {
     public let issues: [GitHubIssue]
     public let pullRequests: [GitHubPullRequest]
