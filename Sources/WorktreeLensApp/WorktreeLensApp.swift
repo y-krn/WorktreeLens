@@ -21,6 +21,12 @@ struct WorktreeLensApp: App {
     }
 }
 
+enum CleanupExecutionState: Equatable {
+    case idle
+    case running
+    case completed(Int)
+}
+
 @MainActor
 final class ApplicationModel: ObservableObject {
     @Published var registeredPaths: [String]
@@ -31,6 +37,7 @@ final class ApplicationModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var statusMessage: String?
     @Published var cleanupPreview: CleanupPreview?
+    @Published var cleanupExecutionState: CleanupExecutionState = .idle
     @Published var isImporterPresented = false
     @Published var isLoading = false
     @Published var isCleanupPreviewLoading = false
@@ -214,18 +221,36 @@ final class ApplicationModel: ObservableObject {
     }
 
     func executeCleanup(_ preview: CleanupPreview) {
+        guard cleanupExecutionState == .idle, cleanupPreview?.id == preview.id else { return }
+        cleanupExecutionState = .running
         let cleanup = self.cleanup
         Task.detached(priority: .userInitiated) {
             let completed = cleanup.execute(preview)
             await MainActor.run {
-                self.cleanupPreview = nil
-                self.statusMessage = completed.isEmpty ? "No target passed the final guard" : "Completed \(completed.count) target(s)"
+                guard self.cleanupPreview?.id == preview.id else { return }
+                self.cleanupExecutionState = .completed(completed.count)
+                self.statusMessage = completed.isEmpty ? "Completed 0 target(s) — no changes after final guard" : "Completed \(completed.count) target(s)"
                 self.refreshSelected()
             }
         }
     }
 
+    func cancelCleanupPreview() {
+        guard cleanupExecutionState == .idle else { return }
+        cleanupPreviewProgressTask?.cancel()
+        cleanupPreviewToken = UUID()
+        cleanupPreview = nil
+        cleanupExecutionState = .idle
+    }
+
+    func closeCleanupPreview() {
+        guard case .completed = cleanupExecutionState else { return }
+        cleanupPreview = nil
+        cleanupExecutionState = .idle
+    }
+
     private func requestPreview(_ operation: @escaping @Sendable () -> CleanupPreview) {
+        guard cleanupExecutionState == .idle else { return }
         cleanupPreviewProgressTask?.cancel()
         let token = UUID()
         cleanupPreviewToken = token
@@ -241,6 +266,7 @@ final class ApplicationModel: ObservableObject {
                 guard self.cleanupPreviewToken == token else { return }
                 self.cleanupPreviewProgressTask?.cancel()
                 self.isCleanupPreviewLoading = false
+                self.cleanupExecutionState = .idle
                 self.cleanupPreview = preview
             }
         }
@@ -266,6 +292,7 @@ struct ContentView: View {
         }
         .sheet(item: $model.cleanupPreview) { preview in
             CleanupConfirmationView(preview: preview, model: model)
+                .interactiveDismissDisabled(model.cleanupExecutionState != .idle)
         }
     }
 
@@ -595,16 +622,53 @@ struct CleanupConfirmationView: View {
             }
             Text("Allowed \(allowedCount) / total \(totalCount). Final guards run again immediately before each operation.")
                 .font(.caption).foregroundStyle(.secondary)
-            HStack {
-                Spacer()
-                Button("Cancel") { model.cleanupPreview = nil }
-                Button("Run allowed targets") { model.executeCleanup(preview) }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(allowedCount == 0)
-            }
+            executionStatus
+            actionArea
         }
         .padding(22)
         .frame(width: 600, height: 470)
+    }
+
+    @ViewBuilder
+    private var executionStatus: some View {
+        switch model.cleanupExecutionState {
+        case .idle:
+            EmptyView()
+        case .running:
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("Running cleanup…")
+            }
+        case .completed(let count):
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Completed \(count) target(s)")
+                if count == 0 {
+                    Text("No changes after final guard")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var actionArea: some View {
+        HStack {
+            Spacer()
+            switch model.cleanupExecutionState {
+            case .idle:
+                Button("Cancel") { model.cancelCleanupPreview() }
+                Button("Run allowed targets") { model.executeCleanup(preview) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(allowedCount == 0)
+            case .running:
+                Button("Cancel") { model.cancelCleanupPreview() }
+                    .disabled(true)
+            case .completed:
+                Button("Close") { model.closeCleanupPreview() }
+                    .buttonStyle(.borderedProminent)
+            }
+        }
     }
 
     private var allowedCount: Int {
