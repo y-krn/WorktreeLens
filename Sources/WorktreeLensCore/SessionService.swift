@@ -145,10 +145,12 @@ public struct CodexSessionProvider: SessionProvider {
 public struct ChatGPTSessionProvider: SessionProvider {
     public let kind: SessionProviderKind = .chatGPT
     private let home: String
+    private let runner: any ProcessRunning
     private let activityProbe: any SessionActivityProbing
 
-    public init(home: String = NSHomeDirectory(), activityProbe: any SessionActivityProbing = ProcessActivityProbe()) {
+    public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner(), activityProbe: any SessionActivityProbing = ProcessActivityProbe()) {
         self.home = home
+        self.runner = runner
         self.activityProbe = activityProbe
     }
 
@@ -157,76 +159,213 @@ public struct ChatGPTSessionProvider: SessionProvider {
     }
 
     public func discover(processSnapshot: ProcessActivitySnapshot) -> SessionDiscoveryResult {
-        let roots = [
-            URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/com.openai.chat"),
-            URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/ChatGPT"),
-            URL(fileURLWithPath: home).appendingPathComponent("Library/Containers/com.openai.chat/Data/Library/Application Support/com.openai.chat")
+        let catalogPath = URL(fileURLWithPath: home).appendingPathComponent(".codex/sqlite/codex-dev.db").path
+        let adapters: [any ChatGPTSessionAdapter] = [
+            SQLiteCatalogAdapter(databasePath: catalogPath, runner: runner),
+            LegacyJSONAdapter(roots: legacyRoots)
         ]
-        var records: [SessionRecord] = []
-        var inspected = false
-        for root in roots where FileManager.default.fileExists(atPath: root.path) {
-            inspected = true
-            records.append(contentsOf: scanJSON(root: root, processSnapshot: processSnapshot))
+        var metadata: [ChatGPTSessionMetadata] = []
+        var notes: [String] = []
+        for adapter in adapters {
+            let result = adapter.read()
+            metadata.append(contentsOf: result.sessions)
+            notes.append(contentsOf: result.notes)
         }
-        var notes = [inspected ? "ChatGPT: known local roots read-only scan" : "ChatGPT: known local roots unavailable"]
+
+        let records = metadata.map { makeRecord($0, processSnapshot: processSnapshot) }
         if records.isEmpty {
-            notes.append("ChatGPT: explicit session metadata未取得 → Unknown")
+            notes.append("ChatGPT: explicit cwd + session ID metadataなし。worktree紐付け不能 → Unknown")
         } else {
-            notes.append("ChatGPT: explicit path/id metadataのみ採用")
+            notes.append("ChatGPT: absolute cwd + session ID metadataのみ採用。推測紐付けなし")
         }
-        notes.append("ChatGPT: アプリ内部DB・設定書込みなし")
+        let chromiumStorage = URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/Codex/Default/Local Storage/leveldb")
+        if FileManager.default.fileExists(atPath: chromiumStorage.path) {
+            notes.append("ChatGPT: \(chromiumStorage.path) Chromium LevelDB存在。明示cwd schema未確認のため未採用")
+        }
+        notes.append("ChatGPT: SQLite/JSON/JSONL read-only。書込み・DB migration・IndexedDB/LevelDB無差別scanなし")
         var unique: [String: SessionRecord] = [:]
         records.forEach { unique[$0.id] = $0 }
-        return SessionDiscoveryResult(sessions: Array(unique.values), notes: notes)
+        return SessionDiscoveryResult(sessions: unique.values.sorted { $0.updatedAt ?? .distantPast > $1.updatedAt ?? .distantPast }, notes: notes)
     }
+
+    private var legacyRoots: [URL] {
+        let base = URL(fileURLWithPath: home)
+        return [
+            base.appendingPathComponent("Library/Application Support/com.openai.chat"),
+            base.appendingPathComponent("Library/Application Support/ChatGPT"),
+            base.appendingPathComponent("Library/Containers/com.openai.chat/Data/Library/Application Support/com.openai.chat")
+        ]
+    }
+
+    private func makeRecord(_ metadata: ChatGPTSessionMetadata, processSnapshot: ProcessActivitySnapshot) -> SessionRecord {
+        let state = activityProbe.activity(for: metadata.id, provider: .chatGPT, snapshot: processSnapshot)
+        var evidence = "\(metadata.source); explicit cwd/id"
+        if let sourceKind = metadata.sourceKind, !sourceKind.isEmpty { evidence += "; source_kind=\(sourceKind)" }
+        if let branch = metadata.branch, !branch.isEmpty { evidence += "; git_branch=\(branch)" }
+        evidence += "; \(state.1)"
+        return SessionRecord(
+            id: "chatgpt-\(metadata.id)",
+            provider: .chatGPT,
+            title: metadata.title.isEmpty ? "Untitled session" : metadata.title,
+            updatedAt: metadata.updatedAt,
+            cwd: metadata.cwd,
+            branch: metadata.branch,
+            url: metadata.url ?? URL(string: "codex://threads/\(metadata.id)"),
+            activity: state.0,
+            evidence: evidence
+        )
+    }
+}
+
+private struct ChatGPTSessionMetadata: Sendable {
+    let id: String
+    let title: String
+    let updatedAt: Date?
+    let cwd: String
+    let branch: String?
+    let url: URL?
+    let source: String
+    let sourceKind: String?
+}
+
+private struct ChatGPTAdapterResult: Sendable {
+    let sessions: [ChatGPTSessionMetadata]
+    let notes: [String]
+}
+
+private protocol ChatGPTSessionAdapter: Sendable {
+    func read() -> ChatGPTAdapterResult
+}
+
+private struct SQLiteCatalogAdapter: ChatGPTSessionAdapter {
+    let databasePath: String
+    let runner: any ProcessRunning
+
+    func read() -> ChatGPTAdapterResult {
+        guard FileManager.default.fileExists(atPath: databasePath) else {
+            return ChatGPTAdapterResult(sessions: [], notes: ["ChatGPT: \(databasePath) unavailable (local_thread_catalog未確認)"])
+        }
+
+        let currentSQL = """
+        SELECT json_object(
+          'id', thread_id, 'title', display_title, 'updated_at', source_updated_at,
+          'cwd', cwd, 'branch', git_branch, 'source_kind', source_kind,
+          'source_detail', source_detail, 'thread_source', thread_source
+        )
+        FROM local_thread_catalog
+        WHERE host_id = 'local' AND missing_candidate = 0 AND cwd IS NOT NULL AND trim(cwd) != ''
+        ORDER BY source_recency_at DESC, source_updated_at DESC, thread_id
+        LIMIT 100;
+        """
+        if let rows = query(sql: currentSQL) {
+            return ChatGPTAdapterResult(sessions: rows.compactMap { parse($0) }, notes: ["ChatGPT: \(databasePath) local_thread_catalog v2 read-only; explicit cwd rows=\(rows.count)"])
+        }
+
+        let legacySQL = """
+        SELECT json_object('id', thread_id, 'title', display_title, 'updated_at', source_updated_at, 'cwd', cwd, 'branch', git_branch, 'source_kind', source_kind)
+        FROM local_thread_catalog
+        WHERE cwd IS NOT NULL AND trim(cwd) != ''
+        ORDER BY source_updated_at DESC, thread_id
+        LIMIT 100;
+        """
+        guard let rows = query(sql: legacySQL) else {
+            return ChatGPTAdapterResult(sessions: [], notes: ["ChatGPT: \(databasePath) local_thread_catalog read failed or schema unsupported; explicit cwd取得不能"])
+        }
+        return ChatGPTAdapterResult(sessions: rows.compactMap { parse($0) }, notes: ["ChatGPT: \(databasePath) local_thread_catalog legacy schema read-only; explicit cwd rows=\(rows.count)"])
+    }
+
+    private func query(sql: String) -> [[String: Any]]? {
+        guard let result = try? runner.run("/usr/bin/sqlite3", arguments: ["-batch", "-noheader", "file:\(databasePath)?mode=ro", sql], currentDirectory: nil), result.succeeded else { return nil }
+        return result.stdout.split(whereSeparator: \.isNewline).compactMap { line in
+            guard let data = String(line).data(using: .utf8), let value = try? JSONSerialization.jsonObject(with: data) else { return nil }
+            return value as? [String: Any]
+        }
+    }
+
+    private func parse(_ dictionary: [String: Any]) -> ChatGPTSessionMetadata? {
+        guard let id = dictionary["id"] as? String, !id.isEmpty, let cwd = dictionary["cwd"] as? String, !cwd.isEmpty else { return nil }
+        return ChatGPTSessionMetadata(id: id, title: dictionary["title"] as? String ?? "Untitled session", updatedAt: date(dictionary["updated_at"]), cwd: cwd, branch: dictionary["branch"] as? String, url: nil, source: "\(databasePath):local_thread_catalog", sourceKind: dictionary["source_kind"] as? String)
+    }
+
+    private func date(_ value: Any?) -> Date? {
+        guard let value else { return nil }
+        if let number = value as? Double { return Date(timeIntervalSince1970: number > 10_000_000_000 ? number / 1000 : number) }
+        if let string = value as? String, let number = Double(string) { return Date(timeIntervalSince1970: number > 10_000_000_000 ? number / 1000 : number) }
+        return nil
+    }
+}
+
+private struct LegacyJSONAdapter: ChatGPTSessionAdapter {
+    let roots: [URL]
 
     private static let candidateDirectories = ["", "Local Storage", "IndexedDB"]
     private static let candidateFileNames: Set<String> = ["session.json", "sessions.json", "conversations.json", "conversations.jsonl", "state.json", "metadata.json"]
     private static let maxFiles = 64
     private static let maxTotalBytes: Int64 = 50_000_000
     private static let maxFileBytes: Int64 = 2_000_000
+    private static let maxSessions = 500
+    private static let maxDepth = 32
 
-    private func scanJSON(root: URL, processSnapshot: ProcessActivitySnapshot) -> [SessionRecord] {
-        var records: [SessionRecord] = []
+    func read() -> ChatGPTAdapterResult {
+        var sessions: [ChatGPTSessionMetadata] = []
+        var notes: [String] = []
+        for root in roots {
+            guard FileManager.default.fileExists(atPath: root.path) else {
+                notes.append("ChatGPT: \(root.path) unavailable")
+                continue
+            }
+            let (inspectedFiles, skippedFiles) = scan(root: root, sessions: &sessions)
+            notes.append("ChatGPT: \(root.path) JSON/JSONL candidate scan read-only; files=\(inspectedFiles), skipped=\(skippedFiles)")
+        }
+        return ChatGPTAdapterResult(sessions: sessions, notes: notes)
+    }
+
+    private func scan(root: URL, sessions: inout [ChatGPTSessionMetadata]) -> (Int, Int) {
         var inspectedFiles = 0
+        var skippedFiles = 0
         var totalBytes: Int64 = 0
         for directory in Self.candidateDirectories {
-            guard inspectedFiles < Self.maxFiles, totalBytes < Self.maxTotalBytes else { break }
+            guard inspectedFiles < Self.maxFiles, totalBytes < Self.maxTotalBytes, sessions.count < Self.maxSessions else { break }
             let directoryURL = directory.isEmpty ? root : root.appendingPathComponent(directory)
             guard let children = try? FileManager.default.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey], options: [.skipsHiddenFiles]) else { continue }
             for fileURL in children where Self.candidateFileNames.contains(fileURL.lastPathComponent) {
-                guard inspectedFiles < Self.maxFiles, totalBytes < Self.maxTotalBytes else { break }
+                guard inspectedFiles < Self.maxFiles, totalBytes < Self.maxTotalBytes, sessions.count < Self.maxSessions else { break }
                 inspectedFiles += 1
                 let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap(Int64.init) ?? 0
-                guard size <= Self.maxFileBytes, totalBytes + size <= Self.maxTotalBytes, let values = readJSONObjects(fileURL) else { continue }
+                guard size <= Self.maxFileBytes, totalBytes + size <= Self.maxTotalBytes, let data = try? Data(contentsOf: fileURL) else {
+                    skippedFiles += 1
+                    continue
+                }
                 totalBytes += size
-                for value in values { collect(value, records: &records, source: fileURL.path, processSnapshot: processSnapshot) }
+                guard let object = parseJSON(data, url: fileURL) else {
+                    skippedFiles += 1
+                    continue
+                }
+                collect(object, source: fileURL.path, depth: 0, sessions: &sessions)
             }
         }
-        return records
+        return (inspectedFiles, skippedFiles)
     }
 
-    private func readJSONObjects(_ url: URL) -> [[String: Any]]? {
-        guard let resource = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]), resource.isRegularFile == true, (resource.fileSize ?? 0) <= Self.maxFileBytes, let data = try? Data(contentsOf: url) else { return nil }
+    private func parseJSON(_ data: Data, url: URL) -> Any? {
         if url.pathExtension.lowercased() == "jsonl" {
-            return data.split(separator: 10).compactMap { try? JSONSerialization.jsonObject(with: Data($0)) as? [String: Any] }
+            return data.split(separator: 10).compactMap { try? JSONSerialization.jsonObject(with: Data($0)) }
         }
-        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
-        return [object].compactMap { $0 as? [String: Any] }
+        return try? JSONSerialization.jsonObject(with: data)
     }
 
-    private func collect(_ object: Any, records: inout [SessionRecord], source: String, processSnapshot: ProcessActivitySnapshot) {
-        guard let dictionary = object as? [String: Any] else {
-            if let array = object as? [Any] { array.forEach { collect($0, records: &records, source: source, processSnapshot: processSnapshot) } }
-            return
+    private func collect(_ object: Any, source: String, depth: Int, sessions: inout [ChatGPTSessionMetadata]) {
+        guard depth <= Self.maxDepth, sessions.count < Self.maxSessions else { return }
+        if let dictionary = object as? [String: Any] {
+            let id = firstString(dictionary, keys: ["id", "conversationId", "conversation_id", "threadId", "thread_id"])
+            let cwd = firstString(dictionary, keys: ["cwd", "workingDirectory", "worktreePath", "repoPath", "repositoryPath"])
+            if let id, let cwd, !id.isEmpty, !cwd.isEmpty {
+                sessions.append(ChatGPTSessionMetadata(id: id, title: firstString(dictionary, keys: ["title", "name"]) ?? "Untitled session", updatedAt: date(dictionary), cwd: cwd, branch: firstString(dictionary, keys: ["branch", "branchName"]), url: URL(string: firstString(dictionary, keys: ["url", "link"]) ?? ""), source: source, sourceKind: nil))
+            }
+            for value in dictionary.values { collect(value, source: source, depth: depth + 1, sessions: &sessions) }
+        } else if let array = object as? [Any] {
+            for value in array { collect(value, source: source, depth: depth + 1, sessions: &sessions) }
         }
-        let id = firstString(dictionary, keys: ["id", "conversationId", "conversation_id", "threadId", "thread_id"])
-        let cwd = firstString(dictionary, keys: ["cwd", "workingDirectory", "worktreePath", "repoPath", "repositoryPath"])
-        if let id, let cwd {
-            let state = activityProbe.activity(for: id, provider: .chatGPT, snapshot: processSnapshot)
-            records.append(SessionRecord(id: "chatgpt-\(id)", provider: .chatGPT, title: firstString(dictionary, keys: ["title", "name"]) ?? "Untitled session", updatedAt: date(dictionary), cwd: cwd, branch: firstString(dictionary, keys: ["branch", "branchName"]), url: URL(string: firstString(dictionary, keys: ["url", "link"]) ?? ""), activity: state.0, evidence: "\(source); explicit path/id; \(state.1)"))
-        }
-        dictionary.values.forEach { collect($0, records: &records, source: source, processSnapshot: processSnapshot) }
     }
 
     private func firstString(_ dictionary: [String: Any], keys: [String]) -> String? {
@@ -234,9 +373,10 @@ public struct ChatGPTSessionProvider: SessionProvider {
     }
 
     private func date(_ dictionary: [String: Any]) -> Date? {
-        if let value = firstString(dictionary, keys: ["updatedAt", "updated_at", "modifiedAt", "lastUpdatedAt"]), let date = ISO8601DateFormatter().date(from: value) { return date }
         for key in ["updatedAt", "updated_at", "modifiedAt", "lastUpdatedAt"] {
             if let value = dictionary[key] as? Double { return Date(timeIntervalSince1970: value > 10_000_000_000 ? value / 1000 : value) }
+            if let value = dictionary[key] as? String, let number = Double(value) { return Date(timeIntervalSince1970: number > 10_000_000_000 ? number / 1000 : number) }
+            if let value = dictionary[key] as? String, let date = ISO8601DateFormatter().date(from: value) { return date }
         }
         return nil
     }
@@ -249,7 +389,7 @@ public final class SessionService: @unchecked Sendable {
     public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner()) {
         let probe = ProcessActivityProbe(runner: runner)
         processProbe = probe
-        providers = [CodexSessionProvider(home: home, runner: runner, activityProbe: probe), ChatGPTSessionProvider(home: home, activityProbe: probe)]
+        providers = [CodexSessionProvider(home: home, runner: runner, activityProbe: probe), ChatGPTSessionProvider(home: home, runner: runner, activityProbe: probe)]
     }
 
     public func discover() -> SessionDiscoveryResult {

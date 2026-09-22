@@ -70,6 +70,79 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(counter.value, 1)
     }
 
+    func testChatGPTCatalogFixtureParsesExplicitCwdAndAssociatesWorktree() throws {
+        let repository = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-chatgpt-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: repository) }
+
+        let git = LocalProcessRunner()
+        func runGit(_ arguments: [String]) throws {
+            let result = try git.run("/usr/bin/git", arguments: ["-C", repository.path] + arguments, currentDirectory: nil)
+            XCTAssertTrue(result.succeeded, result.stderr)
+        }
+        try runGit(["init", "-b", "main"])
+        try runGit(["config", "user.email", "worktree-lens@example.invalid"])
+        try runGit(["config", "user.name", "Worktree Lens Test"])
+        FileManager.default.createFile(atPath: repository.appendingPathComponent("fixture.txt").path, contents: Data("fixture\n".utf8))
+        try runGit(["add", "."])
+        try runGit(["commit", "-m", "fixture"])
+
+        let id = "chatgpt-fixture-1"
+        let json = "{\"id\":\"\(id)\",\"title\":\"Desktop fixture\",\"updated_at\":1790063182,\"cwd\":\"\(repository.path)\",\"branch\":\"main\",\"source_kind\":\"chatgpt\"}\n"
+        let database = repository.appendingPathComponent(".codex/sqlite/codex-dev.db")
+        try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: database.path, contents: Data())
+        let provider = ChatGPTSessionProvider(
+            home: repository.path,
+            runner: StaticRunner(output: json),
+            activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))
+        )
+
+        let discovery = provider.discover()
+        let session = try XCTUnwrap(discovery.sessions.first)
+        XCTAssertEqual(session.id, "chatgpt-\(id)")
+        XCTAssertEqual(session.provider, .chatGPT)
+        XCTAssertEqual(session.title, "Desktop fixture")
+        XCTAssertEqual(session.cwd, repository.path)
+        XCTAssertEqual(session.branch, "main")
+        XCTAssertEqual(session.activity, .inactive)
+        XCTAssertTrue(session.evidence.contains("explicit cwd/id"))
+        XCTAssertEqual(session.url, URL(string: "codex://threads/\(id)"))
+
+        let snapshot = try GitService().snapshot(repositoryPath: repository.path, sessions: discovery.sessions)
+        XCTAssertEqual(snapshot.branches.flatMap(\.worktrees).flatMap(\.sessions).map(\.id), [session.id])
+    }
+
+    func testChatGPTSessionWithoutExplicitPathIsNotLinked() {
+        let provider = ChatGPTSessionProvider(
+            home: "/tmp/worktree-lens-no-chatgpt-home-\(UUID().uuidString)",
+            runner: StaticRunner(output: "{\"id\":\"no-path\",\"title\":\"No path\"}\n"),
+            activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))
+        )
+
+        let result = provider.discover()
+        XCTAssertTrue(result.sessions.isEmpty)
+        XCTAssertTrue(result.notes.contains { $0.contains("explicit cwd + session ID metadataなし") })
+    }
+
+    func testChatGPTMalformedAndOversizedJSONIsSkippedSafely() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-chatgpt-json-\(UUID().uuidString)")
+        let root = home.appendingPathComponent("Library/Application Support/com.openai.chat")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        FileManager.default.createFile(atPath: root.appendingPathComponent("sessions.json").path, contents: Data("{not-json".utf8))
+        FileManager.default.createFile(atPath: root.appendingPathComponent("state.json").path, contents: Data(repeating: 0x78, count: 2_000_001))
+
+        let result = ChatGPTSessionProvider(
+            home: home.path,
+            runner: StaticRunner(output: ""),
+            activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))
+        ).discover()
+
+        XCTAssertTrue(result.sessions.isEmpty)
+        XCTAssertTrue(result.notes.contains { $0.contains("skipped=2") })
+    }
+
     func testLocalProcessRunnerDrainsLargeStdoutAndStderr() throws {
         let result = try LocalProcessRunner().run("/bin/zsh", arguments: ["-c", "i=0; while ((i < 200000)); do print -n x; ((i++)); done & i=0; while ((i < 200000)); do print -nu2 y; ((i++)); done; wait"], currentDirectory: nil)
         XCTAssertTrue(result.succeeded, result.stderr)
