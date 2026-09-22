@@ -145,13 +145,12 @@ public struct CodexSessionProvider: SessionProvider {
 public struct ChatGPTSessionProvider: SessionProvider {
     public let kind: SessionProviderKind = .chatGPT
     private let home: String
-    private let runner: any ProcessRunning
     private let activityProbe: any SessionActivityProbing
 
     public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner(), activityProbe: any SessionActivityProbing = ProcessActivityProbe()) {
         self.home = home
-        self.runner = runner
         self.activityProbe = activityProbe
+        _ = runner // Retain source compatibility; ChatGPT no longer reads SQLite.
     }
 
     public func discover() -> SessionDiscoveryResult {
@@ -159,30 +158,16 @@ public struct ChatGPTSessionProvider: SessionProvider {
     }
 
     public func discover(processSnapshot: ProcessActivitySnapshot) -> SessionDiscoveryResult {
-        let catalogPath = URL(fileURLWithPath: home).appendingPathComponent(".codex/sqlite/codex-dev.db").path
-        let adapters: [any ChatGPTSessionAdapter] = [
-            SQLiteCatalogAdapter(databasePath: catalogPath, runner: runner),
-            LegacyJSONAdapter(roots: legacyRoots)
-        ]
-        var metadata: [ChatGPTSessionMetadata] = []
-        var notes: [String] = []
-        for adapter in adapters {
-            let result = adapter.read()
-            metadata.append(contentsOf: result.sessions)
-            notes.append(contentsOf: result.notes)
-        }
-
-        let records = metadata.map { makeRecord($0, processSnapshot: processSnapshot) }
+        let result = LegacyJSONAdapter(roots: legacyRoots).read()
+        let records = result.sessions.map { makeRecord($0, processSnapshot: processSnapshot) }
+        var notes = result.notes
         if records.isEmpty {
-            notes.append("ChatGPT: explicit cwd + session ID metadataなし。worktree紐付け不能 → Unknown")
+            notes.append("ChatGPT: explicit cwd + session ID metadataなし。ChatGPT由来 session未検出。worktree紐付け不能 → Unknown")
         } else {
             notes.append("ChatGPT: absolute cwd + session ID metadataのみ採用。推測紐付けなし")
         }
-        let chromiumStorage = URL(fileURLWithPath: home).appendingPathComponent("Library/Application Support/Codex/Default/Local Storage/leveldb")
-        if FileManager.default.fileExists(atPath: chromiumStorage.path) {
-            notes.append("ChatGPT: \(chromiumStorage.path) Chromium LevelDB存在。明示cwd schema未確認のため未採用")
-        }
-        notes.append("ChatGPT: SQLite/JSON/JSONL read-only。書込み・DB migration・IndexedDB/LevelDB無差別scanなし")
+        notes.append("ChatGPT: \(URL(fileURLWithPath: home).appendingPathComponent(".codex/sqlite/codex-dev.db").path) local_thread_catalog未採用。実機でChatGPT由来を識別するschema/value証拠なし")
+        notes.append("ChatGPT: SQLite/IndexedDB/LevelDB未採用。JSON/JSONLのみread-only候補scan。書込み・DB migrationなし")
         var unique: [String: SessionRecord] = [:]
         records.forEach { unique[$0.id] = $0 }
         return SessionDiscoveryResult(sessions: unique.values.sorted { $0.updatedAt ?? .distantPast > $1.updatedAt ?? .distantPast }, notes: notes)
@@ -200,7 +185,6 @@ public struct ChatGPTSessionProvider: SessionProvider {
     private func makeRecord(_ metadata: ChatGPTSessionMetadata, processSnapshot: ProcessActivitySnapshot) -> SessionRecord {
         let state = activityProbe.activity(for: metadata.id, provider: .chatGPT, snapshot: processSnapshot)
         var evidence = "\(metadata.source); explicit cwd/id"
-        if let sourceKind = metadata.sourceKind, !sourceKind.isEmpty { evidence += "; source_kind=\(sourceKind)" }
         if let branch = metadata.branch, !branch.isEmpty { evidence += "; git_branch=\(branch)" }
         evidence += "; \(state.1)"
         return SessionRecord(
@@ -210,7 +194,7 @@ public struct ChatGPTSessionProvider: SessionProvider {
             updatedAt: metadata.updatedAt,
             cwd: metadata.cwd,
             branch: metadata.branch,
-            url: metadata.url ?? URL(string: "codex://threads/\(metadata.id)"),
+            url: metadata.url,
             activity: state.0,
             evidence: evidence
         )
@@ -225,7 +209,6 @@ private struct ChatGPTSessionMetadata: Sendable {
     let branch: String?
     let url: URL?
     let source: String
-    let sourceKind: String?
 }
 
 private struct ChatGPTAdapterResult: Sendable {
@@ -233,69 +216,7 @@ private struct ChatGPTAdapterResult: Sendable {
     let notes: [String]
 }
 
-private protocol ChatGPTSessionAdapter: Sendable {
-    func read() -> ChatGPTAdapterResult
-}
-
-private struct SQLiteCatalogAdapter: ChatGPTSessionAdapter {
-    let databasePath: String
-    let runner: any ProcessRunning
-
-    func read() -> ChatGPTAdapterResult {
-        guard FileManager.default.fileExists(atPath: databasePath) else {
-            return ChatGPTAdapterResult(sessions: [], notes: ["ChatGPT: \(databasePath) unavailable (local_thread_catalog未確認)"])
-        }
-
-        let currentSQL = """
-        SELECT json_object(
-          'id', thread_id, 'title', display_title, 'updated_at', source_updated_at,
-          'cwd', cwd, 'branch', git_branch, 'source_kind', source_kind,
-          'source_detail', source_detail, 'thread_source', thread_source
-        )
-        FROM local_thread_catalog
-        WHERE host_id = 'local' AND missing_candidate = 0 AND cwd IS NOT NULL AND trim(cwd) != ''
-        ORDER BY source_recency_at DESC, source_updated_at DESC, thread_id
-        LIMIT 100;
-        """
-        if let rows = query(sql: currentSQL) {
-            return ChatGPTAdapterResult(sessions: rows.compactMap { parse($0) }, notes: ["ChatGPT: \(databasePath) local_thread_catalog v2 read-only; explicit cwd rows=\(rows.count)"])
-        }
-
-        let legacySQL = """
-        SELECT json_object('id', thread_id, 'title', display_title, 'updated_at', source_updated_at, 'cwd', cwd, 'branch', git_branch, 'source_kind', source_kind)
-        FROM local_thread_catalog
-        WHERE cwd IS NOT NULL AND trim(cwd) != ''
-        ORDER BY source_updated_at DESC, thread_id
-        LIMIT 100;
-        """
-        guard let rows = query(sql: legacySQL) else {
-            return ChatGPTAdapterResult(sessions: [], notes: ["ChatGPT: \(databasePath) local_thread_catalog read failed or schema unsupported; explicit cwd取得不能"])
-        }
-        return ChatGPTAdapterResult(sessions: rows.compactMap { parse($0) }, notes: ["ChatGPT: \(databasePath) local_thread_catalog legacy schema read-only; explicit cwd rows=\(rows.count)"])
-    }
-
-    private func query(sql: String) -> [[String: Any]]? {
-        guard let result = try? runner.run("/usr/bin/sqlite3", arguments: ["-batch", "-noheader", "file:\(databasePath)?mode=ro", sql], currentDirectory: nil), result.succeeded else { return nil }
-        return result.stdout.split(whereSeparator: \.isNewline).compactMap { line in
-            guard let data = String(line).data(using: .utf8), let value = try? JSONSerialization.jsonObject(with: data) else { return nil }
-            return value as? [String: Any]
-        }
-    }
-
-    private func parse(_ dictionary: [String: Any]) -> ChatGPTSessionMetadata? {
-        guard let id = dictionary["id"] as? String, !id.isEmpty, let cwd = dictionary["cwd"] as? String, !cwd.isEmpty else { return nil }
-        return ChatGPTSessionMetadata(id: id, title: dictionary["title"] as? String ?? "Untitled session", updatedAt: date(dictionary["updated_at"]), cwd: cwd, branch: dictionary["branch"] as? String, url: nil, source: "\(databasePath):local_thread_catalog", sourceKind: dictionary["source_kind"] as? String)
-    }
-
-    private func date(_ value: Any?) -> Date? {
-        guard let value else { return nil }
-        if let number = value as? Double { return Date(timeIntervalSince1970: number > 10_000_000_000 ? number / 1000 : number) }
-        if let string = value as? String, let number = Double(string) { return Date(timeIntervalSince1970: number > 10_000_000_000 ? number / 1000 : number) }
-        return nil
-    }
-}
-
-private struct LegacyJSONAdapter: ChatGPTSessionAdapter {
+private struct LegacyJSONAdapter {
     let roots: [URL]
 
     private static let candidateDirectories = ["", "Local Storage", "IndexedDB"]
@@ -360,7 +281,7 @@ private struct LegacyJSONAdapter: ChatGPTSessionAdapter {
             let id = firstString(dictionary, keys: ["id", "conversationId", "conversation_id", "threadId", "thread_id"])
             let cwd = firstString(dictionary, keys: ["cwd", "workingDirectory", "worktreePath", "repoPath", "repositoryPath"])
             if let id, let cwd, !id.isEmpty, !cwd.isEmpty {
-                sessions.append(ChatGPTSessionMetadata(id: id, title: firstString(dictionary, keys: ["title", "name"]) ?? "Untitled session", updatedAt: date(dictionary), cwd: cwd, branch: firstString(dictionary, keys: ["branch", "branchName"]), url: URL(string: firstString(dictionary, keys: ["url", "link"]) ?? ""), source: source, sourceKind: nil))
+                sessions.append(ChatGPTSessionMetadata(id: id, title: firstString(dictionary, keys: ["title", "name"]) ?? "Untitled session", updatedAt: date(dictionary), cwd: cwd, branch: firstString(dictionary, keys: ["branch", "branchName"]), url: URL(string: firstString(dictionary, keys: ["url", "link"]) ?? ""), source: source))
             }
             for value in dictionary.values { collect(value, source: source, depth: depth + 1, sessions: &sessions) }
         } else if let array = object as? [Any] {
@@ -389,14 +310,21 @@ public final class SessionService: @unchecked Sendable {
     public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner()) {
         let probe = ProcessActivityProbe(runner: runner)
         processProbe = probe
-        providers = [CodexSessionProvider(home: home, runner: runner, activityProbe: probe), ChatGPTSessionProvider(home: home, runner: runner, activityProbe: probe)]
+        providers = [CodexSessionProvider(home: home, runner: runner, activityProbe: probe), ChatGPTSessionProvider(home: home, activityProbe: probe)]
     }
 
     public func discover() -> SessionDiscoveryResult {
         let processSnapshot = processProbe.snapshot()
+        var seenThreadIDs = Set<String>()
         return providers.reduce(into: SessionDiscoveryResult(sessions: [], notes: [])) { result, provider in
             let next = provider.discover(processSnapshot: processSnapshot)
-            result = SessionDiscoveryResult(sessions: result.sessions + next.sessions, notes: result.notes + next.notes)
+            let unique = next.sessions.filter { seenThreadIDs.insert(rawThreadID($0)).inserted }
+            result = SessionDiscoveryResult(sessions: result.sessions + unique, notes: result.notes + next.notes)
         }
+    }
+
+    private func rawThreadID(_ session: SessionRecord) -> String {
+        let prefix = session.provider == .codex ? "codex-" : "chatgpt-"
+        return session.id.hasPrefix(prefix) ? String(session.id.dropFirst(prefix.count)) : session.id
     }
 }

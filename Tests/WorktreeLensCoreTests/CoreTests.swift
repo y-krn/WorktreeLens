@@ -70,7 +70,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(counter.value, 1)
     }
 
-    func testChatGPTCatalogFixtureParsesExplicitCwdAndAssociatesWorktree() throws {
+    func testChatGPTJSONFixtureParsesExplicitCwdAndAssociatesWorktree() throws {
         let repository = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-chatgpt-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: repository) }
@@ -88,13 +88,12 @@ final class CoreTests: XCTestCase {
         try runGit(["commit", "-m", "fixture"])
 
         let id = "chatgpt-fixture-1"
-        let json = "{\"id\":\"\(id)\",\"title\":\"Desktop fixture\",\"updated_at\":1790063182,\"cwd\":\"\(repository.path)\",\"branch\":\"main\",\"source_kind\":\"chatgpt\"}\n"
-        let database = repository.appendingPathComponent(".codex/sqlite/codex-dev.db")
-        try FileManager.default.createDirectory(at: database.deletingLastPathComponent(), withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: database.path, contents: Data())
+        let root = repository.appendingPathComponent("Library/Application Support/com.openai.chat")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let json = "[{\"id\":\"\(id)\",\"title\":\"Desktop fixture\",\"updatedAt\":1790063182.0,\"cwd\":\"\(repository.path)\",\"branch\":\"main\",\"url\":\"chatgpt://sessions/\(id)\"}]"
+        FileManager.default.createFile(atPath: root.appendingPathComponent("sessions.json").path, contents: Data(json.utf8))
         let provider = ChatGPTSessionProvider(
             home: repository.path,
-            runner: StaticRunner(output: json),
             activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))
         )
 
@@ -107,22 +106,47 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(session.branch, "main")
         XCTAssertEqual(session.activity, .inactive)
         XCTAssertTrue(session.evidence.contains("explicit cwd/id"))
-        XCTAssertEqual(session.url, URL(string: "codex://threads/\(id)"))
+        XCTAssertEqual(session.url, URL(string: "chatgpt://sessions/\(id)"))
 
         let snapshot = try GitService().snapshot(repositoryPath: repository.path, sessions: discovery.sessions)
         XCTAssertEqual(snapshot.branches.flatMap(\.worktrees).flatMap(\.sessions).map(\.id), [session.id])
     }
 
-    func testChatGPTSessionWithoutExplicitPathIsNotLinked() {
+    func testChatGPTSessionWithoutExplicitPathIsNotLinked() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-no-chatgpt-home-\(UUID().uuidString)")
+        let root = home.appendingPathComponent("Library/Application Support/com.openai.chat")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        FileManager.default.createFile(atPath: root.appendingPathComponent("sessions.json").path, contents: Data("[{\"id\":\"no-path\",\"title\":\"No path\"}]".utf8))
         let provider = ChatGPTSessionProvider(
-            home: "/tmp/worktree-lens-no-chatgpt-home-\(UUID().uuidString)",
-            runner: StaticRunner(output: "{\"id\":\"no-path\",\"title\":\"No path\"}\n"),
+            home: home.path,
             activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))
         )
 
         let result = provider.discover()
         XCTAssertTrue(result.sessions.isEmpty)
         XCTAssertTrue(result.notes.contains { $0.contains("explicit cwd + session ID metadataなし") })
+    }
+
+    func testSameThreadIDIsNotReturnedByBothProviders() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-provider-dedup-\(UUID().uuidString)")
+        let state = home.appendingPathComponent(".codex/sqlite/state_5.sqlite")
+        let jsonRoot = home.appendingPathComponent("Library/Application Support/com.openai.chat")
+        try FileManager.default.createDirectory(at: state.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: jsonRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        FileManager.default.createFile(atPath: state.path, contents: Data())
+
+        let id = "shared-thread"
+        let output = "{\"id\":\"\(id)\",\"title\":\"Codex\",\"updated_at\":1790063182,\"cwd\":\"\(home.path)\",\"branch\":\"main\"}\n"
+        let chatGPTJSON = "[{\"id\":\"\(id)\",\"title\":\"ChatGPT\",\"cwd\":\"\(home.path)\"}]"
+        FileManager.default.createFile(atPath: jsonRoot.appendingPathComponent("sessions.json").path, contents: Data(chatGPTJSON.utf8))
+
+        let result = SessionService(home: home.path, runner: StaticRunner(output: output)).discover()
+
+        XCTAssertEqual(result.sessions.count, 1)
+        XCTAssertEqual(result.sessions.first?.provider, .codex)
+        XCTAssertEqual(result.sessions.first?.id, "codex-\(id)")
     }
 
     func testChatGPTMalformedAndOversizedJSONIsSkippedSafely() throws {
@@ -135,7 +159,6 @@ final class CoreTests: XCTestCase {
 
         let result = ChatGPTSessionProvider(
             home: home.path,
-            runner: StaticRunner(output: ""),
             activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))
         ).discover()
 
