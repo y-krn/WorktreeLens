@@ -5,6 +5,16 @@ public struct RepositoryScanResult: Sendable {
     public let sessionNotes: [String]
 }
 
+public struct RepositoryLocalScanResult: Sendable {
+    public let snapshot: RepositorySnapshot
+    public let sessionNotes: [String]
+
+    public init(snapshot: RepositorySnapshot, sessionNotes: [String]) {
+        self.snapshot = snapshot
+        self.sessionNotes = sessionNotes
+    }
+}
+
 public final class RepositoryScanService: @unchecked Sendable {
     private let git: GitService
     private let sessions: SessionService
@@ -16,22 +26,60 @@ public final class RepositoryScanService: @unchecked Sendable {
         self.github = github
     }
 
-    public func scan(repositoryPath: String) async throws -> RepositoryScanResult {
-        let discovery = sessions.discover()
+    public func scanSessions() -> SessionDiscoveryResult {
+        sessions.discover()
+    }
+
+    public func readGit(repositoryPath: String, discovery: SessionDiscoveryResult) throws -> RepositoryLocalScanResult {
         let local = try git.snapshot(repositoryPath: repositoryPath, sessions: discovery.sessions)
+        return RepositoryLocalScanResult(snapshot: local, sessionNotes: discovery.notes)
+    }
+
+    public func localScan(repositoryPath: String) throws -> RepositoryLocalScanResult {
+        try readGit(repositoryPath: repositoryPath, discovery: scanSessions())
+    }
+
+    public func scan(repositoryPath: String) async throws -> RepositoryScanResult {
+        let local = try localScan(repositoryPath: repositoryPath)
+        let snapshot = await enrichGitHub(local: local)
+        return RepositoryScanResult(snapshot: snapshot, sessionNotes: local.sessionNotes)
+    }
+
+    public func enrichGitHub(local: RepositoryLocalScanResult, progress: @escaping @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in }) async -> RepositorySnapshot {
+        let branches = local.snapshot.branches.filter { !$0.isDetachedGroup }
+        let total = branches.count
+        guard total > 0 else { return local.snapshot }
+        let maxConcurrent = 4
         let githubStatuses = await withTaskGroup(of: (String, GitHubStatus).self, returning: [String: GitHubStatus].self) { group in
-            for branch in local.branches where !branch.isDetachedGroup {
+            var statuses: [String: GitHubStatus] = [:]
+            var nextIndex = 0
+            var completed = 0
+
+            func addNextTask() {
+                guard nextIndex < branches.count else { return }
+                let branch = branches[nextIndex]
+                nextIndex += 1
                 group.addTask {
-                    (branch.id, self.github.status(repositoryPath: local.path, branch: branch.name))
+                    (branch.id, await self.github.statusAsync(repositoryPath: local.snapshot.path, branch: branch.name))
                 }
             }
-            var statuses: [String: GitHubStatus] = [:]
-            for await (branchID, status) in group { statuses[branchID] = status }
+
+            for _ in 0..<min(maxConcurrent, branches.count) { addNextTask() }
+            while let result = await group.next() {
+                statuses[result.0] = result.1
+                completed += 1
+                progress(completed, total)
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                addNextTask()
+            }
             return statuses
         }
-        let enrichedBranches = local.branches.map { branch in
+        let enrichedBranches = local.snapshot.branches.map { branch in
             BranchInfo(id: branch.id, name: branch.name, sha: branch.sha, upstream: branch.upstream, ahead: branch.ahead, behind: branch.behind, isMerged: branch.isMerged, remoteGone: branch.remoteGone, lastCommitAt: branch.lastCommitAt, isDefaultBranch: branch.isDefaultBranch, isDetachedGroup: branch.isDetachedGroup, defaultAhead: branch.defaultAhead, defaultBehind: branch.defaultBehind, worktrees: branch.worktrees, github: githubStatuses[branch.id] ?? .unavailable)
         }
-        return RepositoryScanResult(snapshot: RepositorySnapshot(path: local.path, defaultBranch: local.defaultBranch, branches: enrichedBranches), sessionNotes: discovery.notes)
+        return RepositorySnapshot(path: local.snapshot.path, defaultBranch: local.snapshot.defaultBranch, branches: enrichedBranches)
     }
 }

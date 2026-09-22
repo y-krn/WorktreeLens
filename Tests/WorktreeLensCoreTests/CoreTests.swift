@@ -4,20 +4,54 @@ import XCTest
 final class CoreTests: XCTestCase {
     private struct StaticRunner: ProcessRunning {
         let output: String
-        func run(_ executable: String, arguments: [String], currentDirectory: String?) throws -> ProcessResult {
+        func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
             ProcessResult(status: 0, stdout: output)
         }
     }
 
     func testSessionActivityUsesOnlyExplicitProcessEvidence() {
         let active = ProcessActivityProbe(runner: StaticRunner(output: "123 /usr/local/bin/codex thread-123\n"))
-        XCTAssertEqual(active.activity(for: "thread-123", provider: .codex).0, .active)
+        let activeSnapshot = active.snapshot()
+        XCTAssertEqual(active.activity(for: "thread-123", provider: .codex, snapshot: activeSnapshot).0, .active)
 
         let inactive = ProcessActivityProbe(runner: StaticRunner(output: "123 /usr/bin/other-process\n"))
-        XCTAssertEqual(inactive.activity(for: "thread-123", provider: .codex).0, .inactive)
+        let inactiveSnapshot = inactive.snapshot()
+        XCTAssertEqual(inactive.activity(for: "thread-123", provider: .codex, snapshot: inactiveSnapshot).0, .inactive)
 
         let unknown = ProcessActivityProbe(runner: StaticRunner(output: "123 /Applications/Codex.app/Contents/MacOS/Codex\n"))
-        XCTAssertEqual(unknown.activity(for: "thread-123", provider: .codex).0, .unknown)
+        let unknownSnapshot = unknown.snapshot()
+        XCTAssertEqual(unknown.activity(for: "thread-123", provider: .codex, snapshot: unknownSnapshot).0, .unknown)
+    }
+
+    func testSessionActivitySnapshotIsReusableAcrossSessions() {
+        final class Counter: @unchecked Sendable {
+            var value = 0
+        }
+        struct CountingRunner: ProcessRunning {
+            let counter: Counter
+            func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+                counter.value += 1
+                return ProcessResult(status: 0, stdout: "123 /usr/bin/other-process\n")
+            }
+        }
+
+        let counter = Counter()
+        let probe = ProcessActivityProbe(runner: CountingRunner(counter: counter))
+        let snapshot = probe.snapshot()
+        _ = probe.activity(for: "session-a", provider: .codex, snapshot: snapshot)
+        _ = probe.activity(for: "session-b", provider: .chatGPT, snapshot: snapshot)
+        XCTAssertEqual(counter.value, 1)
+
+        counter.value = 0
+        _ = SessionService(home: "/tmp/worktree-lens-no-session-home-\(UUID().uuidString)", runner: CountingRunner(counter: counter)).discover()
+        XCTAssertEqual(counter.value, 1)
+    }
+
+    func testLocalProcessRunnerDrainsLargeStdoutAndStderr() throws {
+        let result = try LocalProcessRunner().run("/bin/zsh", arguments: ["-c", "i=0; while ((i < 200000)); do print -n x; ((i++)); done & i=0; while ((i < 200000)); do print -nu2 y; ((i++)); done; wait"], currentDirectory: nil)
+        XCTAssertTrue(result.succeeded, result.stderr)
+        XCTAssertEqual(result.stdout.count, 200000)
+        XCTAssertEqual(result.stderr.count, 200000)
     }
 
     func testDirtyWorktreeIsNeverRemovable() {

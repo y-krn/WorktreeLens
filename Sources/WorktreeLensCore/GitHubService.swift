@@ -5,29 +5,44 @@ public final class GitHubService: @unchecked Sendable {
 
     public init(runner: any ProcessRunning = LocalProcessRunner()) { self.runner = runner }
 
-    public func status(repositoryPath: String, branch: String) -> GitHubStatus {
+    public static let requestTimeout: TimeInterval = 10
+
+    public func status(repositoryPath: String, branch: String, timeout: TimeInterval = GitHubService.requestTimeout) -> GitHubStatus {
         do {
-            let prs = try query(repositoryPath: repositoryPath, arguments: ["pr", "list", "--state", "all", "--head", branch, "--json", "number,title,state,isDraft,mergedAt,url"])
+            let deadline = Date().addingTimeInterval(timeout)
+            func remainingTimeout() throws -> TimeInterval {
+                let remaining = deadline.timeIntervalSinceNow
+                guard remaining > 0 else { throw ProcessRunnerError.timedOut("gh") }
+                return remaining
+            }
+            let prs = try query(repositoryPath: repositoryPath, arguments: ["pr", "list", "--state", "all", "--head", branch, "--json", "number,title,state,isDraft,mergedAt,url"], timeout: try remainingTimeout())
             let issues = prs.flatMap { pr -> [[String: Any]] in
                 guard let number = pr["number"] as? Int else { return [] }
-                guard let payloads = try? query(repositoryPath: repositoryPath, arguments: ["pr", "view", String(number), "--json", "closingIssuesReferences"]),
+                guard let payloads = try? query(repositoryPath: repositoryPath, arguments: ["pr", "view", String(number), "--json", "closingIssuesReferences"], timeout: (try? remainingTimeout()) ?? 0),
                       let payload = payloads.first,
                       let references = payload["closingIssuesReferences"] as? [[String: Any]] else { return [] }
                 return references
             }
-            let runs = try query(repositoryPath: repositoryPath, arguments: ["run", "list", "--branch", branch, "--limit", "20", "--json", "databaseId,name,status,conclusion,url"])
+            let runs = try query(repositoryPath: repositoryPath, arguments: ["run", "list", "--branch", branch, "--limit", "20", "--json", "databaseId,name,status,conclusion,url"], timeout: try remainingTimeout())
             return GitHubStatus(issues: issues.compactMap(issue), pullRequests: prs.compactMap(pullRequest), actions: runs.compactMap(action), error: nil)
         } catch {
             return GitHubStatus(issues: [], pullRequests: [], actions: [], error: error.localizedDescription)
         }
     }
 
-    private func query(repositoryPath: String, arguments: [String]) throws -> [[String: Any]] {
+    public func statusAsync(repositoryPath: String, branch: String, timeout: TimeInterval = GitHubService.requestTimeout) async -> GitHubStatus {
+        await Task.detached(priority: .utility) {
+            self.status(repositoryPath: repositoryPath, branch: branch, timeout: timeout)
+        }.value
+    }
+
+    private func query(repositoryPath: String, arguments: [String], timeout: TimeInterval) throws -> [[String: Any]] {
         let executable: String
         if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/gh") { executable = "/opt/homebrew/bin/gh" }
         else if FileManager.default.isExecutableFile(atPath: "/usr/local/bin/gh") { executable = "/usr/local/bin/gh" }
         else { throw ProcessRunnerError.executableNotFound("gh") }
-        let fallback = try runner.run(executable, arguments: arguments, currentDirectory: repositoryPath)
+        let fallback = try runner.run(executable, arguments: arguments, currentDirectory: repositoryPath, timeout: timeout)
+        if fallback.timedOut { throw ProcessRunnerError.timedOut("gh") }
         guard fallback.succeeded else { throw ProcessRunnerError.failed(fallback.stderr.trimmingCharacters(in: .whitespacesAndNewlines)) }
         guard let data = fallback.stdout.data(using: .utf8), let json = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
         return json

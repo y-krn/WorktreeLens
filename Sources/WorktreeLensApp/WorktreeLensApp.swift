@@ -34,6 +34,8 @@ final class ApplicationModel: ObservableObject {
     @Published var cleanupPreview: CleanupPreview?
     @Published var isImporterPresented = false
     @Published var isLoading = false
+    @Published var scanPhase: String?
+    @Published var canCancelGitHub = false
     @Published var staleDays = 7
 
     let repositoryStore = RepositoryStore()
@@ -43,6 +45,7 @@ final class ApplicationModel: ObservableObject {
     lazy var scanner = RepositoryScanService(git: git, sessions: sessions, github: github)
     lazy var cleanup = CleanupService(git: git, sessions: sessions)
     private var refreshToken = UUID()
+    private var refreshTask: Task<Void, Never>?
 
     init() {
         registeredPaths = repositoryStore.paths
@@ -53,8 +56,9 @@ final class ApplicationModel: ObservableObject {
     func register(url: URL) {
         repositoryStore.add(url.path)
         registeredPaths = repositoryStore.paths
+        let wasSelected = selectedPath == url.path
         selectedPath = url.path
-        refresh(path: url.path)
+        if wasSelected { refresh(path: url.path) }
     }
 
     func removeSelectedRepository() {
@@ -63,7 +67,6 @@ final class ApplicationModel: ObservableObject {
         registeredPaths = repositoryStore.paths
         self.selectedPath = registeredPaths.first
         snapshot = nil
-        if let next = self.selectedPath { refresh(path: next) }
     }
 
     func refreshSelected() {
@@ -72,21 +75,45 @@ final class ApplicationModel: ObservableObject {
     }
 
     func refresh(path: String) {
+        refreshTask?.cancel()
         let token = UUID()
         refreshToken = token
         isLoading = true
+        scanPhase = "Scanning sessions…"
+        canCancelGitHub = false
         let scanner = self.scanner
-        Task.detached(priority: .userInitiated) {
+        refreshTask = Task.detached(priority: .userInitiated) {
             do {
-                let result = try await scanner.scan(repositoryPath: path)
+                let discovery = scanner.scanSessions()
                 await MainActor.run {
                     guard self.refreshToken == token else { return }
-                    self.snapshot = result.snapshot
-                    self.sessionNotes = result.sessionNotes
-                    self.selectedBranchID = result.snapshot.branches.first?.id
-                    self.selectedWorktreeID = result.snapshot.branches.first?.worktrees.first?.id
+                    self.scanPhase = "Reading Git…"
+                }
+                let local = try scanner.readGit(repositoryPath: path, discovery: discovery)
+                await MainActor.run {
+                    guard self.refreshToken == token else { return }
+                    self.snapshot = local.snapshot
+                    self.sessionNotes = local.sessionNotes
+                    self.selectedBranchID = local.snapshot.branches.first?.id
+                    self.selectedWorktreeID = local.snapshot.branches.first?.worktrees.first?.id
                     self.errorMessage = nil
+                    self.canCancelGitHub = true
+                    let total = local.snapshot.branches.filter { !$0.isDetachedGroup }.count
+                    self.scanPhase = "Loading GitHub 0/\(total)…"
+                }
+                let enriched = await scanner.enrichGitHub(local: local) { completed, total in
+                    Task { @MainActor in
+                        guard self.refreshToken == token else { return }
+                        self.scanPhase = "Loading GitHub \(completed)/\(total)…"
+                    }
+                }
+                await MainActor.run {
+                    guard self.refreshToken == token else { return }
+                    self.snapshot = enriched
                     self.isLoading = false
+                    self.canCancelGitHub = false
+                    self.scanPhase = nil
+                    self.statusMessage = Task.isCancelled ? "GitHub loading cancelled" : nil
                 }
             } catch {
                 await MainActor.run {
@@ -94,9 +121,16 @@ final class ApplicationModel: ObservableObject {
                     self.snapshot = nil
                     self.errorMessage = error.localizedDescription
                     self.isLoading = false
+                    self.canCancelGitHub = false
+                    self.scanPhase = nil
                 }
             }
         }
+    }
+
+    func cancelGitHub() {
+        guard canCancelGitHub else { return }
+        refreshTask?.cancel()
     }
 
     func branch(for worktree: WorktreeInfo) -> BranchInfo? {
@@ -255,7 +289,9 @@ struct ContentView: View {
                     }
                 }
                 Spacer()
+                if let scanPhase = model.scanPhase { Text(scanPhase).font(.caption).foregroundStyle(.secondary) }
                 if model.isLoading { ProgressView().controlSize(.small) }
+                if model.canCancelGitHub { Button("Cancel GitHub") { model.cancelGitHub() } }
                 Button { model.refreshSelected() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                 Menu { cleanupMenu } label: { Label("Cleanup", systemImage: "trash") }
             }

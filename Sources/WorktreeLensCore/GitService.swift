@@ -45,7 +45,9 @@ public final class GitService: @unchecked Sendable {
         _ = try run(["-C", repositoryPath, "branch", "-d", branch])
     }
 
-    private let branchFormat = "%(refname:short)%x1f%(objectname)%x1f%(upstream:short)%x1f%(upstream:track)%x1f%(committerdate:iso8601-strict)%x1e"
+    // Pass separators as literal control characters. Git's ref-filter on macOS
+    // does not expand the pretty-format `%xNN` spelling here.
+    private let branchFormat = "%(refname:short)\u{1f}%(objectname)\u{1f}%(upstream:short)\u{1f}%(upstream:track)\u{1f}%(committerdate:iso8601-strict)\u{1e}"
 
     private struct DefaultBranch: Sendable {
         let name: String
