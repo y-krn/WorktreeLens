@@ -111,4 +111,78 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(preview.items.first?.reason, .unmergedBranch)
         XCTAssertFalse(preview.items.first?.allowed ?? true)
     }
+
+    func testSnapshotParsesAllBranchesAndAssociatesWorktrees() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-\(UUID().uuidString)")
+        let repository = root.appendingPathComponent("repository")
+        let remote = root.appendingPathComponent("remote.git")
+        let alphaWorktree = root.appendingPathComponent("attached-alpha")
+        let betaWorktree = root.appendingPathComponent("attached-beta")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let runner = LocalProcessRunner()
+        func git(_ arguments: [String], in path: URL = repository) throws -> String {
+            let result = try runner.run("/usr/bin/git", arguments: ["-C", path.path] + arguments, currentDirectory: nil)
+            XCTAssertTrue(result.succeeded, "git \(arguments.joined(separator: " ")) failed: \(result.stderr)")
+            return result.stdout
+        }
+        func commit(_ name: String) throws {
+            FileManager.default.createFile(atPath: repository.appendingPathComponent(name).path, contents: Data(name.utf8))
+            _ = try git(["add", "."])
+            _ = try git(["commit", "-m", name])
+        }
+
+        _ = try runner.run("/usr/bin/git", arguments: ["init", "-b", "main", repository.path], currentDirectory: nil)
+        _ = try git(["config", "user.email", "worktree-lens@example.invalid"])
+        _ = try git(["config", "user.name", "Worktree Lens Test"])
+        try commit("base.txt")
+
+        _ = try git(["switch", "-c", "merged"])
+        try commit("merged.txt")
+        _ = try git(["switch", "main"])
+        _ = try git(["merge", "--no-ff", "merged", "-m", "merge merged"])
+
+        _ = try git(["switch", "-c", "delta"])
+        try commit("delta.txt")
+        _ = try git(["switch", "main"])
+
+        _ = try git(["switch", "-c", "gone"])
+        _ = try git(["switch", "main"])
+        _ = try git(["init", "--bare", remote.path], in: root)
+        _ = try git(["remote", "add", "origin", remote.path])
+        _ = try git(["push", "origin", "main"])
+        let remoteHead = try runner.run("/usr/bin/git", arguments: ["--git-dir", remote.path, "symbolic-ref", "HEAD", "refs/heads/main"], currentDirectory: nil)
+        XCTAssertTrue(remoteHead.succeeded, remoteHead.stderr)
+        _ = try git(["remote", "set-head", "origin", "main"])
+        _ = try git(["push", "-u", "origin", "gone"])
+        _ = try git(["update-ref", "-d", "refs/remotes/origin/gone"])
+
+        _ = try git(["switch", "-c", "attached-alpha"])
+        _ = try git(["switch", "main"])
+        _ = try git(["switch", "-c", "attached-beta"])
+        _ = try git(["switch", "main"])
+        _ = try git(["worktree", "add", alphaWorktree.path, "attached-alpha"])
+        _ = try git(["worktree", "add", betaWorktree.path, "attached-beta"])
+
+        let snapshot = try GitService().snapshot(repositoryPath: repository.path)
+        let expectedNames: Set<String> = ["main", "merged", "delta", "gone", "attached-alpha", "attached-beta"]
+        let branches = Dictionary(uniqueKeysWithValues: snapshot.branches.map { ($0.name, $0) })
+
+        XCTAssertEqual(Set(branches.keys), expectedNames)
+        XCTAssertTrue(snapshot.branches.allSatisfy { $0.name == $0.name.trimmingCharacters(in: .whitespacesAndNewlines) })
+        XCTAssertEqual(snapshot.defaultBranch, "main")
+        XCTAssertEqual(branches["attached-alpha"]?.worktrees.map { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path }, [alphaWorktree.resolvingSymlinksInPath().path])
+        XCTAssertEqual(branches["attached-beta"]?.worktrees.map { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path }, [betaWorktree.resolvingSymlinksInPath().path])
+        XCTAssertTrue(branches["merged"]?.isMerged == true)
+        XCTAssertFalse(branches["delta"]?.isMerged ?? true)
+        XCTAssertEqual(branches["delta"]?.defaultAhead, 1)
+        XCTAssertEqual(branches["delta"]?.defaultBehind, 0)
+        XCTAssertTrue(branches["gone"]?.remoteGone == true)
+
+        let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: root.appendingPathComponent("no-session-home").path))
+        let remoteGonePreview = cleanup.previewRemoteGoneBranches(repositoryPath: repository.path)
+        XCTAssertEqual(remoteGonePreview.items.map(\.target), ["gone"])
+        XCTAssertTrue(remoteGonePreview.items.first?.allowed == true)
+    }
 }

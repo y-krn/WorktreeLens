@@ -76,9 +76,10 @@ public final class GitService: @unchecked Sendable {
     }
 
     private func parseBranch(record: String, root: String, defaultBranch: DefaultBranch?, worktrees: [WorktreeInfo]) -> BranchInfo? {
-        let fields = record.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
+        let normalizedRecord = record.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fields = normalizedRecord.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
         guard fields.count >= 5 else { return nil }
-        let name = fields[0]
+        let name = fields[0].trimmingCharacters(in: .whitespacesAndNewlines)
         let tracking = fields[3]
         let aheadBehind = tracking.split(separator: ",").reduce(into: (ahead: 0, behind: 0)) { result, item in
             let value = item.trimmingCharacters(in: .whitespaces)
