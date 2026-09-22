@@ -112,6 +112,29 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(snapshot.branches.flatMap(\.worktrees).flatMap(\.sessions).map(\.id), [session.id])
     }
 
+    func testChatGPTOnlyAcceptsExplicitAbsoluteCwd() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-chatgpt-cwd-(UUID().uuidString)")
+        let root = home.appendingPathComponent("Library/Application Support/com.openai.chat")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let cases = [
+            (cwd: "/tmp/repo", accepted: true),
+            (cwd: "repo", accepted: false),
+            (cwd: "./repo", accepted: false),
+            (cwd: "~/repo", accepted: false)
+        ]
+        for (index, testCase) in cases.enumerated() {
+            let json = "[{\"id\":\"cwd-\(index)\",\"title\":\"cwd fixture\",\"cwd\":\"\(testCase.cwd)\"}]"
+            try Data(json.utf8).write(to: root.appendingPathComponent("sessions.json"), options: .atomic)
+            let sessions = ChatGPTSessionProvider(
+                home: home.path,
+                activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))
+            ).discover().sessions
+            XCTAssertEqual(sessions.isEmpty, !testCase.accepted, "cwd=\(testCase.cwd)")
+        }
+    }
+
     func testChatGPTSessionWithoutExplicitPathIsNotLinked() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-no-chatgpt-home-\(UUID().uuidString)")
         let root = home.appendingPathComponent("Library/Application Support/com.openai.chat")

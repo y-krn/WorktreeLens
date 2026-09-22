@@ -280,13 +280,18 @@ private struct LegacyJSONAdapter {
         if let dictionary = object as? [String: Any] {
             let id = firstString(dictionary, keys: ["id", "conversationId", "conversation_id", "threadId", "thread_id"])
             let cwd = firstString(dictionary, keys: ["cwd", "workingDirectory", "worktreePath", "repoPath", "repositoryPath"])
-            if let id, let cwd, !id.isEmpty, !cwd.isEmpty {
+            if let id, let cwd = explicitAbsolutePath(cwd), !id.isEmpty {
                 sessions.append(ChatGPTSessionMetadata(id: id, title: firstString(dictionary, keys: ["title", "name"]) ?? "Untitled session", updatedAt: date(dictionary), cwd: cwd, branch: firstString(dictionary, keys: ["branch", "branchName"]), url: URL(string: firstString(dictionary, keys: ["url", "link"]) ?? ""), source: source))
             }
             for value in dictionary.values { collect(value, source: source, depth: depth + 1, sessions: &sessions) }
         } else if let array = object as? [Any] {
             for value in array { collect(value, source: source, depth: depth + 1, sessions: &sessions) }
         }
+    }
+
+    private func explicitAbsolutePath(_ value: String?) -> String? {
+        guard let value, !value.isEmpty, value.first == "/" else { return nil }
+        return value
     }
 
     private func firstString(_ dictionary: [String: Any], keys: [String]) -> String? {
