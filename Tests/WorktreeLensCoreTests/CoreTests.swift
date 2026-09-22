@@ -553,6 +553,92 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath.path))
     }
 
+    func testMergedGitHubVerifiedAttachedWorktreeIsRemovedWhenRemoteRemains() async throws {
+        let fixture = try makeFeatureRepository()
+        let remotePath = fixture.root.appendingPathComponent("remote.git")
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["init", "--bare", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "remote", "add", "origin", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "main"])
+        _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "feature"])
+        _ = try runGit(["-C", fixture.repository.path, "remote", "set-head", "origin", "main"])
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 137, sha: fixture.featureSHA), executable: "gh")
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        XCTAssertFalse(branch.remoteGone)
+        let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let enrichedBranch = branch.withMergeEvidence(.githubVerified(prNumber: 137, mergedAt: mergedAt), github: status)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [enrichedBranch])
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+
+        let preview = cleanup.previewMergedBranches(snapshot: snapshot)
+        let group = try XCTUnwrap(preview.groups.first)
+        XCTAssertEqual(group.steps.map(\.step), [.removeWorktree, .deleteBranch])
+        XCTAssertTrue(group.allowed)
+        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath.path))
+        XCTAssertTrue((try runGit(["-C", fixture.repository.path, "show-ref", "--verify", "refs/remotes/origin/feature"])).contains(fixture.featureSHA))
+    }
+
+    func testMergedGitAncestorAttachedWorktreeIsRemovedWhenRemoteRemains() throws {
+        let fixture = try makeFeatureRepository()
+        let remotePath = fixture.root.appendingPathComponent("remote.git")
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["init", "--bare", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "remote", "add", "origin", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "main"])
+        _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "feature"])
+        _ = try runGit(["-C", fixture.repository.path, "remote", "set-head", "origin", "main"])
+        _ = try runGit(["-C", fixture.repository.path, "merge", "--no-ff", "feature", "-m", "merge feature"])
+        _ = try runGit(["-C", fixture.repository.path, "push", "origin", "main"])
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        XCTAssertTrue(branch.isMerged)
+        XCTAssertFalse(branch.remoteGone)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path))
+
+        let preview = cleanup.previewMergedBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch]))
+        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath.path))
+        XCTAssertTrue((try runGit(["-C", fixture.repository.path, "show-ref", "--verify", "refs/remotes/origin/feature"])).contains(fixture.featureSHA))
+    }
+
+    func testMergedBranchWithoutWorktreeUsesBranchOnlyPlan() async throws {
+        let fixture = try makeFeatureRepository()
+        let remotePath = fixture.root.appendingPathComponent("remote.git")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["init", "--bare", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "remote", "add", "origin", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "main"])
+        _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "feature"])
+        _ = try runGit(["-C", fixture.repository.path, "remote", "set-head", "origin", "main"])
+
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 138, sha: fixture.featureSHA), executable: "gh")
+        let git = GitService()
+        let branch = try XCTUnwrap((try git.snapshot(repositoryPath: fixture.repository.path)).branches.first { $0.name == "feature" })
+        let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let mergedBranch = branch.withMergeEvidence(.githubVerified(prNumber: 138, mergedAt: mergedAt), github: status)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [mergedBranch])
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+
+        let preview = cleanup.previewMergedBranches(snapshot: snapshot)
+        XCTAssertEqual(preview.groups.first?.steps.map(\.step), [.deleteBranch])
+        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertTrue((try runGit(["-C", fixture.repository.path, "show-ref", "--verify", "refs/remotes/origin/feature"])).contains(fixture.featureSHA))
+    }
+
     func testRemoteGoneGitAncestorAttachedWorktreeIsRemovedBeforeBranch() throws {
         let fixture = try makeFeatureRepository()
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")

@@ -416,7 +416,7 @@ struct ContentView: View {
                 .disabled(model.selectedBranch() == nil)
             Divider()
             Button("Prune Worktree Metadata…") { model.requestPrune() }
-            Button("Delete Merged Branches…") { model.requestDeleteMergedBranches() }
+            Button("Clean Up Merged Branches…") { model.requestDeleteMergedBranches() }
             Button("Delete Stale Worktrees (\(model.staleDays)d)…") { model.requestRemoveStaleWorktrees() }
             Button("Delete Remote-gone Branches…") { model.requestDeleteRemoteGoneBranches() }
             Divider()
