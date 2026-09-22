@@ -1,5 +1,23 @@
 import Foundation
 
+public struct CleanupBranchState: Sendable {
+    public let name: String
+    public let sha: String
+    public let defaultBranch: String?
+    public let isDefaultBranch: Bool
+    public let worktreePaths: [String]
+    public let isGitAncestor: Bool
+
+    public init(name: String, sha: String, defaultBranch: String?, isDefaultBranch: Bool, worktreePaths: [String], isGitAncestor: Bool) {
+        self.name = name
+        self.sha = sha
+        self.defaultBranch = defaultBranch
+        self.isDefaultBranch = isDefaultBranch
+        self.worktreePaths = worktreePaths
+        self.isGitAncestor = isGitAncestor
+    }
+}
+
 public final class GitService: @unchecked Sendable {
     private let runner: any ProcessRunning
     private let gitPath: String
@@ -19,7 +37,7 @@ public final class GitService: @unchecked Sendable {
         let worktrees = try worktreeList(repositoryPath: root, defaultBranch: defaultBranch, sessions: sessions)
         let output = try run(["-C", root, "for-each-ref", "--format=\(branchFormat)", "refs/heads"]).stdout
         var branches = output.split(separator: "\u{1e}", omittingEmptySubsequences: true).compactMap { record in
-            parseBranch(record: String(record), root: root, defaultBranch: defaultBranch, worktrees: worktrees)
+            parseBranch(record: String(record), root: root, defaultBranch: defaultBranch, worktrees: worktrees, includeCleanupUIData: true)
         }
 
         let detached = worktrees.filter(\.isDetached)
@@ -60,18 +78,42 @@ public final class GitService: @unchecked Sendable {
         let records = try worktreeRecords(repositoryPath: root)
         let attached = placeholderWorktrees(records: records, branch: name)
         guard let record = try branchRecord(repositoryPath: root, name: name) else { return nil }
-        return parseBranch(record: record, root: root, defaultBranch: defaultBranch, worktrees: attached)
+        return parseBranch(record: record, root: root, defaultBranch: defaultBranch, worktrees: attached, includeCleanupUIData: false)
+    }
+
+    /// Revalidates only the state required before deleting one branch.
+    public func cleanupBranchState(repositoryPath: String, name: String) throws -> CleanupBranchState? {
+        let root = try canonicalRepositoryPath(repositoryPath)
+        let defaultBranch = try resolveDefaultBranch(root)
+        let records = try worktreeRecords(repositoryPath: root)
+        guard let record = try cleanupStateBranchRecord(repositoryPath: root, name: name) else { return nil }
+        let fields = record.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "\u{1f}", omittingEmptySubsequences: false)
+            .map(String.init)
+        guard fields.count >= 2 else { return nil }
+        let worktreePaths = records.compactMap { record -> String? in
+            guard record["branch"]?.replacingOccurrences(of: "refs/heads/", with: "") == name else { return nil }
+            return record["worktree"]
+        }
+        return CleanupBranchState(
+            name: name,
+            sha: fields[1],
+            defaultBranch: defaultBranch?.name,
+            isDefaultBranch: defaultBranch?.name == name,
+            worktreePaths: worktreePaths,
+            isGitAncestor: defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false
+        )
     }
 
     /// Revalidates one worktree's status, branch relation, and linked sessions.
-    public func cleanupWorktree(repositoryPath: String, path: String, sessions: [SessionRecord]) throws -> (worktree: WorktreeInfo, branch: BranchInfo?) {
+    public func cleanupWorktree(repositoryPath: String, path: String, sessions: [SessionRecord], includeCleanupUIData: Bool = false) throws -> (worktree: WorktreeInfo, branch: BranchInfo?) {
         let root = try canonicalRepositoryPath(repositoryPath)
         let defaultBranch = try resolveDefaultBranch(root)
         let records = try worktreeRecords(repositoryPath: root)
         guard let record = records.first(where: { isPath($0["worktree"] ?? "", equalTo: path) }) else {
             throw ProcessRunnerError.failed("Worktree missing")
         }
-        guard let worktree = try makeWorktree(record: record, defaultBranch: defaultBranch, sessions: sessions) else {
+        guard let worktree = try makeWorktree(record: record, defaultBranch: defaultBranch, sessions: sessions, includeCleanupUIData: includeCleanupUIData) else {
             throw ProcessRunnerError.failed("Worktree record invalid")
         }
         let branch = try worktree.branch.flatMap { try cleanupBranchRecord(repositoryPath: root, name: $0, defaultBranch: defaultBranch, records: records) }
@@ -92,9 +134,14 @@ public final class GitService: @unchecked Sendable {
         return output.split(separator: "\u{1e}", omittingEmptySubsequences: true).map(String.init).first
     }
 
+    private func cleanupStateBranchRecord(repositoryPath: String, name: String) throws -> String? {
+        let output = try run(["-C", repositoryPath, "for-each-ref", "--format=%(refname:short)\u{1f}%(objectname)\u{1e}", "refs/heads/\(name)"]).stdout
+        return output.split(separator: "\u{1e}", omittingEmptySubsequences: true).map(String.init).first
+    }
+
     private func cleanupBranchRecord(repositoryPath: String, name: String, defaultBranch: DefaultBranch?, records: [[String: String]]) throws -> BranchInfo? {
         guard let record = try branchRecord(repositoryPath: repositoryPath, name: name) else { return nil }
-        return parseBranch(record: record, root: repositoryPath, defaultBranch: defaultBranch, worktrees: placeholderWorktrees(records: records, branch: name))
+        return parseBranch(record: record, root: repositoryPath, defaultBranch: defaultBranch, worktrees: placeholderWorktrees(records: records, branch: name), includeCleanupUIData: false)
     }
 
     private func placeholderWorktrees(records: [[String: String]], branch: String) -> [WorktreeInfo] {
@@ -125,7 +172,7 @@ public final class GitService: @unchecked Sendable {
         return DefaultBranch(name: conventional[0], ref: conventional[0])
     }
 
-    private func parseBranch(record: String, root: String, defaultBranch: DefaultBranch?, worktrees: [WorktreeInfo]) -> BranchInfo? {
+    private func parseBranch(record: String, root: String, defaultBranch: DefaultBranch?, worktrees: [WorktreeInfo], includeCleanupUIData: Bool) -> BranchInfo? {
         let normalizedRecord = record.trimmingCharacters(in: .whitespacesAndNewlines)
         let fields = normalizedRecord.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
         guard fields.count >= 5 else { return nil }
@@ -138,7 +185,7 @@ public final class GitService: @unchecked Sendable {
             if value.contains("behind") { result.behind = number }
         }
         let branchWorktrees = worktrees.filter { $0.branch == name }
-        let relation = defaultBranch.flatMap { defaultDelta(root: root, branch: name, defaultRef: $0.ref) } ?? (ahead: 0, behind: 0)
+        let relation = includeCleanupUIData ? (defaultBranch.flatMap { defaultDelta(root: root, branch: name, defaultRef: $0.ref) } ?? (ahead: 0, behind: 0)) : (ahead: 0, behind: 0)
         let merged = defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false
         return BranchInfo(id: name, name: name, sha: fields[1], upstream: fields[2].isEmpty ? nil : fields[2], ahead: aheadBehind.ahead, behind: aheadBehind.behind, isMerged: merged, remoteGone: tracking.contains("gone"), lastCommitAt: strictDate(fields[4]), isDefaultBranch: defaultBranch?.name == name, defaultAhead: relation.ahead, defaultBehind: relation.behind, worktrees: branchWorktrees, mergeEvidence: merged ? .gitAncestor : MergeEvidence.none)
     }
@@ -164,13 +211,13 @@ public final class GitService: @unchecked Sendable {
         return records
     }
 
-    private func makeWorktree(record: [String: String], defaultBranch: DefaultBranch?, sessions: [SessionRecord]) throws -> WorktreeInfo? {
+    private func makeWorktree(record: [String: String], defaultBranch: DefaultBranch?, sessions: [SessionRecord], includeCleanupUIData: Bool = true) throws -> WorktreeInfo? {
         guard let path = record["worktree"], let head = record["HEAD"] else { return nil }
         let branch = record["branch"]?.replacingOccurrences(of: "refs/heads/", with: "")
         let detached = branch == nil || record["detached"] != nil
         let status = try? runStatus(path)
-        let lastActivity = try? lastCommitDate(path)
-        let delta = defaultBranch.flatMap { defaultDelta(root: path, branch: head, defaultRef: $0.ref) } ?? (ahead: 0, behind: 0)
+        let lastActivity = includeCleanupUIData ? (try? lastCommitDate(path)) : nil
+        let delta = includeCleanupUIData ? (defaultBranch.flatMap { defaultDelta(root: path, branch: head, defaultRef: $0.ref) } ?? (ahead: 0, behind: 0)) : (ahead: 0, behind: 0)
         return WorktreeInfo(id: path, path: path, branch: branch, head: head, isBare: record["bare"] != nil, isLocked: record["locked"] != nil, isDetached: detached, isClean: status?.clean ?? false, stagedCount: status?.staged ?? 0, unstagedCount: status?.unstaged ?? 0, untrackedCount: status?.untracked ?? 0, lastActivity: lastActivity ?? nil, defaultAhead: delta.ahead, defaultBehind: delta.behind, sessions: sessions.filter { session in
                 guard let cwd = session.cwd else { return false }
                 return isPath(cwd, within: path) || isPath(path, within: cwd)
