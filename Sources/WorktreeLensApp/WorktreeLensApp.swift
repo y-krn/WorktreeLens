@@ -177,7 +177,6 @@ final class ApplicationModel: ObservableObject {
             return
         }
         selection = .branch(id)
-        loadGitHubDetailForCurrentSelection()
     }
 
     func selectWorktree(id: String) {
@@ -186,7 +185,6 @@ final class ApplicationModel: ObservableObject {
             return
         }
         selection = .worktree(id)
-        loadGitHubDetailForCurrentSelection()
     }
 
     func selectionDidChange() {
