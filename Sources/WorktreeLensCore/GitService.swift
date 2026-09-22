@@ -45,6 +45,31 @@ public final class GitService: @unchecked Sendable {
         _ = try run(["-C", repositoryPath, "branch", "-d", branch])
     }
 
+    /// Revalidates one branch without rebuilding the repository-wide snapshot.
+    public func cleanupBranch(repositoryPath: String, name: String) throws -> BranchInfo? {
+        let root = try canonicalRepositoryPath(repositoryPath)
+        let defaultBranch = try resolveDefaultBranch(root)
+        let records = try worktreeRecords(repositoryPath: root)
+        let attached = placeholderWorktrees(records: records, branch: name)
+        guard let record = try branchRecord(repositoryPath: root, name: name) else { return nil }
+        return parseBranch(record: record, root: root, defaultBranch: defaultBranch, worktrees: attached)
+    }
+
+    /// Revalidates one worktree's status, branch relation, and linked sessions.
+    public func cleanupWorktree(repositoryPath: String, path: String, sessions: [SessionRecord]) throws -> (worktree: WorktreeInfo, branch: BranchInfo?) {
+        let root = try canonicalRepositoryPath(repositoryPath)
+        let defaultBranch = try resolveDefaultBranch(root)
+        let records = try worktreeRecords(repositoryPath: root)
+        guard let record = records.first(where: { isPath($0["worktree"] ?? "", equalTo: path) }) else {
+            throw ProcessRunnerError.failed("Worktree missing")
+        }
+        guard let worktree = try makeWorktree(record: record, defaultBranch: defaultBranch, sessions: sessions) else {
+            throw ProcessRunnerError.failed("Worktree record invalid")
+        }
+        let branch = try worktree.branch.flatMap { try cleanupBranchRecord(repositoryPath: root, name: $0, defaultBranch: defaultBranch, records: records) }
+        return (worktree, branch)
+    }
+
     // Pass separators as literal control characters. Git's ref-filter on macOS
     // does not expand the pretty-format `%xNN` spelling here.
     private let branchFormat = "%(refname:short)\u{1f}%(objectname)\u{1f}%(upstream:short)\u{1f}%(upstream:track)\u{1f}%(committerdate:iso8601-strict)\u{1e}"
@@ -52,6 +77,23 @@ public final class GitService: @unchecked Sendable {
     private struct DefaultBranch: Sendable {
         let name: String
         let ref: String
+    }
+
+    private func branchRecord(repositoryPath: String, name: String) throws -> String? {
+        let output = try run(["-C", repositoryPath, "for-each-ref", "--format=\(branchFormat)", "refs/heads/\(name)"]).stdout
+        return output.split(separator: "\u{1e}", omittingEmptySubsequences: true).map(String.init).first
+    }
+
+    private func cleanupBranchRecord(repositoryPath: String, name: String, defaultBranch: DefaultBranch?, records: [[String: String]]) throws -> BranchInfo? {
+        guard let record = try branchRecord(repositoryPath: repositoryPath, name: name) else { return nil }
+        return parseBranch(record: record, root: repositoryPath, defaultBranch: defaultBranch, worktrees: placeholderWorktrees(records: records, branch: name))
+    }
+
+    private func placeholderWorktrees(records: [[String: String]], branch: String) -> [WorktreeInfo] {
+        records.compactMap { record in
+            guard record["branch"]?.replacingOccurrences(of: "refs/heads/", with: "") == branch, let path = record["worktree"] else { return nil }
+            return WorktreeInfo(id: path, path: path, branch: branch, head: record["HEAD"] ?? "", isBare: record["bare"] != nil, isLocked: record["locked"] != nil, isClean: false, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)
+        }
     }
 
     private func resolveDefaultBranch(_ root: String) throws -> DefaultBranch? {
@@ -94,6 +136,10 @@ public final class GitService: @unchecked Sendable {
     }
 
     private func worktreeList(repositoryPath: String, defaultBranch: DefaultBranch?, sessions: [SessionRecord]) throws -> [WorktreeInfo] {
+        try worktreeRecords(repositoryPath: repositoryPath).compactMap { try makeWorktree(record: $0, defaultBranch: defaultBranch, sessions: sessions) }
+    }
+
+    private func worktreeRecords(repositoryPath: String) throws -> [[String: String]] {
         let output = try run(["-C", repositoryPath, "worktree", "list", "--porcelain"]).stdout
         var records: [[String: String]] = []
         var current: [String: String] = [:]
@@ -107,19 +153,20 @@ public final class GitService: @unchecked Sendable {
             else if parts.count == 1 { current[parts[0]] = "" }
         }
         if !current.isEmpty { records.append(current) }
+        return records
+    }
 
-        return records.compactMap { record in
-            guard let path = record["worktree"], let head = record["HEAD"] else { return nil }
-            let branch = record["branch"]?.replacingOccurrences(of: "refs/heads/", with: "")
-            let detached = branch == nil || record["detached"] != nil
-            let status = try? runStatus(path)
-            let lastActivity = try? lastCommitDate(path)
-            let delta = defaultBranch.flatMap { defaultDelta(root: path, branch: head, defaultRef: $0.ref) } ?? (ahead: 0, behind: 0)
-            return WorktreeInfo(id: path, path: path, branch: branch, head: head, isBare: record["bare"] != nil, isLocked: record["locked"] != nil, isDetached: detached, isClean: status?.clean ?? false, stagedCount: status?.staged ?? 0, unstagedCount: status?.unstaged ?? 0, untrackedCount: status?.untracked ?? 0, lastActivity: lastActivity ?? nil, defaultAhead: delta.ahead, defaultBehind: delta.behind, sessions: sessions.filter { session in
+    private func makeWorktree(record: [String: String], defaultBranch: DefaultBranch?, sessions: [SessionRecord]) throws -> WorktreeInfo? {
+        guard let path = record["worktree"], let head = record["HEAD"] else { return nil }
+        let branch = record["branch"]?.replacingOccurrences(of: "refs/heads/", with: "")
+        let detached = branch == nil || record["detached"] != nil
+        let status = try? runStatus(path)
+        let lastActivity = try? lastCommitDate(path)
+        let delta = defaultBranch.flatMap { defaultDelta(root: path, branch: head, defaultRef: $0.ref) } ?? (ahead: 0, behind: 0)
+        return WorktreeInfo(id: path, path: path, branch: branch, head: head, isBare: record["bare"] != nil, isLocked: record["locked"] != nil, isDetached: detached, isClean: status?.clean ?? false, stagedCount: status?.staged ?? 0, unstagedCount: status?.unstaged ?? 0, untrackedCount: status?.untracked ?? 0, lastActivity: lastActivity ?? nil, defaultAhead: delta.ahead, defaultBehind: delta.behind, sessions: sessions.filter { session in
                 guard let cwd = session.cwd else { return false }
                 return isPath(cwd, within: path) || isPath(path, within: cwd)
             })
-        }
     }
 
     private func isAncestor(root: String, branch: String, defaultRef: String) -> Bool {
@@ -166,5 +213,9 @@ public final class GitService: @unchecked Sendable {
         let candidatePath = URL(fileURLWithPath: candidate).standardizedFileURL.path
         let rootPath = URL(fileURLWithPath: root).standardizedFileURL.path
         return candidatePath == rootPath || candidatePath.hasPrefix(rootPath + "/")
+    }
+
+    private func isPath(_ lhs: String, equalTo rhs: String) -> Bool {
+        URL(fileURLWithPath: lhs).standardizedFileURL.path == URL(fileURLWithPath: rhs).standardizedFileURL.path
     }
 }

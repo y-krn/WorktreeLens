@@ -25,57 +25,58 @@ public final class CleanupService: @unchecked Sendable {
         return CleanupDecision(allowed: true)
     }
 
-    public func previewRemoveWorktree(repositoryPath: String, path: String) -> CleanupPreview {
-        guard let snapshot = freshSnapshot(repositoryPath), let match = locateWorktree(snapshot, path: path) else {
-            return CleanupPreview(operation: .removeWorktree, repositoryPath: repositoryPath, items: [CleanupPreviewItem(id: path, target: path, allowed: false, reason: .missingBranch)])
+    public func previewRemoveWorktree(snapshot: RepositorySnapshot, path: String) -> CleanupPreview {
+        guard let match = locateWorktree(snapshot, path: path) else {
+            return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [CleanupPreviewItem(id: path, target: path, allowed: false, reason: .missingBranch)])
         }
         let decision = decide(worktree: match.worktree, branch: match.branch)
-        return CleanupPreview(operation: .removeWorktree, repositoryPath: repositoryPath, items: [item(id: path, target: path, decision: decision)])
+        return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [item(id: path, target: path, decision: decision)])
     }
 
-    public func previewDeleteBranch(repositoryPath: String, name: String) -> CleanupPreview {
+    public func previewDeleteBranch(snapshot: RepositorySnapshot, name: String) -> CleanupPreview {
         let decision: CleanupDecision
-        if let snapshot = freshSnapshot(repositoryPath), let branch = snapshot.branches.first(where: { $0.name == name }) {
+        if let branch = snapshot.branches.first(where: { $0.name == name }) {
             decision = branchDecision(branch)
         } else {
             decision = CleanupDecision(allowed: false, reason: .missingBranch)
         }
-        return CleanupPreview(operation: .deleteBranch, repositoryPath: repositoryPath, items: [item(id: name, target: name, decision: decision)])
+        return CleanupPreview(operation: .deleteBranch, repositoryPath: snapshot.path, items: [item(id: name, target: name, decision: decision)])
     }
 
-    public func previewPrune(repositoryPath: String) -> CleanupPreview {
-        CleanupPreview(operation: .prune, repositoryPath: repositoryPath, items: [CleanupPreviewItem(id: "prune", target: "Unreachable worktree metadata", allowed: true)])
+    public func previewPrune(snapshot: RepositorySnapshot) -> CleanupPreview {
+        CleanupPreview(operation: .prune, repositoryPath: snapshot.path, items: [CleanupPreviewItem(id: "prune", target: "Unreachable worktree metadata", allowed: true)])
     }
 
-    public func previewMergedBranches(repositoryPath: String) -> CleanupPreview {
-        let items = freshSnapshot(repositoryPath)?.branches.filter { !$0.isDetachedGroup }.map { branch in
+    public func previewMergedBranches(snapshot: RepositorySnapshot) -> CleanupPreview {
+        let items = snapshot.branches.filter { !$0.isDetachedGroup }.map { branch in
             item(id: branch.name, target: branch.name, decision: branchDecision(branch))
-        } ?? []
-        return CleanupPreview(operation: .deleteMergedBranches, repositoryPath: repositoryPath, items: items)
+        }
+        return CleanupPreview(operation: .deleteMergedBranches, repositoryPath: snapshot.path, items: items)
     }
 
-    public func previewStaleWorktrees(repositoryPath: String, staleDays: Int, now: Date = Date()) -> CleanupPreview {
-        let items = freshSnapshot(repositoryPath)?.branches.flatMap { branch in
+    public func previewStaleWorktrees(snapshot: RepositorySnapshot, staleDays: Int, now: Date = Date()) -> CleanupPreview {
+        let items = snapshot.branches.flatMap { branch in
             branch.worktrees.map { worktree in
                 item(id: worktree.path, target: worktree.path, decision: decide(worktree: worktree, branch: branch, requireMerged: true, now: now, staleDays: staleDays))
             }
-        } ?? []
-        return CleanupPreview(operation: .removeStaleWorktrees, repositoryPath: repositoryPath, items: items, staleDays: staleDays)
+        }
+        return CleanupPreview(operation: .removeStaleWorktrees, repositoryPath: snapshot.path, items: items, staleDays: staleDays)
     }
 
-    public func previewRemoteGoneBranches(repositoryPath: String) -> CleanupPreview {
-        let items = freshSnapshot(repositoryPath)?.branches.filter { $0.remoteGone }.map { branch in
+    public func previewRemoteGoneBranches(snapshot: RepositorySnapshot) -> CleanupPreview {
+        let items = snapshot.branches.filter { $0.remoteGone }.map { branch in
             item(id: branch.name, target: branch.name, decision: branchDecision(branch))
-        } ?? []
-        return CleanupPreview(operation: .deleteRemoteGoneBranches, repositoryPath: repositoryPath, items: items)
+        }
+        return CleanupPreview(operation: .deleteRemoteGoneBranches, repositoryPath: snapshot.path, items: items)
     }
 
     public func execute(_ preview: CleanupPreview) -> [String] {
         var completed: [String] = []
+        let currentSessions = sessions.discover().sessions
         for target in preview.allowedItems {
             switch preview.operation {
             case .removeWorktree:
-                if executeRemoveWorktree(repositoryPath: preview.repositoryPath, path: target.id) { completed.append(target.id) }
+                if executeRemoveWorktree(repositoryPath: preview.repositoryPath, path: target.id, sessions: currentSessions) { completed.append(target.id) }
             case .deleteBranch:
                 if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id) { completed.append(target.id) }
             case .prune:
@@ -83,7 +84,7 @@ public final class CleanupService: @unchecked Sendable {
             case .deleteMergedBranches:
                 if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id) { completed.append(target.id) }
             case .removeStaleWorktrees:
-                if executeRemoveStale(repositoryPath: preview.repositoryPath, path: target.id, staleDays: preview.staleDays ?? 7) { completed.append(target.id) }
+                if executeRemoveStale(repositoryPath: preview.repositoryPath, path: target.id, staleDays: preview.staleDays ?? 7, sessions: currentSessions) { completed.append(target.id) }
             case .deleteRemoteGoneBranches:
                 if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id) { completed.append(target.id) }
             }
@@ -99,24 +100,20 @@ public final class CleanupService: @unchecked Sendable {
         return CleanupDecision(allowed: true)
     }
 
-    private func executeRemoveWorktree(repositoryPath: String, path: String) -> Bool {
-        guard let snapshot = freshSnapshot(repositoryPath), let match = locateWorktree(snapshot, path: path), decide(worktree: match.worktree, branch: match.branch).allowed else { return false }
+    private func executeRemoveWorktree(repositoryPath: String, path: String, sessions: [SessionRecord]) -> Bool {
+        guard let match = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: sessions), decide(worktree: match.worktree, branch: match.branch).allowed else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
     }
 
     private func executeDeleteBranch(repositoryPath: String, name: String) -> Bool {
-        guard let branch = freshSnapshot(repositoryPath)?.branches.first(where: { $0.name == name }), branchDecision(branch).allowed else { return false }
+        guard let branch = try? git.cleanupBranch(repositoryPath: repositoryPath, name: name), branchDecision(branch).allowed else { return false }
         return (try? git.deleteBranch(repositoryPath: repositoryPath, branch: name)) != nil
     }
 
-    private func executeRemoveStale(repositoryPath: String, path: String, staleDays: Int) -> Bool {
-        guard let snapshot = freshSnapshot(repositoryPath), let match = locateWorktree(snapshot, path: path) else { return false }
+    private func executeRemoveStale(repositoryPath: String, path: String, staleDays: Int, sessions: [SessionRecord]) -> Bool {
+        guard let match = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: sessions) else { return false }
         guard decide(worktree: match.worktree, branch: match.branch, requireMerged: true, now: Date(), staleDays: staleDays).allowed else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
-    }
-
-    private func freshSnapshot(_ repositoryPath: String) -> RepositorySnapshot? {
-        try? git.snapshot(repositoryPath: repositoryPath, sessions: sessions.discover().sessions)
     }
 
     private func locateWorktree(_ snapshot: RepositorySnapshot, path: String) -> (worktree: WorktreeInfo, branch: BranchInfo)? {

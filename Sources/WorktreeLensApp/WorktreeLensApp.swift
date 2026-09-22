@@ -34,6 +34,7 @@ final class ApplicationModel: ObservableObject {
     @Published var cleanupPreview: CleanupPreview?
     @Published var isImporterPresented = false
     @Published var isLoading = false
+    @Published var isCleanupPreviewLoading = false
     @Published var scanPhase: String?
     @Published var canCancelGitHub = false
     @Published var staleDays = 7
@@ -46,6 +47,8 @@ final class ApplicationModel: ObservableObject {
     lazy var cleanup = CleanupService(git: git, sessions: sessions)
     private var refreshToken = UUID()
     private var refreshTask: Task<Void, Never>?
+    private var cleanupPreviewToken = UUID()
+    private var cleanupPreviewProgressTask: Task<Void, Never>?
 
     init() {
         registeredPaths = repositoryStore.paths
@@ -148,40 +151,40 @@ final class ApplicationModel: ObservableObject {
     }
 
     func requestRemoveSelectedWorktree() {
-        guard let path = selectedPath, let worktree = selectedWorktree() else { return }
+        guard let path = selectedPath, let snapshot, snapshot.path == path, let worktree = selectedWorktree() else { return }
         let cleanup = self.cleanup
-        requestPreview { cleanup.previewRemoveWorktree(repositoryPath: path, path: worktree.path) }
+        requestPreview { cleanup.previewRemoveWorktree(snapshot: snapshot, path: worktree.path) }
     }
 
     func requestDeleteSelectedBranch() {
-        guard let path = selectedPath, let branch = selectedBranch() else { return }
+        guard let path = selectedPath, let snapshot, snapshot.path == path, let branch = selectedBranch() else { return }
         let cleanup = self.cleanup
-        requestPreview { cleanup.previewDeleteBranch(repositoryPath: path, name: branch.name) }
+        requestPreview { cleanup.previewDeleteBranch(snapshot: snapshot, name: branch.name) }
     }
 
     func requestPrune() {
-        guard let path = selectedPath else { return }
+        guard let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let cleanup = self.cleanup
-        requestPreview { cleanup.previewPrune(repositoryPath: path) }
+        requestPreview { cleanup.previewPrune(snapshot: snapshot) }
     }
 
     func requestDeleteMergedBranches() {
-        guard let path = selectedPath else { return }
+        guard let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let cleanup = self.cleanup
-        requestPreview { cleanup.previewMergedBranches(repositoryPath: path) }
+        requestPreview { cleanup.previewMergedBranches(snapshot: snapshot) }
     }
 
     func requestRemoveStaleWorktrees() {
-        guard let path = selectedPath else { return }
+        guard let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let days = staleDays
         let cleanup = self.cleanup
-        requestPreview { cleanup.previewStaleWorktrees(repositoryPath: path, staleDays: days) }
+        requestPreview { cleanup.previewStaleWorktrees(snapshot: snapshot, staleDays: days) }
     }
 
     func requestDeleteRemoteGoneBranches() {
-        guard let path = selectedPath else { return }
+        guard let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let cleanup = self.cleanup
-        requestPreview { cleanup.previewRemoteGoneBranches(repositoryPath: path) }
+        requestPreview { cleanup.previewRemoteGoneBranches(snapshot: snapshot) }
     }
 
     func executeCleanup(_ preview: CleanupPreview) {
@@ -197,11 +200,21 @@ final class ApplicationModel: ObservableObject {
     }
 
     private func requestPreview(_ operation: @escaping @Sendable () -> CleanupPreview) {
-        isLoading = true
+        cleanupPreviewProgressTask?.cancel()
+        let token = UUID()
+        cleanupPreviewToken = token
+        isCleanupPreviewLoading = false
+        cleanupPreviewProgressTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            guard !Task.isCancelled, cleanupPreviewToken == token else { return }
+            isCleanupPreviewLoading = true
+        }
         Task.detached(priority: .userInitiated) {
             let preview = operation()
             await MainActor.run {
-                self.isLoading = false
+                guard self.cleanupPreviewToken == token else { return }
+                self.cleanupPreviewProgressTask?.cancel()
+                self.isCleanupPreviewLoading = false
                 self.cleanupPreview = preview
             }
         }
@@ -290,7 +303,7 @@ struct ContentView: View {
                 }
                 Spacer()
                 if let scanPhase = model.scanPhase { Text(scanPhase).font(.caption).foregroundStyle(.secondary) }
-                if model.isLoading { ProgressView().controlSize(.small) }
+                if model.isLoading || model.isCleanupPreviewLoading { ProgressView().controlSize(.small) }
                 if model.canCancelGitHub { Button("Cancel GitHub") { model.cancelGitHub() } }
                 Button { model.refreshSelected() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                 Menu { cleanupMenu } label: { Label("Cleanup", systemImage: "trash") }

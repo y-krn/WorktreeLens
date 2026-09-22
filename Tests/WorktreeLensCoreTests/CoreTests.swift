@@ -75,6 +75,32 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(CleanupService().decide(worktree: worktree, branch: branch).allowed)
     }
 
+    func testCleanupPreviewUsesProvidedSnapshotWithoutGitScan() {
+        final class Counter: @unchecked Sendable {
+            var value = 0
+        }
+        struct CountingRunner: ProcessRunning {
+            let counter: Counter
+
+            func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+                counter.value += 1
+                return ProcessResult(status: 0)
+            }
+        }
+
+        let counter = Counter()
+        let branches = (0..<100).map { index in
+            BranchInfo(id: "branch-(index)", name: "branch-(index)", sha: "sha-(index)", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: false, lastCommitAt: nil, worktrees: [])
+        }
+        let snapshot = RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: branches)
+        let cleanup = CleanupService(git: GitService(runner: CountingRunner(counter: counter)), sessions: SessionService(home: "/tmp/no-session-home"))
+
+        let preview = cleanup.previewMergedBranches(snapshot: snapshot)
+
+        XCTAssertEqual(preview.items.count, 100)
+        XCTAssertEqual(counter.value, 0)
+    }
+
     func testStaleRequiresInactiveCleanMergedAndAgeThreshold() {
         let old = Date(timeIntervalSince1970: 1)
         let worktree = WorktreeInfo(id: "/tmp/wt", path: "/tmp/wt", branch: "feature", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: old)
@@ -107,7 +133,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(snapshot.defaultBranch, "main")
         XCTAssertFalse(feature.isMerged)
         let cleanup = CleanupService(git: service, sessions: SessionService(home: repository.appendingPathComponent("no-session-home").path))
-        let preview = cleanup.previewDeleteBranch(repositoryPath: repository.path, name: "feature")
+        let preview = cleanup.previewDeleteBranch(snapshot: snapshot, name: "feature")
         XCTAssertEqual(preview.items.first?.reason, .unmergedBranch)
         XCTAssertFalse(preview.items.first?.allowed ?? true)
     }
@@ -181,8 +207,19 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(branches["gone"]?.remoteGone == true)
 
         let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: root.appendingPathComponent("no-session-home").path))
-        let remoteGonePreview = cleanup.previewRemoteGoneBranches(repositoryPath: repository.path)
+        let remoteGonePreview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         XCTAssertEqual(remoteGonePreview.items.map(\.target), ["gone"])
         XCTAssertTrue(remoteGonePreview.items.first?.allowed == true)
+
+        let alphaSnapshotPath = try XCTUnwrap(branches["attached-alpha"]?.worktrees.first?.path)
+        let worktreePreview = cleanup.previewRemoveWorktree(snapshot: snapshot, path: alphaSnapshotPath)
+        XCTAssertTrue(worktreePreview.items.first?.allowed == true, String(describing: worktreePreview.items.first?.reason))
+        FileManager.default.createFile(atPath: URL(fileURLWithPath: alphaSnapshotPath).appendingPathComponent("dirty.txt").path, contents: Data("dirty\n".utf8))
+        XCTAssertTrue(cleanup.execute(worktreePreview).isEmpty)
+
+        let mergedPreview = cleanup.previewMergedBranches(snapshot: snapshot)
+        XCTAssertTrue(mergedPreview.items.contains { $0.target == "merged" && $0.allowed })
+        _ = try git(["reset", "--hard", "HEAD~1"])
+        XCTAssertTrue(cleanup.execute(mergedPreview).isEmpty)
     }
 }
