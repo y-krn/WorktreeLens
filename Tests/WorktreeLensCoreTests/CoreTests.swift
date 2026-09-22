@@ -9,6 +9,26 @@ final class CoreTests: XCTestCase {
         }
     }
 
+    private struct RoutingRunner: ProcessRunning {
+        let handler: @Sendable ([String]) throws -> ProcessResult
+
+        func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+            try handler(arguments)
+        }
+    }
+
+    private final class RecordingRunner: @unchecked Sendable, ProcessRunning {
+        private let lock = NSLock()
+        private(set) var arguments: [[String]] = []
+
+        func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+            lock.lock()
+            self.arguments.append(arguments)
+            lock.unlock()
+            return try LocalProcessRunner().run(executable, arguments: arguments, currentDirectory: currentDirectory, timeout: timeout)
+        }
+    }
+
     func testRepositorySelectionKeepsBranchAndWorktreeInSync() {
         let worktree = WorktreeInfo(id: "/tmp/alpha", path: "/tmp/alpha", branch: "alpha", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)
         let branches = ["alpha", "beta", "charlie"].map { name in
@@ -363,5 +383,220 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(mergedPreview.items.contains { $0.target == "merged" && $0.allowed })
         _ = try git(["reset", "--hard", "HEAD~1"])
         XCTAssertTrue(cleanup.execute(mergedPreview).isEmpty)
+    }
+
+    func testSquashMergeEquivalentUsesGitHubVerifiedEvidenceAndExpectedSHADeletion() async throws {
+        try await assertGitHubVerifiedDeletion(prNumber: 123)
+    }
+
+    func testRebaseMergeEquivalentUsesGitHubVerifiedEvidenceAndExpectedSHADeletion() async throws {
+        try await assertGitHubVerifiedDeletion(prNumber: 124)
+    }
+
+    func testGitHubVerificationRequiresMergedStateBaseBranchHeadBranchAndExactSHA() {
+        let mergedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let makePR: (String, String, String) -> GitHubPullRequest = { state, base, sha in
+            GitHubPullRequest(id: "pr-1", number: 1, title: "feature", state: state, isDraft: false, baseRefName: base, headRefName: "feature", headRefOid: sha, mergedAt: state == "MERGED" ? mergedAt : nil, url: nil)
+        }
+        let valid = GitHubStatus(issues: [], pullRequests: [makePR("MERGED", "main", "abc")], actions: [], error: nil)
+        XCTAssertNotNil(valid.verifiedMergedPullRequest(defaultBranch: "main", branchName: "feature", localSHA: "abc"))
+        XCTAssertNil(valid.verifiedMergedPullRequest(defaultBranch: "main", branchName: "feature", localSHA: "different"))
+        XCTAssertNil(GitHubStatus(issues: [], pullRequests: [makePR("MERGED", "develop", "abc")], actions: [], error: nil).verifiedMergedPullRequest(defaultBranch: "main", branchName: "feature", localSHA: "abc"))
+        XCTAssertNil(GitHubStatus(issues: [], pullRequests: [makePR("OPEN", "main", "abc")], actions: [], error: nil).verifiedMergedPullRequest(defaultBranch: "main", branchName: "feature", localSHA: "abc"))
+        XCTAssertNil(GitHubStatus(issues: [], pullRequests: [makePR("MERGED", "main", "abc")], actions: [], error: "offline", isLoaded: false).verifiedMergedPullRequest(defaultBranch: "main", branchName: "feature", localSHA: "abc"))
+    }
+
+    func testGitHubUnavailableAndDefaultBranchRemainBlocked() {
+        let unavailableBranch = BranchInfo(id: "feature", name: "feature", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])
+        let unavailablePreview = CleanupService().previewDeleteBranch(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [unavailableBranch]), name: "feature")
+        XCTAssertFalse(unavailablePreview.items[0].allowed)
+        XCTAssertEqual(unavailableBranch.mergeStatus, "GitHub verification unavailable")
+
+        let defaultBranch = BranchInfo(id: "main", name: "main", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: false, lastCommitAt: nil, isDefaultBranch: true, worktrees: [])
+        let defaultPreview = CleanupService().previewDeleteBranch(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [defaultBranch]), name: "main")
+        XCTAssertEqual(defaultPreview.items[0].reason, CleanupBlockReason.defaultBranch)
+        XCTAssertFalse(defaultPreview.items[0].allowed)
+    }
+
+    func testGitHubVerifiedPreviewBlocksWhenBranchSHAChangesBeforeExecute() async throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 125, sha: fixture.featureSHA), executable: "gh")
+        let git = GitService()
+        let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
+        let enriched = await RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github).enrichGitHub(local: local)
+        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github).previewDeleteBranch(snapshot: enriched, name: "feature")
+        XCTAssertTrue(preview.items[0].allowed)
+
+        _ = try runGit(["-C", fixture.repository.path, "switch", "feature"])
+        FileManager.default.createFile(atPath: fixture.repository.appendingPathComponent("later.txt").path, contents: Data("later\n".utf8))
+        _ = try runGit(["-C", fixture.repository.path, "add", "."])
+        _ = try runGit(["-C", fixture.repository.path, "commit", "-m", "later"])
+
+        XCTAssertTrue(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github).execute(preview).isEmpty)
+        XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+    }
+
+    func testRemoteGoneGitHubVerifiedBranchIsAllowed() async throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 126, sha: fixture.featureSHA), executable: "gh")
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let remoteGoneBranch = branch.withMergeEvidence(.githubVerified(prNumber: 126, mergedAt: mergedAt), github: status)
+            .withRemoteGone(true)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [remoteGoneBranch])
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
+        XCTAssertTrue(preview.items[0].allowed)
+        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+    }
+
+    func testGitHubVerifiedCleanWorktreeCanBeRemovedAfterFinalRevalidation() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 127, sha: fixture.featureSHA), executable: "gh")
+        let recorder = RecordingRunner()
+        let git = GitService(runner: recorder)
+        let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let enriched = await scanner.enrichGitHub(local: local)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let actualPath = try XCTUnwrap(enriched.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
+        let preview = cleanup.previewRemoveWorktree(snapshot: enriched, path: actualPath)
+        XCTAssertTrue(preview.items[0].allowed)
+        XCTAssertEqual(preview.items[0].expectedSHA, fixture.featureSHA)
+        XCTAssertEqual(cleanup.execute(preview), [actualPath])
+        XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.flatMap(\.worktrees).contains { $0.path == actualPath })
+    }
+
+    func testGitHubVerifiedStaleWorktreeCanBeRemovedAfterFinalRevalidation() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 128, sha: fixture.featureSHA), executable: "gh")
+        let git = GitService()
+        let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let enriched = await scanner.enrichGitHub(local: local)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let actualPath = try XCTUnwrap(enriched.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
+        let preview = cleanup.previewStaleWorktrees(snapshot: enriched, staleDays: 0)
+        XCTAssertTrue(preview.items.contains { $0.target == actualPath && $0.allowed })
+        XCTAssertEqual(cleanup.execute(preview), [actualPath])
+    }
+
+    func testGitHubVerifiedWorktreeSHAChangeBlocksFinalRevalidation() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 129, sha: fixture.featureSHA), executable: "gh")
+        let git = GitService()
+        let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let enriched = await scanner.enrichGitHub(local: local)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let actualPath = try XCTUnwrap(enriched.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
+        let actualURL = URL(fileURLWithPath: actualPath)
+        let preview = cleanup.previewRemoveWorktree(snapshot: enriched, path: actualPath)
+        XCTAssertTrue(preview.items[0].allowed)
+
+        FileManager.default.createFile(atPath: actualURL.appendingPathComponent("later.txt").path, contents: Data("later\n".utf8))
+        _ = try runGit(["-C", actualPath, "add", "."])
+        _ = try runGit(["-C", actualPath, "commit", "-m", "later"])
+
+        XCTAssertTrue(cleanup.execute(preview).isEmpty)
+        XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.flatMap(\.worktrees).contains { $0.path == actualPath })
+    }
+
+    func testGitHubFailureBlocksGitHubVerifiedWorktreeExecute() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let goodGitHub = GitHubService(runner: verifiedGitHubRunner(number: 130, sha: fixture.featureSHA), executable: "gh")
+        let failedGitHub = GitHubService(runner: RoutingRunner { _ in throw ProcessRunnerError.failed("offline") }, executable: "gh")
+        let git = GitService()
+        let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: goodGitHub)
+        let enriched = await scanner.enrichGitHub(local: local)
+        let actualPath = try XCTUnwrap(enriched.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
+        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: goodGitHub).previewRemoveWorktree(snapshot: enriched, path: actualPath)
+        XCTAssertTrue(preview.items[0].allowed)
+
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: failedGitHub)
+        XCTAssertTrue(cleanup.execute(preview).isEmpty)
+        XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.flatMap(\.worktrees).contains { $0.path == actualPath })
+    }
+
+    private func assertGitHubVerifiedDeletion(prNumber: Int) async throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let recorder = RecordingRunner()
+        let git = GitService(runner: recorder)
+        let github = GitHubService(runner: verifiedGitHubRunner(number: prNumber, sha: fixture.featureSHA), executable: "gh")
+        let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let enriched = await scanner.enrichGitHub(local: local)
+        let branch = try XCTUnwrap(enriched.branches.first { $0.name == "feature" })
+        XCTAssertFalse(branch.mergeEvidence == .gitAncestor)
+        if case .githubVerified(let number, _) = branch.mergeEvidence {
+            XCTAssertEqual(number, prNumber)
+        } else {
+            XCTFail("expected GitHub verified evidence")
+        }
+
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let preview = cleanup.previewDeleteBranch(snapshot: enriched, name: "feature")
+        XCTAssertTrue(preview.items[0].allowed)
+        XCTAssertEqual(preview.items[0].expectedSHA, fixture.featureSHA)
+        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertTrue(recorder.arguments.contains { $0.suffix(4).elementsEqual(["update-ref", "-d", "refs/heads/feature", fixture.featureSHA]) })
+        XCTAssertFalse(recorder.arguments.flatMap { $0 }.contains("-D"))
+        XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+    }
+
+    private func verifiedGitHubRunner(number: Int, sha: String) -> RoutingRunner {
+        let mergedAt = "2026-01-01T00:00:00Z"
+        let pullRequest = "[{\"number\":\(number),\"title\":\"feature\",\"state\":\"MERGED\",\"isDraft\":false,\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRefOid\":\"\(sha)\",\"mergedAt\":\"\(mergedAt)\",\"url\":\"https://github.com/example/repo/pull/\(number)\"}]"
+        return RoutingRunner { arguments in
+            if arguments.starts(with: ["pr", "list"]) { return ProcessResult(status: 0, stdout: pullRequest) }
+            if arguments.starts(with: ["pr", "view"]) { return ProcessResult(status: 0, stdout: "[]") }
+            if arguments.starts(with: ["run", "list"]) { return ProcessResult(status: 0, stdout: "[]") }
+            return ProcessResult(status: 0, stdout: "[]")
+        }
+    }
+
+    private func makeFeatureRepository() throws -> (root: URL, repository: URL, featureSHA: String) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-github-\(UUID().uuidString)")
+        let repository = root.appendingPathComponent("repository")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        _ = try runGit(["init", "-b", "main", repository.path])
+        _ = try runGit(["-C", repository.path, "config", "user.email", "worktree-lens@example.invalid"])
+        _ = try runGit(["-C", repository.path, "config", "user.name", "Worktree Lens Test"])
+        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+        try Data("base\n".utf8).write(to: repository.appendingPathComponent("base.txt"))
+        _ = try runGit(["-C", repository.path, "add", "."])
+        _ = try runGit(["-C", repository.path, "commit", "-m", "base"])
+        _ = try runGit(["-C", repository.path, "switch", "-c", "feature"])
+        try Data("feature\n".utf8).write(to: repository.appendingPathComponent("feature.txt"))
+        _ = try runGit(["-C", repository.path, "add", "."])
+        _ = try runGit(["-C", repository.path, "commit", "-m", "feature"])
+        let sha = try runGit(["-C", repository.path, "rev-parse", "feature"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try runGit(["-C", repository.path, "switch", "main"])
+        return (root, repository, sha)
+    }
+
+    private func runGit(_ arguments: [String]) throws -> String {
+        let result = try LocalProcessRunner().run("/usr/bin/git", arguments: arguments, currentDirectory: nil)
+        XCTAssertTrue(result.succeeded, result.stderr)
+        return result.stdout
     }
 }
