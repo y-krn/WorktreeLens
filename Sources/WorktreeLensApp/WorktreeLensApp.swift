@@ -43,7 +43,7 @@ final class ApplicationModel: ObservableObject {
     let sessions = SessionService()
     let github = GitHubService()
     lazy var scanner = RepositoryScanService(git: git, sessions: sessions, github: github)
-    lazy var cleanup = CleanupService(git: git, sessions: sessions)
+    lazy var cleanup = CleanupService(git: git, sessions: sessions, github: github)
     private var refreshToken = UUID()
     private var refreshTask: Task<Void, Never>?
     private var cleanupPreviewToken = UUID()
@@ -577,31 +577,56 @@ struct CleanupConfirmationView: View {
             Text(preview.operation.rawValue).foregroundStyle(.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 7) {
-                    ForEach(preview.items) { item in
-                        HStack(alignment: .top, spacing: 9) {
-                            Image(systemName: item.allowed ? "checkmark.circle.fill" : "xmark.octagon.fill")
-                                .foregroundStyle(item.allowed ? .green : .orange)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(item.target).lineLimit(2)
-                                if let detail = item.detail { Text(detail).font(.caption).foregroundStyle(item.allowed ? .green : .secondary) }
-                                if let reason = item.reason { Text(reason.message).font(.caption).foregroundStyle(.orange) }
+                    if preview.groups.isEmpty {
+                        ForEach(preview.items) { item in
+                            cleanupItem(item)
+                        }
+                    } else {
+                        ForEach(preview.groups) { group in
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(group.branchName).font(.headline)
+                                ForEach(group.steps) { item in
+                                    cleanupItem(item)
+                                }
                             }
                         }
                     }
                 }
             }
-            Text("Allowed \(preview.allowedItems.count) / total \(preview.items.count). Final guards run again immediately before each operation.")
+            Text("Allowed \(allowedCount) / total \(totalCount). Final guards run again immediately before each operation.")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Spacer()
                 Button("Cancel") { model.cleanupPreview = nil }
                 Button("Run allowed targets") { model.executeCleanup(preview) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(preview.allowedItems.isEmpty)
+                    .disabled(allowedCount == 0)
             }
         }
         .padding(22)
         .frame(width: 600, height: 470)
+    }
+
+    private var allowedCount: Int {
+        preview.groups.isEmpty ? preview.allowedItems.count : preview.groups.filter(\.allowed).count
+    }
+
+    private var totalCount: Int {
+        preview.groups.isEmpty ? preview.items.count : preview.groups.count
+    }
+
+    @ViewBuilder
+    private func cleanupItem(_ item: CleanupPreviewItem) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: item.allowed ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                .foregroundStyle(item.allowed ? .green : .orange)
+            VStack(alignment: .leading, spacing: 3) {
+                if let step = item.step { Text(step.rawValue).font(.subheadline.weight(.semibold)) }
+                Text(item.target).lineLimit(2)
+                if let detail = item.detail { Text(detail).font(.caption).foregroundStyle(item.allowed ? .green : .secondary) }
+                if let reason = item.reason { Text(reason.message).font(.caption).foregroundStyle(.orange) }
+            }
+        }
     }
 }
 

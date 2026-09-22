@@ -292,6 +292,11 @@ public enum CleanupOperation: String, Sendable {
     case deleteRemoteGoneBranches = "Delete remote-gone branches"
 }
 
+public enum CleanupPlanStep: String, Sendable {
+    case removeWorktree = "Will remove worktree"
+    case deleteBranch = "Then delete branch"
+}
+
 public struct CleanupPreviewItem: Identifiable, Sendable {
     public let id: String
     public let target: String
@@ -299,15 +304,33 @@ public struct CleanupPreviewItem: Identifiable, Sendable {
     public let reason: CleanupBlockReason?
     public let detail: String?
     public let expectedSHA: String?
+    public let step: CleanupPlanStep?
 
-    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil, detail: String? = nil, expectedSHA: String? = nil) {
+    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil, detail: String? = nil, expectedSHA: String? = nil, step: CleanupPlanStep? = nil) {
         self.id = id
         self.target = target
         self.allowed = allowed
         self.reason = reason
         self.detail = detail
         self.expectedSHA = expectedSHA
+        self.step = step
     }
+}
+
+public struct CleanupPreviewGroup: Identifiable, Sendable {
+    public let id: String
+    public let branchName: String
+    public let expectedSHA: String?
+    public let steps: [CleanupPreviewItem]
+
+    public init(branchName: String, expectedSHA: String?, steps: [CleanupPreviewItem]) {
+        self.id = branchName
+        self.branchName = branchName
+        self.expectedSHA = expectedSHA
+        self.steps = steps
+    }
+
+    public var allowed: Bool { steps.allSatisfy(\.allowed) }
 }
 
 public struct CleanupPreview: Identifiable, Sendable {
@@ -315,12 +338,14 @@ public struct CleanupPreview: Identifiable, Sendable {
     public let operation: CleanupOperation
     public let repositoryPath: String
     public let items: [CleanupPreviewItem]
+    public let groups: [CleanupPreviewGroup]
     public let staleDays: Int?
 
-    public init(operation: CleanupOperation, repositoryPath: String, items: [CleanupPreviewItem], staleDays: Int? = nil) {
+    public init(operation: CleanupOperation, repositoryPath: String, items: [CleanupPreviewItem], staleDays: Int? = nil, groups: [CleanupPreviewGroup] = []) {
         self.operation = operation
         self.repositoryPath = repositoryPath
         self.items = items
+        self.groups = groups
         self.staleDays = staleDays
     }
 

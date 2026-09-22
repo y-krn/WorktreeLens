@@ -32,7 +32,7 @@ public final class CleanupService: @unchecked Sendable {
             return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [CleanupPreviewItem(id: path, target: path, allowed: false, reason: .missingBranch)])
         }
         let decision = decide(worktree: match.worktree, branch: match.branch)
-        return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [item(id: path, target: path, decision: decision, detail: match.branch.mergeStatus, expectedSHA: match.branch.sha)])
+        return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [item(id: path, target: path, decision: decision, detail: match.branch.mergeStatus, expectedSHA: match.worktree.head)])
     }
 
     public func previewDeleteBranch(snapshot: RepositorySnapshot, name: String) -> CleanupPreview {
@@ -67,14 +67,35 @@ public final class CleanupService: @unchecked Sendable {
     }
 
     public func previewRemoteGoneBranches(snapshot: RepositorySnapshot) -> CleanupPreview {
-        let items = snapshot.branches.filter { $0.remoteGone }.map { branch in
-            item(id: branch.name, target: branch.name, decision: branchDecision(branch, defaultBranch: snapshot.defaultBranch), detail: branch.mergeStatus, expectedSHA: branch.sha)
+        let groups = snapshot.branches.filter(\.remoteGone).map { branch in
+            remoteGoneGroup(branch: branch, defaultBranch: snapshot.defaultBranch)
         }
-        return CleanupPreview(operation: .deleteRemoteGoneBranches, repositoryPath: snapshot.path, items: items)
+        let items = groups.map { group in
+            let decision = group.steps.last.map { CleanupDecision(allowed: $0.allowed, reason: $0.reason) } ?? CleanupDecision(allowed: false, reason: .missingBranch)
+            return item(id: group.branchName, target: group.branchName, decision: decision, detail: group.steps.last?.detail, expectedSHA: group.expectedSHA, step: .deleteBranch)
+        }
+        return CleanupPreview(operation: .deleteRemoteGoneBranches, repositoryPath: snapshot.path, items: items, groups: groups)
     }
 
     public func execute(_ preview: CleanupPreview) -> [String] {
         var completed: [String] = []
+        if preview.operation == .deleteRemoteGoneBranches {
+            if !preview.groups.isEmpty {
+                for group in preview.groups where group.allowed {
+                    if executeRemoteGoneBranch(repositoryPath: preview.repositoryPath, group: group) {
+                        completed.append(group.branchName)
+                    }
+                }
+            } else {
+                for target in preview.allowedItems {
+                    if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) {
+                        completed.append(target.id)
+                    }
+                }
+            }
+            return completed
+        }
+
         let currentSessions = sessions.discover().sessions
         for target in preview.allowedItems {
             switch preview.operation {
@@ -89,25 +110,72 @@ public final class CleanupService: @unchecked Sendable {
             case .removeStaleWorktrees:
                 if executeRemoveStale(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, staleDays: preview.staleDays ?? 7, sessions: currentSessions) { completed.append(target.id) }
             case .deleteRemoteGoneBranches:
-                if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) { completed.append(target.id) }
+                break
             }
         }
         return completed
     }
 
-    private func branchDecision(_ branch: BranchInfo, defaultBranch: String?) -> CleanupDecision {
+    private func branchDecision(_ branch: BranchInfo, defaultBranch: String?, allowAttachedWorktrees: Bool = false) -> CleanupDecision {
         if branch.isDetachedGroup { return CleanupDecision(allowed: false, reason: .detachedWorktree) }
         guard let defaultBranch else { return CleanupDecision(allowed: false, reason: .noDefaultBranch) }
         if branch.isDefaultBranch || branch.name == defaultBranch { return CleanupDecision(allowed: false, reason: .defaultBranch) }
-        if !branch.worktrees.isEmpty { return CleanupDecision(allowed: false, reason: .worktreeAttached) }
+        if !allowAttachedWorktrees && !branch.worktrees.isEmpty { return CleanupDecision(allowed: false, reason: .worktreeAttached) }
         if branch.isMerged { return CleanupDecision(allowed: true) }
         if !branch.github.isLoaded, branch.github.error != nil { return CleanupDecision(allowed: false, reason: .githubVerificationUnavailable) }
         return CleanupDecision(allowed: false, reason: .unmergedBranch)
     }
 
+    private func remoteGoneGroup(branch: BranchInfo, defaultBranch: String?) -> CleanupPreviewGroup {
+        let branchDecision = branchDecision(branch, defaultBranch: defaultBranch, allowAttachedWorktrees: true)
+        let worktreeSteps = branch.worktrees.map { worktree in
+            let decision = branchDecision.allowed ? decide(worktree: worktree, branch: branch) : branchDecision
+            return item(id: "\(branch.name):worktree:\(worktree.path)", target: worktree.path, decision: decision, detail: worktreeDetail(worktree: worktree, mergeStatus: branch.mergeStatus), expectedSHA: branch.sha, step: .removeWorktree)
+        }
+        let firstBlocked = worktreeSteps.first(where: { !$0.allowed })
+        let deleteDecision: CleanupDecision
+        if !branchDecision.allowed {
+            deleteDecision = branchDecision
+        } else if let firstBlocked {
+            deleteDecision = CleanupDecision(allowed: false, reason: firstBlocked.reason)
+        } else {
+            deleteDecision = CleanupDecision(allowed: true)
+        }
+        let deleteDetail = branch.mergeStatus + (deleteDecision.allowed ? " · worktrees complete" : " · blocked")
+        let deleteStep = item(id: "\(branch.name):branch", target: branch.name, decision: deleteDecision, detail: deleteDetail, expectedSHA: branch.sha, step: .deleteBranch)
+        return CleanupPreviewGroup(branchName: branch.name, expectedSHA: branch.sha, steps: worktreeSteps + [deleteStep])
+    }
+
+    private func worktreeDetail(worktree: WorktreeInfo, mergeStatus: String) -> String {
+        let cleanliness = worktree.isClean ? "clean" : "dirty"
+        let sessionState: String
+        if worktree.sessions.isEmpty {
+            sessionState = "session: none"
+        } else {
+            let states = worktree.sessions.map { $0.activity.rawValue.lowercased() }.joined(separator: ", ")
+            sessionState = "session: \(states)"
+        }
+        return "\(cleanliness) · \(sessionState) · \(mergeStatus)"
+    }
+
+    private func executeRemoteGoneBranch(repositoryPath: String, group: CleanupPreviewGroup) -> Bool {
+        guard group.allowed, let expectedSHA = group.expectedSHA else { return false }
+        let plannedPaths = group.steps.filter { $0.step == .removeWorktree }.map(\.target)
+        guard let current = try? git.cleanupBranch(repositoryPath: repositoryPath, name: group.branchName),
+              current.sha == expectedSHA,
+              Set(current.worktrees.map(\.path)) == Set(plannedPaths) else { return false }
+
+        let currentSessions = sessions.discover().sessions
+        for path in plannedPaths {
+            guard executeRemoveWorktree(repositoryPath: repositoryPath, path: path, expectedSHA: expectedSHA, sessions: currentSessions) else { return false }
+        }
+        return executeDeleteBranch(repositoryPath: repositoryPath, name: group.branchName, expectedSHA: expectedSHA)
+    }
+
     private func executeRemoveWorktree(repositoryPath: String, path: String, expectedSHA: String?, sessions: [SessionRecord]) -> Bool {
         guard let match = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: sessions) else { return false }
-        let branch = revalidatedBranch(repositoryPath: repositoryPath, branch: match.branch, expectedSHA: expectedSHA)
+        guard let expectedSHA, match.worktree.head == expectedSHA else { return false }
+        let branch = match.worktree.isDetached ? match.branch : revalidatedBranch(repositoryPath: repositoryPath, branch: match.branch, expectedSHA: expectedSHA)
         guard decide(worktree: match.worktree, branch: branch).allowed else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
     }
@@ -120,7 +188,6 @@ public final class CleanupService: @unchecked Sendable {
               branch.name != defaultBranch,
               !branch.isDefaultBranch,
               branch.worktrees.isEmpty else { return false }
-
         if branch.mergeEvidence == .gitAncestor {
             return (try? git.deleteBranch(repositoryPath: repositoryPath, branch: name)) != nil
         }
@@ -155,7 +222,7 @@ public final class CleanupService: @unchecked Sendable {
         return nil
     }
 
-    private func item(id: String, target: String, decision: CleanupDecision, detail: String? = nil, expectedSHA: String? = nil) -> CleanupPreviewItem {
-        CleanupPreviewItem(id: id, target: target, allowed: decision.allowed, reason: decision.reason, detail: detail, expectedSHA: expectedSHA)
+    private func item(id: String, target: String, decision: CleanupDecision, detail: String? = nil, expectedSHA: String? = nil, step: CleanupPlanStep? = nil) -> CleanupPreviewItem {
+        CleanupPreviewItem(id: id, target: target, allowed: decision.allowed, reason: decision.reason, detail: detail, expectedSHA: expectedSHA, step: step)
     }
 }

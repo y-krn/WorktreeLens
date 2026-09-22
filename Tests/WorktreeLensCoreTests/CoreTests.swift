@@ -29,6 +29,40 @@ final class CoreTests: XCTestCase {
         }
     }
 
+    private final class FailingWorktreeRemovalRunner: @unchecked Sendable, ProcessRunning {
+        private(set) var arguments: [[String]] = []
+
+        func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+            self.arguments.append(arguments)
+            if arguments.contains("worktree") && arguments.contains("remove") {
+                return ProcessResult(status: 1, stderr: "injected worktree removal failure")
+            }
+            return try LocalProcessRunner().run(executable, arguments: arguments, currentDirectory: currentDirectory, timeout: timeout)
+        }
+    }
+
+    private final class AddingWorktreeAfterRemovalRunner: @unchecked Sendable, ProcessRunning {
+        let repositoryPath: String
+        let replacementPath: String
+        private(set) var arguments: [[String]] = []
+        private var added = false
+
+        init(repositoryPath: String, replacementPath: String) {
+            self.repositoryPath = repositoryPath
+            self.replacementPath = replacementPath
+        }
+
+        func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+            self.arguments.append(arguments)
+            let result = try LocalProcessRunner().run(executable, arguments: arguments, currentDirectory: currentDirectory, timeout: timeout)
+            if !added, result.succeeded, arguments.contains("worktree"), arguments.contains("remove") {
+                added = true
+                _ = try LocalProcessRunner().run(executable, arguments: ["-C", repositoryPath, "worktree", "add", replacementPath, "feature"], currentDirectory: nil, timeout: timeout)
+            }
+            return result
+        }
+    }
+
     func testRepositorySelectionKeepsBranchAndWorktreeInSync() {
         let worktree = WorktreeInfo(id: "/tmp/alpha", path: "/tmp/alpha", branch: "alpha", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)
         let branches = ["alpha", "beta", "charlie"].map { name in
@@ -235,6 +269,44 @@ final class CoreTests: XCTestCase {
         let worktree = WorktreeInfo(id: "/tmp/wt", path: "/tmp/wt", branch: "feature", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: Date())
         let branch = BranchInfo(id: "feature", name: "feature", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: false, lastCommitAt: Date(), worktrees: [worktree])
         XCTAssertTrue(CleanupService().decide(worktree: worktree, branch: branch).allowed)
+    }
+
+    func testStandaloneRemoveHandlesMultipleDetachedWorktreesWithDifferentHEADs() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-detached-\(UUID().uuidString)")
+        let repository = root.appendingPathComponent("repository")
+        let firstPath = root.appendingPathComponent("detached-first")
+        let secondPath = root.appendingPathComponent("detached-second")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        _ = try runGit(["init", "-b", "main", repository.path])
+        _ = try runGit(["-C", repository.path, "config", "user.email", "worktree-lens@example.invalid"])
+        _ = try runGit(["-C", repository.path, "config", "user.name", "Worktree Lens Test"])
+        for (name, contents) in [("one.txt", "one\n"), ("two.txt", "two\n"), ("three.txt", "three\n")] {
+            try Data(contents.utf8).write(to: repository.appendingPathComponent(name))
+            _ = try runGit(["-C", repository.path, "add", "."])
+            _ = try runGit(["-C", repository.path, "commit", "-m", name])
+        }
+        _ = try runGit(["-C", repository.path, "worktree", "add", "--detach", firstPath.path, "HEAD~1"])
+        _ = try runGit(["-C", repository.path, "worktree", "add", "--detach", secondPath.path, "HEAD~2"])
+
+        let git = GitService()
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: root.appendingPathComponent("no-sessions").path))
+        let snapshot = try git.snapshot(repositoryPath: repository.path)
+        let detached = try XCTUnwrap(snapshot.branches.first(where: \.isDetachedGroup))
+        let first = try XCTUnwrap(detached.worktrees.first { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path == firstPath.resolvingSymlinksInPath().path })
+        let second = try XCTUnwrap(detached.worktrees.first { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path == secondPath.resolvingSymlinksInPath().path })
+        XCTAssertNotEqual(first.head, second.head)
+
+        let firstPreview = cleanup.previewRemoveWorktree(snapshot: snapshot, path: first.path)
+        let secondPreview = cleanup.previewRemoveWorktree(snapshot: snapshot, path: second.path)
+        XCTAssertEqual(firstPreview.items[0].expectedSHA, first.head)
+        XCTAssertEqual(secondPreview.items[0].expectedSHA, second.head)
+        XCTAssertEqual(cleanup.execute(firstPreview), [first.path])
+        XCTAssertEqual(cleanup.execute(secondPreview), [second.path])
+
+        let remaining = try git.snapshot(repositoryPath: repository.path).branches.flatMap(\.worktrees)
+        XCTAssertFalse(remaining.contains { $0.path == first.path || $0.path == second.path })
     }
 
     func testCleanupPreviewUsesProvidedSnapshotWithoutGitScan() {
@@ -453,6 +525,187 @@ final class CoreTests: XCTestCase {
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         XCTAssertTrue(preview.items[0].allowed)
         XCTAssertEqual(cleanup.execute(preview), ["feature"])
+    }
+
+    func testRemoteGoneGitHubVerifiedAttachedWorktreeIsRemovedBeforeBranch() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 131, sha: fixture.featureSHA), executable: "gh")
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let remoteGoneBranch = branch.withMergeEvidence(.githubVerified(prNumber: 131, mergedAt: mergedAt), github: status).withRemoteGone(true)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [remoteGoneBranch])
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+
+        let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
+        let group = try XCTUnwrap(preview.groups.first)
+        XCTAssertEqual(group.steps.map(\.step), [.removeWorktree, .deleteBranch])
+        XCTAssertTrue(group.steps.allSatisfy(\.allowed))
+        XCTAssertTrue(group.steps[0].detail?.contains("clean") == true)
+        XCTAssertTrue(group.steps[0].detail?.contains("session: none") == true)
+        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath.path))
+    }
+
+    func testRemoteGoneGitAncestorAttachedWorktreeIsRemovedBeforeBranch() throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "switch", "main"])
+        _ = try runGit(["-C", fixture.repository.path, "merge", "--no-ff", "feature", "-m", "merge feature"])
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        XCTAssertEqual(branch.mergeEvidence, .gitAncestor)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withRemoteGone(true)])
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path))
+
+        XCTAssertEqual(cleanup.execute(cleanup.previewRemoteGoneBranches(snapshot: snapshot)), ["feature"])
+        XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+    }
+
+    func testRemoteGoneUnsafeAttachedWorktreeBlocksBranchCleanup() {
+        let reasons: [(CleanupBlockReason, WorktreeInfo)] = [
+            (.dirtyWorktree, WorktreeInfo(id: "dirty", path: "/tmp/dirty", branch: "feature", head: "abc", isBare: false, isLocked: false, isClean: false, stagedCount: 1, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)),
+            (.lockedWorktree, WorktreeInfo(id: "locked", path: "/tmp/locked", branch: "feature", head: "abc", isBare: false, isLocked: true, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)),
+            (.activeSession, WorktreeInfo(id: "active", path: "/tmp/active", branch: "feature", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil, sessions: [SessionRecord(id: "active", provider: .codex, title: "active", updatedAt: nil, cwd: "/tmp/active", branch: "feature", url: nil, activity: .active, evidence: "explicit cwd")])),
+            (.unknownSessionActivity, WorktreeInfo(id: "unknown", path: "/tmp/unknown", branch: "feature", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil, sessions: [SessionRecord(id: "unknown", provider: .codex, title: "unknown", updatedAt: nil, cwd: "/tmp/unknown", branch: "feature", url: nil, activity: .unknown, evidence: "explicit cwd")]))
+        ]
+
+        for (reason, worktree) in reasons {
+            let branch = BranchInfo(id: "feature", name: "feature", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: true, lastCommitAt: nil, worktrees: [worktree])
+            let snapshot = RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [branch])
+            let preview = CleanupService().previewRemoteGoneBranches(snapshot: snapshot)
+            XCTAssertFalse(preview.groups[0].allowed)
+            XCTAssertEqual(preview.groups[0].steps.last?.reason, reason)
+        }
+    }
+
+    func testRemoteGoneWorktreeBecomesDirtyAfterPreviewAndBranchRemains() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 132, sha: fixture.featureSHA), executable: "gh")
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withMergeEvidence(.githubVerified(prNumber: 132, mergedAt: mergedAt), github: status).withRemoteGone(true)])
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
+        try Data("dirty\n".utf8).write(to: worktreePath.appendingPathComponent("dirty.txt"))
+
+        XCTAssertTrue(cleanup.execute(preview).isEmpty)
+        XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
+    }
+
+    func testRemoteGoneBranchSHAChangeAfterPreviewBlocksAllActions() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 133, sha: fixture.featureSHA), executable: "gh")
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withMergeEvidence(.githubVerified(prNumber: 133, mergedAt: mergedAt), github: status).withRemoteGone(true)])
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
+        try Data("changed\n".utf8).write(to: worktreePath.appendingPathComponent("changed.txt"))
+        _ = try runGit(["-C", worktreePath.path, "add", "."])
+        _ = try runGit(["-C", worktreePath.path, "commit", "-m", "changed"])
+
+        XCTAssertTrue(cleanup.execute(preview).isEmpty)
+        XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
+    }
+
+    func testRemoteGoneGitHubVerificationFailureAfterPreviewLeavesWorktreeAndBranch() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let goodGitHub = GitHubService(runner: verifiedGitHubRunner(number: 134, sha: fixture.featureSHA), executable: "gh")
+        let failedGitHub = GitHubService(runner: RoutingRunner { _ in throw ProcessRunnerError.failed("offline") }, executable: "gh")
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let status = goodGitHub.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withMergeEvidence(.githubVerified(prNumber: 134, mergedAt: mergedAt), github: status).withRemoteGone(true)])
+        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: goodGitHub).previewRemoteGoneBranches(snapshot: snapshot)
+
+        XCTAssertTrue(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: failedGitHub).execute(preview).isEmpty)
+        XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
+    }
+
+    func testRemoteGoneWorktreeRemovalFailureNeverAttemptsBranchDeletion() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 135, sha: fixture.featureSHA), executable: "gh")
+        let readWriteGit = GitService()
+        let local = try readWriteGit.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let remoteGoneBranch = branch.withMergeEvidence(.githubVerified(prNumber: 135, mergedAt: mergedAt), github: status).withRemoteGone(true)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [remoteGoneBranch])
+        let failingRunner = FailingWorktreeRemovalRunner()
+        let cleanup = CleanupService(git: GitService(runner: failingRunner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
+
+        XCTAssertTrue(cleanup.execute(preview).isEmpty)
+        XCTAssertTrue(failingRunner.arguments.contains { $0.contains("worktree") && $0.contains("remove") })
+        XCTAssertFalse(failingRunner.arguments.contains { $0.contains("branch") && $0.contains("-d") })
+        XCTAssertFalse(failingRunner.arguments.contains { $0.contains("update-ref") && $0.contains("-d") })
+        XCTAssertTrue((try readWriteGit.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
+    }
+
+    func testRemoteGoneBranchDeletionBlockedWhenAnotherWorktreeAppearsAfterRemoval() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        let replacementPath = fixture.root.appendingPathComponent("replacement-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 136, sha: fixture.featureSHA), executable: "gh")
+        let readWriteGit = GitService()
+        let local = try readWriteGit.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withMergeEvidence(.githubVerified(prNumber: 136, mergedAt: mergedAt), github: status).withRemoteGone(true)])
+        let runner = AddingWorktreeAfterRemovalRunner(repositoryPath: fixture.repository.path, replacementPath: replacementPath.path)
+        let cleanup = CleanupService(git: GitService(runner: runner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+
+        XCTAssertTrue(cleanup.execute(cleanup.previewRemoteGoneBranches(snapshot: snapshot)).isEmpty)
+        XCTAssertTrue((try readWriteGit.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: replacementPath.path))
+        XCTAssertTrue(runner.arguments.contains { $0.contains("branch") && $0.contains("-d") } == false)
+    }
+
+    func testRemoteGoneDefaultBranchRemainsBlocked() {
+        let worktree = WorktreeInfo(id: "main-wt", path: "/tmp/main-wt", branch: "main", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)
+        let branch = BranchInfo(id: "main", name: "main", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: true, lastCommitAt: nil, isDefaultBranch: true, worktrees: [worktree])
+        let preview = CleanupService().previewRemoteGoneBranches(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [branch]))
+
+        XCTAssertFalse(preview.groups[0].allowed)
+        XCTAssertEqual(preview.groups[0].steps.last?.reason, .defaultBranch)
     }
 
     func testGitHubVerifiedCleanWorktreeCanBeRemovedAfterFinalRevalidation() async throws {
