@@ -2,10 +2,10 @@ import Foundation
 
 public final class CleanupService: @unchecked Sendable {
     private let git: GitService
-    private let sessions: SessionService
+    private let sessions: any SessionDiscovering
     private let github: GitHubService
 
-    public init(git: GitService = GitService(), sessions: SessionService = SessionService(), github: GitHubService = GitHubService()) {
+    public init(git: GitService = GitService(), sessions: any SessionDiscovering = SessionService(), github: GitHubService = GitHubService()) {
         self.git = git
         self.sessions = sessions
         self.github = github
@@ -164,9 +164,12 @@ public final class CleanupService: @unchecked Sendable {
     private func executeMergedBranch(repositoryPath: String, group: CleanupPreviewGroup) -> Bool {
         guard group.allowed, let expectedSHA = group.expectedSHA else { return false }
         let plannedPaths = group.steps.filter { $0.step == .removeWorktree }.map(\.target)
-        guard let current = try? git.cleanupBranch(repositoryPath: repositoryPath, name: group.branchName),
+        if plannedPaths.isEmpty {
+            return executeDeleteBranch(repositoryPath: repositoryPath, name: group.branchName, expectedSHA: expectedSHA)
+        }
+        guard let current = try? git.cleanupBranchState(repositoryPath: repositoryPath, name: group.branchName),
               current.sha == expectedSHA,
-              Set(current.worktrees.map(\.path)) == Set(plannedPaths) else { return false }
+              Set(current.worktreePaths) == Set(plannedPaths) else { return false }
 
         let currentSessions = sessions.discover().sessions
         for path in plannedPaths {
@@ -184,25 +187,25 @@ public final class CleanupService: @unchecked Sendable {
     }
 
     private func executeDeleteBranch(repositoryPath: String, name: String, expectedSHA: String?) -> Bool {
-        guard let branch = try? git.cleanupBranch(repositoryPath: repositoryPath, name: name),
+        guard let branch = try? git.cleanupBranchState(repositoryPath: repositoryPath, name: name),
               let expectedSHA,
               branch.sha == expectedSHA,
-              let defaultBranch = try? git.defaultBranchName(repositoryPath: repositoryPath),
+              let defaultBranch = branch.defaultBranch,
               branch.name != defaultBranch,
               !branch.isDefaultBranch,
-              branch.worktrees.isEmpty else { return false }
-        if branch.mergeEvidence == .gitAncestor {
+              branch.worktreePaths.isEmpty else { return false }
+        if branch.isGitAncestor {
             return (try? git.deleteBranch(repositoryPath: repositoryPath, branch: name)) != nil
         }
 
-        let status = github.status(repositoryPath: repositoryPath, branch: branch.name)
+        let status = github.cleanupStatus(repositoryPath: repositoryPath, branch: branch.name)
         guard let verified = status.verifiedMergedPullRequest(defaultBranch: defaultBranch, branchName: branch.name, localSHA: branch.sha),
               verified.mergedAt != nil else { return false }
         return (try? git.deleteBranchVerified(repositoryPath: repositoryPath, branch: name, expectedOldSHA: expectedSHA)) != nil
     }
 
     private func executeRemoveStale(repositoryPath: String, path: String, expectedSHA: String?, staleDays: Int, sessions: [SessionRecord]) -> Bool {
-        guard let match = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: sessions) else { return false }
+        guard let match = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: sessions, includeCleanupUIData: true) else { return false }
         let branch = revalidatedBranch(repositoryPath: repositoryPath, branch: match.branch, expectedSHA: expectedSHA)
         guard decide(worktree: match.worktree, branch: branch, requireMerged: true, now: Date(), staleDays: staleDays).allowed else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
@@ -213,7 +216,7 @@ public final class CleanupService: @unchecked Sendable {
         guard let expectedSHA, branch.sha == expectedSHA else { return nil }
         if branch.mergeEvidence == .gitAncestor { return branch }
         guard let defaultBranch = try? git.defaultBranchName(repositoryPath: repositoryPath) else { return nil }
-        let status = github.status(repositoryPath: repositoryPath, branch: branch.name)
+        let status = github.cleanupStatus(repositoryPath: repositoryPath, branch: branch.name)
         guard let verified = status.verifiedMergedPullRequest(defaultBranch: defaultBranch, branchName: branch.name, localSHA: branch.sha), let mergedAt = verified.mergedAt else { return nil }
         return branch.withMergeEvidence(.githubVerified(prNumber: verified.number, mergedAt: mergedAt), github: status)
     }

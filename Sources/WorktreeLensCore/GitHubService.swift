@@ -40,6 +40,16 @@ public final class GitHubService: @unchecked Sendable {
         }.value
     }
 
+    /// Fetches only the PR fields required by destructive cleanup verification.
+    public func cleanupStatus(repositoryPath: String, branch: String, timeout: TimeInterval = GitHubService.requestTimeout) -> GitHubStatus {
+        do {
+            let prs = try query(repositoryPath: repositoryPath, arguments: ["pr", "list", "--state", "all", "--head", branch, "--json", "number,state,baseRefName,headRefName,headRefOid,mergedAt"], timeout: timeout)
+            return GitHubStatus(issues: [], pullRequests: prs.compactMap(pullRequest), actions: [], error: nil, isLoaded: true)
+        } catch {
+            return GitHubStatus(issues: [], pullRequests: [], actions: [], error: error.localizedDescription, isLoaded: false)
+        }
+    }
+
     private func query(repositoryPath: String, arguments: [String], timeout: TimeInterval) throws -> [[String: Any]] {
         let executable: String
         if let configuredExecutable {
@@ -64,7 +74,8 @@ public final class GitHubService: @unchecked Sendable {
     }
 
     private func pullRequest(_ raw: [String: Any]) -> GitHubPullRequest? {
-        guard let number = raw["number"] as? Int, let title = raw["title"] as? String, let state = raw["state"] as? String else { return nil }
+        guard let number = raw["number"] as? Int, let state = raw["state"] as? String else { return nil }
+        let title = raw["title"] as? String ?? ""
         let mergedAt = (raw["mergedAt"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
         return GitHubPullRequest(id: "pr-\(number)", number: number, title: title, state: state, isDraft: raw["isDraft"] as? Bool ?? false, baseRefName: raw["baseRefName"] as? String, headRefName: raw["headRefName"] as? String, headRefOid: raw["headRefOid"] as? String, mergedAt: mergedAt, url: URL(string: raw["url"] as? String ?? ""))
     }

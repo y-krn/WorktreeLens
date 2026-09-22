@@ -10,6 +10,10 @@ public struct SessionDiscoveryResult: Sendable {
     }
 }
 
+public protocol SessionDiscovering: Sendable {
+    func discover() -> SessionDiscoveryResult
+}
+
 public struct ProcessActivitySnapshot: Sendable {
     fileprivate let processes: [String]
     fileprivate let isAvailable: Bool
@@ -308,7 +312,7 @@ private struct LegacyJSONAdapter {
     }
 }
 
-public final class SessionService: @unchecked Sendable {
+public final class SessionService: @unchecked Sendable, SessionDiscovering {
     private let providers: [any SessionProvider]
     private let processProbe: ProcessActivityProbe
 

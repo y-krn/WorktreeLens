@@ -29,6 +29,29 @@ final class CoreTests: XCTestCase {
         }
     }
 
+    private final class CountingSessionDiscovery: @unchecked Sendable, SessionDiscovering {
+        private(set) var count = 0
+
+        func discover() -> SessionDiscoveryResult {
+            count += 1
+            return SessionDiscoveryResult(sessions: [], notes: [])
+        }
+    }
+
+    private final class StubRecordingRunner: @unchecked Sendable, ProcessRunning {
+        private(set) var arguments: [[String]] = []
+        private let response: ([String]) -> ProcessResult
+
+        init(response: @escaping ([String]) -> ProcessResult) {
+            self.response = response
+        }
+
+        func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+            self.arguments.append(arguments)
+            return response(arguments)
+        }
+    }
+
     private final class FailingWorktreeRemovalRunner: @unchecked Sendable, ProcessRunning {
         private(set) var arguments: [[String]] = []
 
@@ -631,12 +654,35 @@ final class CoreTests: XCTestCase {
         let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
         let mergedBranch = branch.withMergeEvidence(.githubVerified(prNumber: 138, mergedAt: mergedAt), github: status)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [mergedBranch])
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+        let sessionDiscovery = CountingSessionDiscovery()
+        let executionRecorder = RecordingRunner()
+        let cleanup = CleanupService(git: GitService(runner: executionRecorder), sessions: sessionDiscovery, github: github)
 
         let preview = cleanup.previewMergedBranches(snapshot: snapshot)
         XCTAssertEqual(preview.groups.first?.steps.map(\.step), [.deleteBranch])
         XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(sessionDiscovery.count, 0)
+        XCTAssertEqual(executionRecorder.arguments.count, 7)
+        XCTAssertEqual(executionRecorder.arguments.filter { $0.contains("for-each-ref") }.count, 1)
         XCTAssertTrue((try runGit(["-C", fixture.repository.path, "show-ref", "--verify", "refs/remotes/origin/feature"])).contains(fixture.featureSHA))
+    }
+
+    func testCleanupGitHubVerificationFetchesMergeEvidenceOnly() throws {
+        let sha = String(repeating: "a", count: 40)
+        let runner = StubRecordingRunner { arguments in
+            if arguments.starts(with: ["pr", "list"]) {
+                return ProcessResult(status: 0, stdout: "[{\"number\":12,\"state\":\"MERGED\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRefOid\":\"" + sha + "\",\"mergedAt\":\"2026-01-01T00:00:00Z\"}]")
+            }
+            return ProcessResult(status: 0, stdout: "[]")
+        }
+        let status = GitHubService(runner: runner, executable: "gh").cleanupStatus(repositoryPath: "/tmp/repository", branch: "feature")
+
+        XCTAssertNotNil(status.verifiedMergedPullRequest(defaultBranch: "main", branchName: "feature", localSHA: sha))
+        XCTAssertEqual(runner.arguments.count, 1)
+        XCTAssertEqual(Array(runner.arguments.first?.prefix(2) ?? []), ["pr", "list"])
+        XCTAssertFalse(runner.arguments.flatMap { $0 }.contains("closingIssuesReferences"))
+        XCTAssertFalse(runner.arguments.contains { $0.starts(with: ["pr", "view"]) })
+        XCTAssertFalse(runner.arguments.contains { $0.starts(with: ["run", "list"]) })
     }
 
     func testRemoteGoneGitAncestorAttachedWorktreeIsRemovedBeforeBranch() throws {
