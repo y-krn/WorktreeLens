@@ -56,12 +56,11 @@ final class ApplicationModel: ObservableObject {
     private var githubDetailToken = UUID()
     private var githubDetailTask: Task<Void, Never>?
     private var cleanupPreviewToken = UUID()
-    private var cleanupPreviewProgressTask: Task<Void, Never>?
 
-    init() {
+    init(loadRepositories: Bool = true) {
         registeredPaths = repositoryStore.paths
         selectedPath = registeredPaths.first
-        if let selectedPath { refresh(path: selectedPath) }
+        if loadRepositories, let selectedPath { refresh(path: selectedPath) }
     }
 
     func register(url: URL) {
@@ -234,44 +233,44 @@ final class ApplicationModel: ObservableObject {
     }
 
     func requestRemoveSelectedWorktree() {
-        guard let path = selectedPath, let snapshot, snapshot.path == path, let worktree = selectedWorktree() else { return }
+        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path, let worktree = selectedWorktree() else { return }
         let cleanup = self.cleanup
         requestPreview { cleanup.previewRemoveWorktree(snapshot: snapshot, path: worktree.path) }
     }
 
     func requestDeleteSelectedBranch() {
-        guard let path = selectedPath, let snapshot, snapshot.path == path, let branch = selectedBranch() else { return }
+        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path, let branch = selectedBranch() else { return }
         let cleanup = self.cleanup
         requestPreview { cleanup.previewDeleteBranch(snapshot: snapshot, name: branch.name) }
     }
 
     func requestPrune() {
-        guard let path = selectedPath, let snapshot, snapshot.path == path else { return }
+        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let cleanup = self.cleanup
         requestPreview { cleanup.previewPrune(snapshot: snapshot) }
     }
 
     func requestDeleteMergedBranches() {
-        guard let path = selectedPath, let snapshot, snapshot.path == path else { return }
+        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let cleanup = self.cleanup
         requestPreview { cleanup.previewMergedBranches(snapshot: snapshot) }
     }
 
     func requestRemoveStaleWorktrees() {
-        guard let path = selectedPath, let snapshot, snapshot.path == path else { return }
+        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let days = staleDays
         let cleanup = self.cleanup
         requestPreview { cleanup.previewStaleWorktrees(snapshot: snapshot, staleDays: days) }
     }
 
     func requestDeleteRemoteGoneBranches() {
-        guard let path = selectedPath, let snapshot, snapshot.path == path else { return }
+        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let cleanup = self.cleanup
         requestPreview { cleanup.previewRemoteGoneBranches(snapshot: snapshot) }
     }
 
     func executeCleanup(_ preview: CleanupPreview) {
-        guard cleanupExecutionState == .idle, cleanupPreview?.id == preview.id else { return }
+        guard cleanupExecutionState == .idle, !isCleanupPreviewLoading, cleanupPreview?.id == preview.id else { return }
         cleanupExecutionState = .running
         let cleanup = self.cleanup
         Task.detached(priority: .userInitiated) {
@@ -287,7 +286,6 @@ final class ApplicationModel: ObservableObject {
 
     func cancelCleanupPreview() {
         guard cleanupExecutionState == .idle else { return }
-        cleanupPreviewProgressTask?.cancel()
         cleanupPreviewToken = UUID()
         cleanupPreview = nil
         cleanupExecutionState = .idle
@@ -300,26 +298,50 @@ final class ApplicationModel: ObservableObject {
     }
 
     private func requestPreview(_ operation: @escaping @Sendable () -> CleanupPreview) {
-        guard cleanupExecutionState == .idle else { return }
-        cleanupPreviewProgressTask?.cancel()
+        if cleanupExecutionState == .running {
+            statusMessage = "Cleanup already running"
+            return
+        }
+        if case .completed = cleanupExecutionState, cleanupPreview == nil {
+            cleanupExecutionState = .idle
+        }
+        guard cleanupExecutionState == .idle else {
+            statusMessage = "Close the current cleanup preview first"
+            return
+        }
         let token = UUID()
         cleanupPreviewToken = token
-        isCleanupPreviewLoading = false
-        cleanupPreviewProgressTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            guard !Task.isCancelled, cleanupPreviewToken == token else { return }
-            isCleanupPreviewLoading = true
-        }
+        isCleanupPreviewLoading = true
+        statusMessage = "Preparing cleanup…"
         Task.detached(priority: .userInitiated) {
             let preview = operation()
             await MainActor.run {
                 guard self.cleanupPreviewToken == token else { return }
-                self.cleanupPreviewProgressTask?.cancel()
                 self.isCleanupPreviewLoading = false
                 self.cleanupExecutionState = .idle
                 self.cleanupPreview = preview
+                if preview.operation == .deleteRemoteGoneBranches, preview.groups.isEmpty {
+                    self.statusMessage = "No remote-gone branches found"
+                } else {
+                    self.statusMessage = nil
+                }
             }
         }
+    }
+
+    private func canRequestCleanup() -> Bool {
+        if cleanupExecutionState == .running {
+            statusMessage = "Cleanup already running"
+            return false
+        }
+        if case .completed = cleanupExecutionState, cleanupPreview == nil {
+            cleanupExecutionState = .idle
+        }
+        guard let path = selectedPath, let snapshot, snapshot.path == path else {
+            statusMessage = "Cleanup unavailable: no current repository snapshot"
+            return false
+        }
+        return true
     }
 }
 
@@ -469,7 +491,7 @@ struct ContentView: View {
             Button("Prune Worktree Metadata…") { model.requestPrune() }
             Button("Clean Up Merged Branches…") { model.requestDeleteMergedBranches() }
             Button("Delete Stale Worktrees (\(model.staleDays)d)…") { model.requestRemoveStaleWorktrees() }
-            Button("Delete Remote-gone Branches…") { model.requestDeleteRemoteGoneBranches() }
+            Button("Clean Up Merged Remote-gone Branches…") { model.requestDeleteRemoteGoneBranches() }
             Divider()
             Stepper("Stale threshold: \(model.staleDays) days", value: $model.staleDays, in: 1...365)
         }
@@ -658,6 +680,10 @@ struct CleanupConfirmationView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Confirm cleanup").font(.system(.title2, design: .rounded).weight(.bold))
             Text(preview.operation.rawValue).foregroundStyle(.secondary)
+            if preview.operation == .deleteRemoteGoneBranches, preview.groups.isEmpty {
+                Text("No remote-gone branches found")
+                    .font(.headline)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 7) {
                     if preview.groups.isEmpty {
