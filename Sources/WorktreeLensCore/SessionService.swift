@@ -12,6 +12,111 @@ public struct SessionDiscoveryResult: Sendable {
 
 public protocol SessionDiscovering: Sendable {
     func discover() -> SessionDiscoveryResult
+    func makeCleanupSafetyCache() -> SessionCleanupSafetyCache?
+}
+
+public extension SessionDiscovering {
+    func makeCleanupSafetyCache() -> SessionCleanupSafetyCache? { nil }
+}
+
+public protocol SessionCleanupSafetyChecking: Sendable {
+    func cachedMetadata() -> [SessionRecord]?
+    func freshSessionsForRemoval() -> [SessionRecord]?
+}
+
+public struct SessionDiscoveryMetricSnapshot: Equatable, Sendable {
+    public let processScans: Int
+    public let codexSQLiteQueries: Int
+    public let chatGPTMetadataScans: Int
+    public let chatGPTDirectoryEnumerations: Int
+    public let chatGPTFileReads: Int
+    public let fileAttributeChecks: Int
+    public let providerFingerprintCalls: Int
+
+    public var totalOperations: Int {
+        processScans + codexSQLiteQueries + chatGPTMetadataScans + chatGPTDirectoryEnumerations + chatGPTFileReads + fileAttributeChecks + providerFingerprintCalls
+    }
+}
+
+public final class SessionDiscoveryMetrics: @unchecked Sendable {
+    private let lock = NSLock()
+    private var processScans = 0
+    private var codexSQLiteQueries = 0
+    private var chatGPTMetadataScans = 0
+    private var chatGPTDirectoryEnumerations = 0
+    private var chatGPTFileReads = 0
+    private var fileAttributeChecks = 0
+    private var providerFingerprintCalls = 0
+
+    public init() {}
+
+    public func snapshot() -> SessionDiscoveryMetricSnapshot {
+        lock.lock(); defer { lock.unlock() }
+        return SessionDiscoveryMetricSnapshot(processScans: processScans, codexSQLiteQueries: codexSQLiteQueries, chatGPTMetadataScans: chatGPTMetadataScans, chatGPTDirectoryEnumerations: chatGPTDirectoryEnumerations, chatGPTFileReads: chatGPTFileReads, fileAttributeChecks: fileAttributeChecks, providerFingerprintCalls: providerFingerprintCalls)
+    }
+
+    public func reset() {
+        lock.lock(); defer { lock.unlock() }
+        processScans = 0; codexSQLiteQueries = 0; chatGPTMetadataScans = 0; chatGPTDirectoryEnumerations = 0; chatGPTFileReads = 0; fileAttributeChecks = 0; providerFingerprintCalls = 0
+    }
+
+    fileprivate func recordProcessScan() { lock.lock(); processScans += 1; lock.unlock() }
+    fileprivate func recordSQLiteQuery() { lock.lock(); codexSQLiteQueries += 1; lock.unlock() }
+    fileprivate func recordMetadataScan() { lock.lock(); chatGPTMetadataScans += 1; lock.unlock() }
+    fileprivate func recordDirectoryEnumeration() { lock.lock(); chatGPTDirectoryEnumerations += 1; lock.unlock() }
+    fileprivate func recordFileRead() { lock.lock(); chatGPTFileReads += 1; lock.unlock() }
+    fileprivate func recordAttributeCheck() { lock.lock(); fileAttributeChecks += 1; lock.unlock() }
+    fileprivate func recordProviderFingerprint() { lock.lock(); providerFingerprintCalls += 1; lock.unlock() }
+}
+
+public final class SessionSourceFingerprintCache: @unchecked Sendable {
+    private struct DirectoryEntry {
+        let stamp: String
+        let candidates: [String]
+    }
+    private var directories: [String: DirectoryEntry] = [:]
+
+    fileprivate init() {}
+
+    fileprivate func chatGPTFingerprint(directories paths: [URL], metrics: SessionDiscoveryMetrics) -> String? {
+        let manager = FileManager.default
+        var fingerprints: [String] = []
+        for directory in paths {
+            metrics.recordAttributeCheck()
+            let attributes: [FileAttributeKey: Any]
+            do {
+                attributes = try manager.attributesOfItem(atPath: directory.path)
+            } catch where isMissingFileError(error) {
+                directories.removeValue(forKey: directory.path)
+                fingerprints.append("missing:\(directory.path)")
+                continue
+            } catch {
+                return nil
+            }
+            guard attributes[.type] as? FileAttributeType == .typeDirectory,
+                  let modified = attributes[.modificationDate] as? Date,
+                  let size = attributes[.size] as? NSNumber else { return nil }
+            let stamp = "\(size):\(modified.timeIntervalSince1970):\(attributes[.systemFileNumber] ?? "")"
+            let candidates: [String]
+            if let cached = directories[directory.path], cached.stamp == stamp {
+                candidates = cached.candidates
+            } else {
+                metrics.recordDirectoryEnumeration()
+                guard let children = try? manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
+                candidates = children.filter(LegacyJSONAdapter.isCandidate).map(\.path).sorted()
+                directories[directory.path] = DirectoryEntry(stamp: stamp, candidates: candidates)
+            }
+            fingerprints.append("dir:\(directory.path):\(stamp)")
+            for candidate in candidates {
+                metrics.recordAttributeCheck()
+                guard let fileAttributes = try? manager.attributesOfItem(atPath: candidate),
+                      let fileSize = fileAttributes[.size] as? NSNumber,
+                      let fileModified = fileAttributes[.modificationDate] as? Date else { return nil }
+                fingerprints.append("file:\(candidate):\(fileSize):\(fileModified.timeIntervalSince1970):\(fileAttributes[.systemFileNumber] ?? "")")
+            }
+        }
+        return fingerprints.sorted().joined(separator: "\n")
+    }
 }
 
 public struct ProcessActivitySnapshot: Sendable {
@@ -37,10 +142,12 @@ public extension SessionActivityProbing {
 
 public struct ProcessActivityProbe: SessionActivityProbing {
     private let runner: any ProcessRunning
+    private let metrics: SessionDiscoveryMetrics
 
-    public init(runner: any ProcessRunning = LocalProcessRunner()) { self.runner = runner }
+    public init(runner: any ProcessRunning = LocalProcessRunner(), metrics: SessionDiscoveryMetrics = SessionDiscoveryMetrics()) { self.runner = runner; self.metrics = metrics }
 
     public func snapshot() -> ProcessActivitySnapshot {
+        metrics.recordProcessScan()
         guard let result = try? runner.run("/bin/ps", arguments: ["-axo", "pid=,command="], currentDirectory: nil), result.succeeded else {
             return ProcessActivitySnapshot(processes: [], isAvailable: false)
         }
@@ -70,9 +177,14 @@ public struct ProcessActivityProbe: SessionActivityProbing {
 public protocol SessionProvider: Sendable {
     var kind: SessionProviderKind { get }
     func discover(processSnapshot: ProcessActivitySnapshot) -> SessionDiscoveryResult
+    func sourceFingerprint() -> String?
+    func sourceFingerprint(using cache: SessionSourceFingerprintCache, metrics: SessionDiscoveryMetrics) -> String?
 }
 
 public extension SessionProvider {
+    func sourceFingerprint() -> String? { nil }
+    func sourceFingerprint(using cache: SessionSourceFingerprintCache, metrics: SessionDiscoveryMetrics) -> String? { sourceFingerprint() }
+
     func discover() -> SessionDiscoveryResult {
         discover(processSnapshot: ProcessActivityProbe().snapshot())
     }
@@ -83,11 +195,13 @@ public struct CodexSessionProvider: SessionProvider {
     private let home: String
     private let runner: any ProcessRunning
     private let activityProbe: any SessionActivityProbing
+    private let metrics: SessionDiscoveryMetrics
 
-    public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner(), activityProbe: any SessionActivityProbing = ProcessActivityProbe()) {
+    public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner(), activityProbe: any SessionActivityProbing = ProcessActivityProbe(), metrics: SessionDiscoveryMetrics = SessionDiscoveryMetrics()) {
         self.home = home
         self.runner = runner
         self.activityProbe = activityProbe
+        self.metrics = metrics
     }
 
     public func discover() -> SessionDiscoveryResult {
@@ -125,6 +239,26 @@ public struct CodexSessionProvider: SessionProvider {
         return SessionDiscoveryResult(sessions: sessions.values.sorted { $0.updatedAt ?? .distantPast > $1.updatedAt ?? .distantPast }, notes: notes)
     }
 
+    public func sourceFingerprint() -> String? {
+        let base = URL(fileURLWithPath: home).appendingPathComponent(".codex/sqlite")
+        return fingerprintFiles([
+            base.appendingPathComponent("state_5.sqlite"),
+            base.appendingPathComponent("state_5.sqlite-wal"),
+            base.appendingPathComponent("codex-dev.db"),
+            base.appendingPathComponent("codex-dev.db-wal")
+        ])
+    }
+
+    public func sourceFingerprint(using cache: SessionSourceFingerprintCache, metrics: SessionDiscoveryMetrics) -> String? {
+        let base = URL(fileURLWithPath: home).appendingPathComponent(".codex/sqlite")
+        return fingerprintFiles([
+            base.appendingPathComponent("state_5.sqlite"),
+            base.appendingPathComponent("state_5.sqlite-wal"),
+            base.appendingPathComponent("codex-dev.db"),
+            base.appendingPathComponent("codex-dev.db-wal")
+        ], metrics: metrics)
+    }
+
     private func makeRecord(id: String, title: String, updatedAt: Date?, cwd: String, branch: String?, source: String, processSnapshot: ProcessActivitySnapshot) -> SessionRecord {
         let state = activityProbe.activity(for: id, provider: .codex, snapshot: processSnapshot)
         return SessionRecord(id: "codex-\(id)", provider: .codex, title: title, updatedAt: updatedAt, cwd: cwd, branch: branch, url: URL(string: "codex://threads/\(id)"), activity: state.0, evidence: "\(source); \(state.1)")
@@ -137,7 +271,9 @@ public struct CodexSessionProvider: SessionProvider {
     }
 
     private func query(database: String, sql: String) -> [[String: Any]]? {
+        metrics.recordAttributeCheck()
         guard FileManager.default.fileExists(atPath: database) else { return nil }
+        metrics.recordSQLiteQuery()
         guard let result = try? runner.run("/usr/bin/sqlite3", arguments: ["-batch", "-noheader", "file:\(database)?mode=ro", sql], currentDirectory: nil), result.succeeded else { return nil }
         return result.stdout.split(whereSeparator: \.isNewline).compactMap { line in
             guard let data = String(line).data(using: .utf8), let object = try? JSONSerialization.jsonObject(with: data), let dict = object as? [String: Any] else { return nil }
@@ -150,10 +286,12 @@ public struct ChatGPTSessionProvider: SessionProvider {
     public let kind: SessionProviderKind = .chatGPT
     private let home: String
     private let activityProbe: any SessionActivityProbing
+    private let metrics: SessionDiscoveryMetrics
 
-    public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner(), activityProbe: any SessionActivityProbing = ProcessActivityProbe()) {
+    public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner(), activityProbe: any SessionActivityProbing = ProcessActivityProbe(), metrics: SessionDiscoveryMetrics = SessionDiscoveryMetrics()) {
         self.home = home
         self.activityProbe = activityProbe
+        self.metrics = metrics
         _ = runner // Retain source compatibility; ChatGPT no longer reads SQLite.
     }
 
@@ -162,7 +300,7 @@ public struct ChatGPTSessionProvider: SessionProvider {
     }
 
     public func discover(processSnapshot: ProcessActivitySnapshot) -> SessionDiscoveryResult {
-        let result = LegacyJSONAdapter(roots: legacyRoots).read()
+        let result = LegacyJSONAdapter(roots: legacyRoots, metrics: metrics).read()
         let records = result.sessions.map { makeRecord($0, processSnapshot: processSnapshot) }
         var notes = result.notes
         if records.isEmpty {
@@ -177,6 +315,14 @@ public struct ChatGPTSessionProvider: SessionProvider {
         return SessionDiscoveryResult(sessions: unique.values.sorted { $0.updatedAt ?? .distantPast > $1.updatedAt ?? .distantPast }, notes: notes)
     }
 
+    public func sourceFingerprint() -> String? {
+        SessionSourceFingerprintCache().chatGPTFingerprint(directories: legacyDirectories, metrics: metrics)
+    }
+
+    public func sourceFingerprint(using cache: SessionSourceFingerprintCache, metrics: SessionDiscoveryMetrics) -> String? {
+        cache.chatGPTFingerprint(directories: legacyDirectories, metrics: metrics)
+    }
+
     private var legacyRoots: [URL] {
         let base = URL(fileURLWithPath: home)
         return [
@@ -184,6 +330,10 @@ public struct ChatGPTSessionProvider: SessionProvider {
             base.appendingPathComponent("Library/Application Support/ChatGPT"),
             base.appendingPathComponent("Library/Containers/com.openai.chat/Data/Library/Application Support/com.openai.chat")
         ]
+    }
+
+    private var legacyDirectories: [URL] {
+        legacyRoots.flatMap { root in [root] + ["Local Storage", "IndexedDB"].map { root.appendingPathComponent($0) } }
     }
 
     private func makeRecord(_ metadata: ChatGPTSessionMetadata, processSnapshot: ProcessActivitySnapshot) -> SessionRecord {
@@ -222,6 +372,7 @@ private struct ChatGPTAdapterResult: Sendable {
 
 private struct LegacyJSONAdapter {
     let roots: [URL]
+    let metrics: SessionDiscoveryMetrics
 
     private static let candidateDirectories = ["", "Local Storage", "IndexedDB"]
     private static let candidateFileNames: Set<String> = ["session.json", "sessions.json", "conversations.json", "conversations.jsonl", "state.json", "metadata.json"]
@@ -231,10 +382,13 @@ private struct LegacyJSONAdapter {
     private static let maxSessions = 500
     private static let maxDepth = 32
 
+    static func isCandidate(_ url: URL) -> Bool { candidateFileNames.contains(url.lastPathComponent) }
+
     func read() -> ChatGPTAdapterResult {
         var sessions: [ChatGPTSessionMetadata] = []
         var notes: [String] = []
         for root in roots {
+            metrics.recordAttributeCheck()
             guard FileManager.default.fileExists(atPath: root.path) else {
                 notes.append("ChatGPT: \(root.path) unavailable")
                 continue
@@ -246,18 +400,26 @@ private struct LegacyJSONAdapter {
     }
 
     private func scan(root: URL, sessions: inout [ChatGPTSessionMetadata]) -> (Int, Int) {
+        metrics.recordMetadataScan()
         var inspectedFiles = 0
         var skippedFiles = 0
         var totalBytes: Int64 = 0
         for directory in Self.candidateDirectories {
             guard inspectedFiles < Self.maxFiles, totalBytes < Self.maxTotalBytes, sessions.count < Self.maxSessions else { break }
             let directoryURL = directory.isEmpty ? root : root.appendingPathComponent(directory)
+            metrics.recordDirectoryEnumeration()
             guard let children = try? FileManager.default.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey], options: [.skipsHiddenFiles]) else { continue }
             for fileURL in children where Self.candidateFileNames.contains(fileURL.lastPathComponent) {
                 guard inspectedFiles < Self.maxFiles, totalBytes < Self.maxTotalBytes, sessions.count < Self.maxSessions else { break }
                 inspectedFiles += 1
+                metrics.recordAttributeCheck()
                 let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap(Int64.init) ?? 0
-                guard size <= Self.maxFileBytes, totalBytes + size <= Self.maxTotalBytes, let data = try? Data(contentsOf: fileURL) else {
+                guard size <= Self.maxFileBytes, totalBytes + size <= Self.maxTotalBytes else {
+                    skippedFiles += 1
+                    continue
+                }
+                metrics.recordFileRead()
+                guard let data = try? Data(contentsOf: fileURL) else {
                     skippedFiles += 1
                     continue
                 }
@@ -315,11 +477,13 @@ private struct LegacyJSONAdapter {
 public final class SessionService: @unchecked Sendable, SessionDiscovering {
     private let providers: [any SessionProvider]
     private let processProbe: ProcessActivityProbe
+    public let metrics: SessionDiscoveryMetrics
 
-    public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner()) {
-        let probe = ProcessActivityProbe(runner: runner)
+    public init(home: String = NSHomeDirectory(), runner: any ProcessRunning = LocalProcessRunner(), metrics: SessionDiscoveryMetrics = SessionDiscoveryMetrics()) {
+        self.metrics = metrics
+        let probe = ProcessActivityProbe(runner: runner, metrics: metrics)
         processProbe = probe
-        providers = [CodexSessionProvider(home: home, runner: runner, activityProbe: probe), ChatGPTSessionProvider(home: home, activityProbe: probe)]
+        providers = [CodexSessionProvider(home: home, runner: runner, activityProbe: probe, metrics: metrics), ChatGPTSessionProvider(home: home, activityProbe: probe, metrics: metrics)]
     }
 
     public func discover() -> SessionDiscoveryResult {
@@ -332,8 +496,118 @@ public final class SessionService: @unchecked Sendable, SessionDiscovering {
         }
     }
 
+    public func makeCleanupSafetyCache() -> SessionCleanupSafetyCache? {
+        SessionCleanupSafetyCache(providers: providers, processProbe: processProbe, metrics: metrics)
+    }
+
     private func rawThreadID(_ session: SessionRecord) -> String {
         let prefix = session.provider == .codex ? "codex-" : "chatgpt-"
         return session.id.hasPrefix(prefix) ? String(session.id.dropFirst(prefix.count)) : session.id
     }
+}
+
+public final class SessionCleanupSafetyCache: SessionCleanupSafetyChecking, @unchecked Sendable {
+    private let providers: [any SessionProvider]
+    private let processProbe: ProcessActivityProbe
+    private var fingerprints: [SessionProviderKind: String] = [:]
+    private var metadata: [SessionProviderKind: [SessionRecord]] = [:]
+    private var initialized = false
+    private let metrics: SessionDiscoveryMetrics
+    private let fingerprintCache = SessionSourceFingerprintCache()
+
+    fileprivate init(providers: [any SessionProvider], processProbe: ProcessActivityProbe, metrics: SessionDiscoveryMetrics) {
+        self.providers = providers
+        self.processProbe = processProbe
+        self.metrics = metrics
+    }
+
+    public func cachedMetadata() -> [SessionRecord]? {
+        guard initializeIfNeeded() else { return nil }
+        return allMetadata.map { withActivity($0, .inactive, "cached metadata") }
+    }
+
+    public func freshSessionsForRemoval() -> [SessionRecord]? {
+        guard initializeIfNeeded(), refreshChangedProviders() else { return nil }
+        let processSnapshot = processProbe.snapshot()
+        let sourceStamps = fingerprints
+        var result: [SessionRecord] = []
+        for session in allMetadata {
+            let activity = processProbe.activity(for: rawID(session), provider: session.provider, snapshot: processSnapshot)
+            result.append(SessionRecord(id: session.id, provider: session.provider, title: session.title, updatedAt: session.updatedAt, cwd: session.cwd, branch: session.branch, url: session.url, activity: activity.0, evidence: metadataEvidence(session) + "; " + activity.1))
+        }
+        // A source change during inspection invalidates this snapshot; the next attempt refreshes it.
+        guard providers.allSatisfy({ sourceFingerprint($0) == sourceStamps[$0.kind] }) else { return nil }
+        return result
+    }
+
+    private var allMetadata: [SessionRecord] { providers.flatMap { metadata[$0.kind] ?? [] } }
+
+    private func initializeIfNeeded() -> Bool {
+        if initialized { return true }
+        for provider in providers {
+            guard let before = sourceFingerprint(provider) else { return false }
+            let found = provider.discover(processSnapshot: ProcessActivitySnapshot(processes: [], isAvailable: false))
+            guard let after = sourceFingerprint(provider), before == after else { return false }
+            fingerprints[provider.kind] = after
+            metadata[provider.kind] = found.sessions
+        }
+        initialized = true
+        return true
+    }
+
+    private func refreshChangedProviders() -> Bool {
+        for provider in providers {
+            guard let current = sourceFingerprint(provider) else { return false }
+            guard current != fingerprints[provider.kind] else { continue }
+            let refreshed = provider.discover(processSnapshot: ProcessActivitySnapshot(processes: [], isAvailable: false))
+            guard let verified = sourceFingerprint(provider), verified == current else { return false }
+            metadata[provider.kind] = refreshed.sessions
+            fingerprints[provider.kind] = verified
+        }
+        return true
+    }
+
+    private func rawID(_ session: SessionRecord) -> String {
+        let prefix = session.provider == .codex ? "codex-" : "chatgpt-"
+        return session.id.hasPrefix(prefix) ? String(session.id.dropFirst(prefix.count)) : session.id
+    }
+
+    private func sourceFingerprint(_ provider: any SessionProvider) -> String? {
+        metrics.recordProviderFingerprint()
+        return provider.sourceFingerprint(using: fingerprintCache, metrics: metrics)
+    }
+
+    private func metadataEvidence(_ session: SessionRecord) -> String {
+        session.evidence.components(separatedBy: "; ").filter { $0 != "process scan unavailable" && $0 != "provider process not running" && $0 != "provider process running; session ID not exposed" && $0 != "running process contains exact session ID" }.joined(separator: "; ")
+    }
+
+    private func withActivity(_ session: SessionRecord, _ activity: SessionActivity, _ evidence: String) -> SessionRecord {
+        SessionRecord(id: session.id, provider: session.provider, title: session.title, updatedAt: session.updatedAt, cwd: session.cwd, branch: session.branch, url: session.url, activity: activity, evidence: metadataEvidence(session) + "; " + evidence)
+    }
+}
+
+private func fingerprintFiles(_ urls: [URL], metrics: SessionDiscoveryMetrics? = nil) -> String? {
+    let manager = FileManager.default
+    var entries: [String] = []
+    for url in urls {
+        metrics?.recordAttributeCheck()
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try manager.attributesOfItem(atPath: url.path)
+        } catch where isMissingFileError(error) {
+            entries.append("missing:\(url.path)")
+            continue
+        } catch {
+            return nil
+        }
+        guard let size = attributes[.size] as? NSNumber,
+              let modified = attributes[.modificationDate] as? Date else { return nil }
+        entries.append("file:\(url.path):\(size):\(modified.timeIntervalSince1970):\(attributes[.systemFileNumber] ?? "")")
+    }
+    return entries.joined(separator: "\n")
+}
+
+private func isMissingFileError(_ error: Error) -> Bool {
+    let code = (error as NSError).code
+    return code == NSFileNoSuchFileError || code == NSFileReadNoSuchFileError
 }
