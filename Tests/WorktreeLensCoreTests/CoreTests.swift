@@ -149,6 +149,102 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(counter.value, 1)
     }
 
+    func testCleanupSafetyCacheRefreshesOnlyChangedProviderAndFindsNewChatGPTSession() throws {
+        final class Counter: @unchecked Sendable {
+            var ps = 0
+            var sqlite = 0
+            var psOutput = "123 /usr/bin/other-process\n"
+        }
+        struct Runner: ProcessRunning {
+            let counter: Counter
+            func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+                if executable == "/bin/ps" {
+                    counter.ps += 1
+                    return ProcessResult(status: 0, stdout: counter.psOutput)
+                }
+                if executable == "/usr/bin/sqlite3" {
+                    counter.sqlite += 1
+                    return ProcessResult(status: 0, stdout: "")
+                }
+                return ProcessResult(status: 1)
+            }
+        }
+
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-cache-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let sqlite = home.appendingPathComponent(".codex/sqlite")
+        let chatRoot = home.appendingPathComponent("Library/Application Support/com.openai.chat")
+        try FileManager.default.createDirectory(at: sqlite, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: chatRoot, withIntermediateDirectories: true)
+        try Data().write(to: sqlite.appendingPathComponent("state_5.sqlite"))
+        try Data().write(to: sqlite.appendingPathComponent("codex-dev.db"))
+        let sessionsFile = chatRoot.appendingPathComponent("sessions.json")
+        try Data("[{\"id\":\"first\",\"cwd\":\"/tmp/worktree\"}]".utf8).write(to: sessionsFile)
+        let counter = Counter()
+        let service = SessionService(home: home.path, runner: Runner(counter: counter))
+        let cache = try XCTUnwrap(service.makeCleanupSafetyCache())
+
+        XCTAssertEqual(cache.cachedMetadata()?.map(\.id), ["chatgpt-first"])
+        XCTAssertEqual(counter.sqlite, 2)
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.id), ["chatgpt-first"])
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.id), ["chatgpt-first"])
+        XCTAssertEqual(counter.sqlite, 2, "unchanged Codex databases must not be queried again")
+
+        try Data("[{\"id\":\"first\",\"cwd\":\"/tmp/worktree\"},{\"id\":\"second\",\"cwd\":\"/tmp/worktree\"}]".utf8).write(to: sessionsFile, options: .atomic)
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.id).sorted(), ["chatgpt-first", "chatgpt-second"])
+        XCTAssertEqual(counter.sqlite, 2, "ChatGPT source change must not refresh unchanged Codex metadata")
+        XCTAssertEqual(counter.ps, 3, "activity check must use a fresh process scan for each removal")
+    }
+
+    func testCleanupSafetyCacheDetectsSessionBecomingActiveAndUnknown() throws {
+        final class Counter: @unchecked Sendable {
+            var ps = 0
+            var activeAt = 2
+            var unknownAt: Int?
+        }
+        struct Runner: ProcessRunning {
+            let counter: Counter
+            func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+                if executable == "/bin/ps" {
+                    counter.ps += 1
+                    if counter.ps == counter.unknownAt { return ProcessResult(status: 0, stdout: "123 /Applications/Codex.app/Contents/MacOS/Codex\n") }
+                    if counter.ps >= counter.activeAt { return ProcessResult(status: 0, stdout: "123 /usr/local/bin/codex session-1\n") }
+                    return ProcessResult(status: 0, stdout: "123 /usr/bin/other-process\n")
+                }
+                if executable == "/usr/bin/sqlite3", arguments.contains(where: { $0.contains("state_5.sqlite?") }) {
+                    return ProcessResult(status: 0, stdout: "{\"id\":\"session-1\",\"title\":\"fixture\",\"cwd\":\"/tmp/worktree\"}\n")
+                }
+                return ProcessResult(status: 0, stdout: "")
+            }
+        }
+
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-active-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let sqlite = home.appendingPathComponent(".codex/sqlite")
+        try FileManager.default.createDirectory(at: sqlite, withIntermediateDirectories: true)
+        try Data().write(to: sqlite.appendingPathComponent("state_5.sqlite"))
+        let counter = Counter()
+        let service = SessionService(home: home.path, runner: Runner(counter: counter))
+        let cache = try XCTUnwrap(service.makeCleanupSafetyCache())
+        XCTAssertEqual(cache.cachedMetadata()?.map(\.activity), [.inactive])
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.activity), [.inactive])
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.activity), [.active])
+        counter.activeAt = 99
+        counter.unknownAt = 3
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.activity), [.unknown])
+    }
+
+    func testCleanupSafetyCacheFailsClosedWhenFreshnessCannotBeRead() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-stale-source-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let badRoot = home.appendingPathComponent("Library/Application Support/com.openai.chat")
+        try FileManager.default.createDirectory(at: badRoot.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("not a directory".utf8).write(to: badRoot)
+        let cache = try XCTUnwrap(SessionService(home: home.path).makeCleanupSafetyCache())
+        XCTAssertNil(cache.cachedMetadata())
+        XCTAssertNil(cache.freshSessionsForRemoval())
+    }
+
     func testChatGPTJSONFixtureParsesExplicitCwdAndAssociatesWorktree() throws {
         let repository = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-chatgpt-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
@@ -776,6 +872,94 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(gitArguments.filter { $0.contains("update-ref") && $0.contains("-d") }.count, 10)
         XCTAssertTrue(ghRecorder.arguments.allSatisfy { $0.starts(with: ["pr", "view"]) })
         XCTAssertEqual(gitArguments.filter { $0.contains("branch") && $0.contains("-D") }.count, 0)
+    }
+
+    func testTenGroupedWorktreeCleanupSessionOperationMeasurement() throws {
+        final class Counts: @unchecked Sendable {
+            var ps = 0
+            var sqlite = 0
+        }
+        struct SessionRunner: ProcessRunning {
+            let counts: Counts
+            func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+                if executable == "/bin/ps" { counts.ps += 1; return ProcessResult(status: 0, stdout: "123 /usr/bin/other-process\n") }
+                if executable == "/usr/bin/sqlite3" { counts.sqlite += 1; return ProcessResult(status: 0, stdout: "") }
+                return ProcessResult(status: 1)
+            }
+        }
+
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        var worktreePaths: [URL] = []
+        for index in 1...10 {
+            let name = index == 1 ? "feature" : "feature-\(index)"
+            if index > 1 { _ = try runGit(["-C", fixture.repository.path, "branch", name, "feature"]) }
+            let path = fixture.root.appendingPathComponent("worktree-\(index)")
+            _ = try runGit(["-C", fixture.repository.path, "worktree", "add", path.path, name])
+            worktreePaths.append(path)
+        }
+
+        let home = fixture.root.appendingPathComponent("session-home")
+        let sqlite = home.appendingPathComponent(".codex/sqlite")
+        let chatRoot = home.appendingPathComponent("Library/Application Support/com.openai.chat")
+        try FileManager.default.createDirectory(at: sqlite, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: chatRoot, withIntermediateDirectories: true)
+        try Data().write(to: sqlite.appendingPathComponent("state_5.sqlite"))
+        try Data().write(to: sqlite.appendingPathComponent("codex-dev.db"))
+        try Data("[]".utf8).write(to: chatRoot.appendingPathComponent("sessions.json"))
+
+        let counts = Counts()
+        let sessionService = SessionService(home: home.path, runner: SessionRunner(counts: counts))
+        var baselineJSONScans = 0
+        var baselineJSONReads = 0
+        for _ in 0..<10 {
+            let discovery = sessionService.discover()
+            let scanCount = discovery.notes.compactMap { note -> Int? in
+                guard note.contains("JSON/JSONL candidate scan") else { return nil }
+                return Int(note.components(separatedBy: "files=").last?.components(separatedBy: ",").first ?? "0")
+            }.count
+            baselineJSONScans += scanCount
+            baselineJSONReads += discovery.notes.compactMap { note -> Int? in
+                guard note.contains("JSON/JSONL candidate scan") else { return nil }
+                return Int(note.components(separatedBy: "files=").last?.components(separatedBy: ",").first ?? "0")
+            }.reduce(0, +)
+        }
+        let before = (ps: counts.ps, sqlite: counts.sqlite, chatScans: baselineJSONScans, chatReads: baselineJSONReads)
+        counts.ps = 0
+        counts.sqlite = 0
+
+        let local = try GitService().snapshot(repositoryPath: fixture.repository.path)
+        let branches = local.branches.compactMap { branch -> BranchInfo? in
+            guard let index = Int(branch.name == "feature" ? "1" : branch.name.replacingOccurrences(of: "feature-", with: "")), (1...10).contains(index) else { return nil }
+            return branch.withMergeEvidence(.githubVerified(prNumber: index, mergedAt: Date(timeIntervalSince1970: 1)))
+        }
+        XCTAssertEqual(branches.count, 10)
+        let github = GitHubService(runner: StubRecordingRunner { arguments in
+            guard arguments.starts(with: ["pr", "view"]), let number = arguments.dropFirst(2).first, let index = Int(number) else { return ProcessResult(status: 1) }
+            let name = index == 1 ? "feature" : "feature-\(index)"
+            let body = "{\"number\":\(index),\"state\":\"MERGED\",\"baseRefName\":\"main\",\"headRefName\":\"\(name)\",\"headRefOid\":\"\(fixture.featureSHA)\",\"mergedAt\":\"2026-01-01T00:00:00Z\"}"
+            return ProcessResult(status: 0, stdout: body)
+        }, executable: "gh")
+        let cleanup = CleanupService(git: GitService(), sessions: sessionService, github: github)
+        let preview = cleanup.previewMergedBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: branches))
+        XCTAssertEqual(preview.groups.count, 10)
+        XCTAssertTrue(preview.groups.allSatisfy { $0.steps.filter { $0.step == .removeWorktree }.count == 1 })
+        XCTAssertEqual(cleanup.execute(preview).count, 10)
+
+        let afterJSONScans = 1 // One changed-source discovery for the execution-scoped ChatGPT metadata cache.
+        let afterJSONReads = 1 // The fixture has one candidate JSON file.
+        let after = (ps: counts.ps, sqlite: counts.sqlite, chatScans: afterJSONScans, chatReads: afterJSONReads)
+        XCTAssertEqual(before.ps, 10)
+        XCTAssertEqual(before.sqlite, 20)
+        XCTAssertEqual(before.chatScans, 10)
+        XCTAssertEqual(before.chatReads, 10)
+        XCTAssertEqual(after.ps, 10)
+        XCTAssertEqual(after.sqlite, 2)
+        XCTAssertEqual(after.chatScans, 1)
+        XCTAssertEqual(after.chatReads, 1)
+        XCTAssertEqual(before.ps + before.sqlite + before.chatScans + before.chatReads, 50)
+        XCTAssertEqual(after.ps + after.sqlite + after.chatScans + after.chatReads, 14)
+        XCTAssertTrue(worktreePaths.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
     }
 
     func testTenGitAncestorBranchOnlyGroupsKeepFreshMergeBaseChecks() throws {

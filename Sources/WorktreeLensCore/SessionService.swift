@@ -12,6 +12,16 @@ public struct SessionDiscoveryResult: Sendable {
 
 public protocol SessionDiscovering: Sendable {
     func discover() -> SessionDiscoveryResult
+    func makeCleanupSafetyCache() -> SessionCleanupSafetyCache?
+}
+
+public extension SessionDiscovering {
+    func makeCleanupSafetyCache() -> SessionCleanupSafetyCache? { nil }
+}
+
+public protocol SessionCleanupSafetyChecking: Sendable {
+    func cachedMetadata() -> [SessionRecord]?
+    func freshSessionsForRemoval() -> [SessionRecord]?
 }
 
 public struct ProcessActivitySnapshot: Sendable {
@@ -70,9 +80,12 @@ public struct ProcessActivityProbe: SessionActivityProbing {
 public protocol SessionProvider: Sendable {
     var kind: SessionProviderKind { get }
     func discover(processSnapshot: ProcessActivitySnapshot) -> SessionDiscoveryResult
+    func sourceFingerprint() -> String?
 }
 
 public extension SessionProvider {
+    func sourceFingerprint() -> String? { nil }
+
     func discover() -> SessionDiscoveryResult {
         discover(processSnapshot: ProcessActivityProbe().snapshot())
     }
@@ -125,6 +138,16 @@ public struct CodexSessionProvider: SessionProvider {
         return SessionDiscoveryResult(sessions: sessions.values.sorted { $0.updatedAt ?? .distantPast > $1.updatedAt ?? .distantPast }, notes: notes)
     }
 
+    public func sourceFingerprint() -> String? {
+        let base = URL(fileURLWithPath: home).appendingPathComponent(".codex/sqlite")
+        return fingerprintFiles([
+            base.appendingPathComponent("state_5.sqlite"),
+            base.appendingPathComponent("state_5.sqlite-wal"),
+            base.appendingPathComponent("codex-dev.db"),
+            base.appendingPathComponent("codex-dev.db-wal")
+        ])
+    }
+
     private func makeRecord(id: String, title: String, updatedAt: Date?, cwd: String, branch: String?, source: String, processSnapshot: ProcessActivitySnapshot) -> SessionRecord {
         let state = activityProbe.activity(for: id, provider: .codex, snapshot: processSnapshot)
         return SessionRecord(id: "codex-\(id)", provider: .codex, title: title, updatedAt: updatedAt, cwd: cwd, branch: branch, url: URL(string: "codex://threads/\(id)"), activity: state.0, evidence: "\(source); \(state.1)")
@@ -175,6 +198,30 @@ public struct ChatGPTSessionProvider: SessionProvider {
         var unique: [String: SessionRecord] = [:]
         records.forEach { unique[$0.id] = $0 }
         return SessionDiscoveryResult(sessions: unique.values.sorted { $0.updatedAt ?? .distantPast > $1.updatedAt ?? .distantPast }, notes: notes)
+    }
+
+    public func sourceFingerprint() -> String? {
+        let manager = FileManager.default
+        var entries: [String] = []
+        for root in legacyRoots {
+            let roots = [root] + ["Local Storage", "IndexedDB"].map { root.appendingPathComponent($0) }
+            for directory in roots {
+                var isDirectory: ObjCBool = false
+                guard manager.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {
+                    entries.append("missing:\(directory.path)")
+                    continue
+                }
+                guard isDirectory.boolValue, let children = try? manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
+                entries.append("dir:\(directory.path)")
+                for file in children where LegacyJSONAdapter.isCandidate(file) {
+                    guard let attributes = try? manager.attributesOfItem(atPath: file.path),
+                          let size = attributes[.size] as? NSNumber,
+                          let modified = attributes[.modificationDate] as? Date else { return nil }
+                    entries.append("file:\(file.path):\(size):\(modified.timeIntervalSince1970)")
+                }
+            }
+        }
+        return entries.sorted().joined(separator: "\n")
     }
 
     private var legacyRoots: [URL] {
@@ -230,6 +277,8 @@ private struct LegacyJSONAdapter {
     private static let maxFileBytes: Int64 = 2_000_000
     private static let maxSessions = 500
     private static let maxDepth = 32
+
+    static func isCandidate(_ url: URL) -> Bool { candidateFileNames.contains(url.lastPathComponent) }
 
     func read() -> ChatGPTAdapterResult {
         var sessions: [ChatGPTSessionMetadata] = []
@@ -332,8 +381,100 @@ public final class SessionService: @unchecked Sendable, SessionDiscovering {
         }
     }
 
+    public func makeCleanupSafetyCache() -> SessionCleanupSafetyCache? {
+        SessionCleanupSafetyCache(providers: providers, processProbe: processProbe)
+    }
+
     private func rawThreadID(_ session: SessionRecord) -> String {
         let prefix = session.provider == .codex ? "codex-" : "chatgpt-"
         return session.id.hasPrefix(prefix) ? String(session.id.dropFirst(prefix.count)) : session.id
     }
+}
+
+public final class SessionCleanupSafetyCache: SessionCleanupSafetyChecking, @unchecked Sendable {
+    private let providers: [any SessionProvider]
+    private let processProbe: ProcessActivityProbe
+    private var fingerprints: [SessionProviderKind: String] = [:]
+    private var metadata: [SessionProviderKind: [SessionRecord]] = [:]
+    private var initialized = false
+
+    fileprivate init(providers: [any SessionProvider], processProbe: ProcessActivityProbe) {
+        self.providers = providers
+        self.processProbe = processProbe
+    }
+
+    public func cachedMetadata() -> [SessionRecord]? {
+        guard initializeIfNeeded() else { return nil }
+        return allMetadata.map { withActivity($0, .inactive, "cached metadata") }
+    }
+
+    public func freshSessionsForRemoval() -> [SessionRecord]? {
+        guard initializeIfNeeded(), refreshChangedProviders() else { return nil }
+        let processSnapshot = processProbe.snapshot()
+        let sourceStamps = fingerprints
+        var result: [SessionRecord] = []
+        for session in allMetadata {
+            let activity = processProbe.activity(for: rawID(session), provider: session.provider, snapshot: processSnapshot)
+            result.append(SessionRecord(id: session.id, provider: session.provider, title: session.title, updatedAt: session.updatedAt, cwd: session.cwd, branch: session.branch, url: session.url, activity: activity.0, evidence: metadataEvidence(session) + "; " + activity.1))
+        }
+        // A source change during inspection invalidates this snapshot; the next attempt refreshes it.
+        guard providers.allSatisfy({ $0.sourceFingerprint() == sourceStamps[$0.kind] }) else { return nil }
+        return result
+    }
+
+    private var allMetadata: [SessionRecord] { providers.flatMap { metadata[$0.kind] ?? [] } }
+
+    private func initializeIfNeeded() -> Bool {
+        if initialized { return true }
+        for provider in providers {
+            guard let before = provider.sourceFingerprint() else { return false }
+            let found = provider.discover(processSnapshot: ProcessActivitySnapshot(processes: [], isAvailable: false))
+            guard let after = provider.sourceFingerprint(), before == after else { return false }
+            fingerprints[provider.kind] = after
+            metadata[provider.kind] = found.sessions
+        }
+        initialized = true
+        return true
+    }
+
+    private func refreshChangedProviders() -> Bool {
+        for provider in providers {
+            guard let current = provider.sourceFingerprint() else { return false }
+            guard current != fingerprints[provider.kind] else { continue }
+            let refreshed = provider.discover(processSnapshot: ProcessActivitySnapshot(processes: [], isAvailable: false))
+            guard let verified = provider.sourceFingerprint(), verified == current else { return false }
+            metadata[provider.kind] = refreshed.sessions
+            fingerprints[provider.kind] = verified
+        }
+        return true
+    }
+
+    private func rawID(_ session: SessionRecord) -> String {
+        let prefix = session.provider == .codex ? "codex-" : "chatgpt-"
+        return session.id.hasPrefix(prefix) ? String(session.id.dropFirst(prefix.count)) : session.id
+    }
+
+    private func metadataEvidence(_ session: SessionRecord) -> String {
+        session.evidence.components(separatedBy: "; ").filter { $0 != "process scan unavailable" && $0 != "provider process not running" && $0 != "provider process running; session ID not exposed" && $0 != "running process contains exact session ID" }.joined(separator: "; ")
+    }
+
+    private func withActivity(_ session: SessionRecord, _ activity: SessionActivity, _ evidence: String) -> SessionRecord {
+        SessionRecord(id: session.id, provider: session.provider, title: session.title, updatedAt: session.updatedAt, cwd: session.cwd, branch: session.branch, url: session.url, activity: activity, evidence: metadataEvidence(session) + "; " + evidence)
+    }
+}
+
+private func fingerprintFiles(_ urls: [URL]) -> String? {
+    let manager = FileManager.default
+    var entries: [String] = []
+    for url in urls {
+        guard manager.fileExists(atPath: url.path) else {
+            entries.append("missing:\(url.path)")
+            continue
+        }
+        guard let attributes = try? manager.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber,
+              let modified = attributes[.modificationDate] as? Date else { return nil }
+        entries.append("file:\(url.path):\(size):\(modified.timeIntervalSince1970)")
+    }
+    return entries.joined(separator: "\n")
 }
