@@ -15,7 +15,13 @@ public struct RepositoryLocalScanResult: Sendable {
     }
 }
 
-public final class RepositoryScanService: @unchecked Sendable {
+public protocol RepositoryScanning: Sendable {
+    func scanSessions() -> SessionDiscoveryResult
+    func readGit(repositoryPath: String, discovery: SessionDiscoveryResult) throws -> RepositoryLocalScanResult
+    func enrichGitHub(local: RepositoryLocalScanResult, progress: @escaping @Sendable (_ completed: Int, _ total: Int) -> Void) async -> RepositorySnapshot
+}
+
+public final class RepositoryScanService: @unchecked Sendable, RepositoryScanning {
     private let git: GitService
     private let sessions: SessionService
     private let github: GitHubService

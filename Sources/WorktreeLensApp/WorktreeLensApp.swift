@@ -27,8 +27,20 @@ enum CleanupExecutionState: Equatable {
     case completed(Int)
 }
 
+protocol GitHubDetailLoading: Sendable {
+    func statusAsync(repositoryPath: String, branch: String, timeout: TimeInterval) async -> GitHubStatus
+}
+
+extension GitHubService: GitHubDetailLoading {}
+
 @MainActor
 final class ApplicationModel: ObservableObject {
+    private struct RepositoryViewCache {
+        var snapshot: RepositorySnapshot
+        var sessionNotes: [String]
+        var selection: RepositorySelection?
+    }
+
     @Published var registeredPaths: [String]
     @Published var selectedPath: String?
     @Published var snapshot: RepositorySnapshot?
@@ -45,38 +57,69 @@ final class ApplicationModel: ObservableObject {
     @Published var canCancelGitHub = false
     @Published var staleDays = 7
 
-    let repositoryStore = RepositoryStore()
-    let git = GitService()
-    let sessions = SessionService()
-    let github = GitHubService()
-    lazy var scanner = RepositoryScanService(git: git, sessions: sessions, github: github)
+    let repositoryStore: RepositoryStore
+    let git: GitService
+    let sessions: SessionService
+    let github: GitHubService
+    private let detailLoader: any GitHubDetailLoading
+    let scanner: any RepositoryScanning
     lazy var cleanup = CleanupService(git: git, sessions: sessions, github: github)
+    private var viewCache: [String: RepositoryViewCache] = [:]
     private var refreshToken = UUID()
     private var refreshTask: Task<Void, Never>?
     private var githubDetailToken = UUID()
     private var githubDetailTask: Task<Void, Never>?
     private var cleanupPreviewToken = UUID()
 
-    init(loadRepositories: Bool = true) {
+    init(loadRepositories: Bool = true, repositoryStore: RepositoryStore = RepositoryStore(), git: GitService = GitService(), sessions: SessionService = SessionService(), github: GitHubService = GitHubService(), detailLoader: (any GitHubDetailLoading)? = nil, scanner injectedScanner: (any RepositoryScanning)? = nil) {
+        self.repositoryStore = repositoryStore
+        self.git = git
+        self.sessions = sessions
+        self.github = github
+        self.detailLoader = detailLoader ?? github
+        self.scanner = injectedScanner ?? RepositoryScanService(git: git, sessions: sessions, github: github)
         registeredPaths = repositoryStore.paths
-        selectedPath = registeredPaths.first
-        if loadRepositories, let selectedPath { refresh(path: selectedPath) }
+        selectedPath = nil
+        if loadRepositories, let path = registeredPaths.first { selectRepository(path: path) }
     }
 
     func register(url: URL) {
         repositoryStore.add(url.path)
         registeredPaths = repositoryStore.paths
-        let wasSelected = selectedPath == url.path
-        selectedPath = url.path
-        if wasSelected { refresh(path: url.path) }
+        selectRepository(path: URL(fileURLWithPath: url.path).standardizedFileURL.path)
     }
 
     func removeSelectedRepository() {
         guard let selectedPath else { return }
+        invalidateRepositoryTasks()
+        viewCache.removeValue(forKey: selectedPath)
         repositoryStore.remove(selectedPath)
         registeredPaths = repositoryStore.paths
-        self.selectedPath = registeredPaths.first
-        snapshot = nil
+        self.selectedPath = nil
+        clearVisibleRepository()
+        if let nextPath = registeredPaths.first { selectRepository(path: nextPath) }
+    }
+
+    func selectRepository(path: String) {
+        let canonicalPath = URL(fileURLWithPath: path).standardizedFileURL.path
+        if selectedPath == canonicalPath { return }
+        saveCurrentView()
+        invalidateRepositoryTasks()
+        selectedPath = canonicalPath
+        errorMessage = nil
+        statusMessage = nil
+        if let cached = viewCache[canonicalPath] {
+            snapshot = cached.snapshot
+            sessionNotes = cached.sessionNotes
+            selection = normalizedSelection(cached.selection, in: cached.snapshot)
+            isLoading = false
+            scanPhase = nil
+            canCancelGitHub = false
+            loadGitHubDetailForCurrentSelection()
+        } else {
+            clearVisibleRepository()
+            refresh(path: canonicalPath)
+        }
     }
 
     func refreshSelected() {
@@ -85,6 +128,8 @@ final class ApplicationModel: ObservableObject {
     }
 
     func refresh(path: String) {
+        guard selectedPath == path else { return }
+        saveCurrentView()
         refreshTask?.cancel()
         githubDetailTask?.cancel()
         githubDetailToken = UUID()
@@ -97,32 +142,27 @@ final class ApplicationModel: ObservableObject {
         refreshTask = Task.detached(priority: .userInitiated) {
             do {
                 let discovery = scanner.scanSessions()
-                await MainActor.run {
-                    guard self.refreshToken == token else { return }
+                let canReadGit = await MainActor.run {
+                    guard self.refreshToken == token, self.selectedPath == path else { return false }
                     self.scanPhase = "Reading Git…"
+                    return true
                 }
+                guard canReadGit else { return }
                 let local = try scanner.readGit(repositoryPath: path, discovery: discovery)
-                await MainActor.run {
-                    guard self.refreshToken == token else { return }
+                let canLoadGitHub = await MainActor.run {
+                    guard self.refreshToken == token, self.selectedPath == path else { return false }
                     let previousSelection = self.snapshot?.path == local.snapshot.path ? self.selection : nil
                     self.snapshot = local.snapshot
                     self.sessionNotes = local.sessionNotes
-                    self.selection = previousSelection.flatMap { selection in
-                        guard let branchID = selection.branchID(in: local.snapshot) else { return nil }
-                        switch selection {
-                        case .branch:
-                            return .branch(branchID)
-                        case .worktree(let worktreeID):
-                            return local.snapshot.branches.flatMap(\.worktrees).contains { $0.id == worktreeID } ? .worktree(worktreeID) : .branch(branchID)
-                        }
-                    } ?? local.snapshot.branches.first.flatMap { branch in
-                        branch.worktrees.first.map { .worktree($0.id) } ?? .branch(branch.id)
-                    }
+                    self.selection = self.normalizedSelection(previousSelection, in: local.snapshot)
                     self.errorMessage = nil
+                    self.saveCurrentView()
                     self.canCancelGitHub = true
                     let total = local.snapshot.branches.contains { !$0.isDetachedGroup } ? 1 : 0
                     self.scanPhase = "Loading GitHub 0/\(total)…"
+                    return true
                 }
+                guard canLoadGitHub else { return }
                 let enriched = await scanner.enrichGitHub(local: local) { completed, total in
                     Task { @MainActor in
                         guard self.refreshToken == token else { return }
@@ -130,8 +170,9 @@ final class ApplicationModel: ObservableObject {
                     }
                 }
                 await MainActor.run {
-                    guard self.refreshToken == token else { return }
+                    guard self.refreshToken == token, self.selectedPath == path else { return }
                     self.snapshot = enriched
+                    self.saveCurrentView()
                     self.isLoading = false
                     self.canCancelGitHub = false
                     self.scanPhase = nil
@@ -140,7 +181,7 @@ final class ApplicationModel: ObservableObject {
                 }
             } catch {
                 await MainActor.run {
-                    guard self.refreshToken == token else { return }
+                    guard self.refreshToken == token, self.selectedPath == path else { return }
                     self.snapshot = nil
                     self.errorMessage = error.localizedDescription
                     self.isLoading = false
@@ -176,6 +217,7 @@ final class ApplicationModel: ObservableObject {
             return
         }
         selection = .branch(id)
+        saveCurrentView()
     }
 
     func selectWorktree(id: String) {
@@ -184,6 +226,7 @@ final class ApplicationModel: ObservableObject {
             return
         }
         selection = .worktree(id)
+        saveCurrentView()
     }
 
     func selectionDidChange() {
@@ -203,9 +246,9 @@ final class ApplicationModel: ObservableObject {
         let token = UUID()
         githubDetailToken = token
         let refreshToken = self.refreshToken
-        let github = self.github
+        let detailLoader = self.detailLoader
         githubDetailTask = Task.detached(priority: .utility) {
-            let status = await github.statusAsync(repositoryPath: path, branch: branch.name)
+            let status = await detailLoader.statusAsync(repositoryPath: path, branch: branch.name, timeout: GitHubService.requestTimeout)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard self.githubDetailToken == token,
@@ -218,7 +261,45 @@ final class ApplicationModel: ObservableObject {
                 var branches = snapshot.branches
                 branches[index] = branches[index].withGitHubStatus(status)
                 self.snapshot = RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: branches, refreshedAt: snapshot.refreshedAt)
+                self.saveCurrentView()
             }
+        }
+    }
+
+    private func invalidateRepositoryTasks() {
+        refreshTask?.cancel()
+        githubDetailTask?.cancel()
+        refreshToken = UUID()
+        githubDetailToken = UUID()
+        refreshTask = nil
+        githubDetailTask = nil
+    }
+
+    private func clearVisibleRepository() {
+        snapshot = nil
+        selection = nil
+        sessionNotes = []
+        isLoading = false
+        scanPhase = nil
+        canCancelGitHub = false
+    }
+
+    private func saveCurrentView() {
+        guard let selectedPath, let snapshot, snapshot.path == selectedPath else { return }
+        viewCache[selectedPath] = RepositoryViewCache(snapshot: snapshot, sessionNotes: sessionNotes, selection: selection)
+    }
+
+    private func normalizedSelection(_ selection: RepositorySelection?, in snapshot: RepositorySnapshot) -> RepositorySelection? {
+        if let selection, let branchID = selection.branchID(in: snapshot) {
+            switch selection {
+            case .branch:
+                return .branch(branchID)
+            case .worktree(let worktreeID):
+                return snapshot.branches.flatMap(\.worktrees).contains { $0.id == worktreeID } ? .worktree(worktreeID) : .branch(branchID)
+            }
+        }
+        return snapshot.branches.first.flatMap { branch in
+            branch.worktrees.first.map { .worktree($0.id) } ?? .branch(branch.id)
         }
     }
 
@@ -383,7 +464,9 @@ struct ContentView: View {
             }
             .padding()
             Divider()
-            List(selection: $model.selectedPath) {
+            List(selection: Binding(get: { model.selectedPath }, set: { path in
+                if let path { model.selectRepository(path: path) }
+            })) {
                 ForEach(model.registeredPaths, id: \.self) { path in
                     VStack(alignment: .leading, spacing: 4) {
                         Text(URL(fileURLWithPath: path).lastPathComponent)
@@ -397,14 +480,11 @@ struct ContentView: View {
                     .tag(Optional(path))
                     .contextMenu {
                         Button("Remove Registration", role: .destructive) {
-                            model.selectedPath = path
+                            model.selectRepository(path: path)
                             model.removeSelectedRepository()
                         }
                     }
                 }
-            }
-            .onChange(of: model.selectedPath) { newValue in
-                if let newValue { model.refresh(path: newValue) }
             }
             if model.registeredPaths.isEmpty {
                 EmptyStateView(title: "No repository", systemImage: "folder.badge.plus", message: "Register a local Git repository")
