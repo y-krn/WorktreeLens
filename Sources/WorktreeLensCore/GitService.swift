@@ -67,8 +67,9 @@ public final class GitService: @unchecked Sendable {
         _ = try run(["-C", repositoryPath, "update-ref", "-d", "refs/heads/\(branch)", expectedOldSHA])
     }
 
-    public func defaultBranchName(repositoryPath: String) throws -> String? {
-        try resolveDefaultBranch(canonicalRepositoryPath(repositoryPath))?.name
+    public func defaultBranchName(repositoryPath: String, canonicalPath: String? = nil) throws -> String? {
+        let root = try canonicalPath ?? canonicalRepositoryPath(repositoryPath)
+        return try resolveDefaultBranch(root)?.name
     }
 
     /// Revalidates one branch without rebuilding the repository-wide snapshot.
@@ -106,8 +107,8 @@ public final class GitService: @unchecked Sendable {
     }
 
     /// Revalidates one worktree's status, branch relation, and linked sessions.
-    public func cleanupWorktree(repositoryPath: String, path: String, sessions: [SessionRecord], includeCleanupUIData: Bool = false) throws -> (worktree: WorktreeInfo, branch: BranchInfo?) {
-        let root = try canonicalRepositoryPath(repositoryPath)
+    public func cleanupWorktree(repositoryPath: String, path: String, sessions: [SessionRecord], includeCleanupUIData: Bool = false, canonicalPath: String? = nil) throws -> (worktree: WorktreeInfo, branch: BranchInfo?) {
+        let root = try canonicalPath ?? canonicalRepositoryPath(repositoryPath)
         let defaultBranch = try resolveDefaultBranch(root)
         let records = try worktreeRecords(repositoryPath: root)
         guard let record = records.first(where: { isPath($0["worktree"] ?? "", equalTo: path) }) else {

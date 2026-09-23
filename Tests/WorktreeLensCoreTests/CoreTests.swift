@@ -40,6 +40,7 @@ final class CoreTests: XCTestCase {
 
     private final class StubRecordingRunner: @unchecked Sendable, ProcessRunning {
         private(set) var arguments: [[String]] = []
+        private(set) var currentDirectories: [String?] = []
         private let response: ([String]) -> ProcessResult
 
         init(response: @escaping ([String]) -> ProcessResult) {
@@ -48,6 +49,7 @@ final class CoreTests: XCTestCase {
 
         func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
             self.arguments.append(arguments)
+            self.currentDirectories.append(currentDirectory)
             return response(arguments)
         }
     }
@@ -881,6 +883,74 @@ final class CoreTests: XCTestCase {
 
         XCTAssertTrue(cleanup.execute(preview).isEmpty)
         XCTAssertTrue((try GitService().snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+    }
+
+    func testGroupedBranchOnlyExecutionUsesCanonicalRootForGitHubAndDeletion() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let registeredPath = fixture.root.appendingPathComponent("registered-repository")
+        try FileManager.default.createSymbolicLink(at: registeredPath, withDestinationURL: fixture.repository)
+        let canonicalPath = try GitService().canonicalRepositoryPath(registeredPath.path)
+        XCTAssertNotEqual(registeredPath.path, canonicalPath)
+        let branch = try XCTUnwrap(GitService().snapshot(repositoryPath: canonicalPath).branches.first { $0.name == "feature" })
+        let planned = branch.withMergeEvidence(.githubVerified(prNumber: 138, mergedAt: Date(timeIntervalSince1970: 1)))
+        let preview = CleanupService().previewMergedBranches(snapshot: RepositorySnapshot(path: registeredPath.path, defaultBranch: "main", branches: [planned]))
+        let gitRecorder = RecordingRunner()
+        let exactPR = "{\"number\":138,\"state\":\"MERGED\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRefOid\":\"\(fixture.featureSHA)\",\"mergedAt\":\"2026-01-01T00:00:00Z\"}"
+        let ghRecorder = StubRecordingRunner { _ in ProcessResult(status: 0, stdout: exactPR) }
+        let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: GitHubService(runner: ghRecorder, executable: "gh"))
+
+        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(ghRecorder.currentDirectories.compactMap { $0 }, [canonicalPath])
+        XCTAssertEqual(gitRecorder.arguments.filter { $0.contains("rev-parse") && $0.contains("--show-toplevel") }.count, 1)
+        XCTAssertTrue(gitRecorder.arguments.contains { $0.starts(with: ["-C", canonicalPath]) && $0.contains("update-ref") && $0.contains("-d") })
+        XCTAssertEqual(gitRecorder.arguments.filter { $0.starts(with: ["-C", registeredPath.path]) }.count, 1)
+    }
+
+    func testGroupedWorktreeRevalidationAndRemovalUseCanonicalRoot() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let registeredPath = fixture.root.appendingPathComponent("registered-repository")
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        try FileManager.default.createSymbolicLink(at: registeredPath, withDestinationURL: fixture.repository)
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let canonicalPath = try GitService().canonicalRepositoryPath(registeredPath.path)
+        XCTAssertNotEqual(registeredPath.path, canonicalPath)
+        let branch = try XCTUnwrap(GitService().snapshot(repositoryPath: canonicalPath).branches.first { $0.name == "feature" })
+        let planned = branch.withMergeEvidence(.githubVerified(prNumber: 138, mergedAt: Date(timeIntervalSince1970: 1)))
+        let preview = CleanupService().previewMergedBranches(snapshot: RepositorySnapshot(path: registeredPath.path, defaultBranch: "main", branches: [planned]))
+        let gitRecorder = RecordingRunner()
+        let exactPR = "{\"number\":138,\"state\":\"MERGED\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRefOid\":\"\(fixture.featureSHA)\",\"mergedAt\":\"2026-01-01T00:00:00Z\"}"
+        let ghRecorder = StubRecordingRunner { _ in ProcessResult(status: 0, stdout: exactPR) }
+        let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: GitHubService(runner: ghRecorder, executable: "gh"))
+
+        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(ghRecorder.currentDirectories.compactMap { $0 }, [canonicalPath, canonicalPath])
+        XCTAssertEqual(gitRecorder.arguments.filter { $0.contains("rev-parse") && $0.contains("--show-toplevel") }.count, 1)
+        XCTAssertTrue(gitRecorder.arguments.contains { $0.starts(with: ["-C", canonicalPath]) && $0.contains("worktree") && $0.contains("remove") })
+        XCTAssertTrue(gitRecorder.arguments.contains { $0.starts(with: ["-C", canonicalPath]) && $0.contains("update-ref") && $0.contains("-d") })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath.path))
+        XCTAssertEqual(gitRecorder.arguments.filter { $0.starts(with: ["-C", registeredPath.path]) }.count, 1)
+    }
+
+    func testGroupedGitAncestorBranchDeletionUsesCanonicalRoot() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "merge", "--no-ff", "feature", "-m", "merge feature"])
+        let registeredPath = fixture.root.appendingPathComponent("registered-repository")
+        try FileManager.default.createSymbolicLink(at: registeredPath, withDestinationURL: fixture.repository)
+        let canonicalPath = try GitService().canonicalRepositoryPath(registeredPath.path)
+        XCTAssertNotEqual(registeredPath.path, canonicalPath)
+        let branch = try XCTUnwrap(GitService().snapshot(repositoryPath: canonicalPath).branches.first { $0.name == "feature" })
+        XCTAssertEqual(branch.mergeEvidence, .gitAncestor)
+        let preview = CleanupService().previewMergedBranches(snapshot: RepositorySnapshot(path: registeredPath.path, defaultBranch: "main", branches: [branch]))
+        let gitRecorder = RecordingRunner()
+        let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path))
+
+        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertTrue(gitRecorder.arguments.contains { $0.starts(with: ["-C", canonicalPath, "branch", "-d"]) })
+        XCTAssertEqual(gitRecorder.arguments.filter { $0.contains("rev-parse") && $0.contains("--show-toplevel") }.count, 1)
+        XCTAssertEqual(gitRecorder.arguments.filter { $0.starts(with: ["-C", registeredPath.path]) }.count, 1)
     }
 
     func testCleanupGitHubVerificationFetchesMergeEvidenceOnly() throws {
