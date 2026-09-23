@@ -82,8 +82,8 @@ public final class GitService: @unchecked Sendable {
     }
 
     /// Revalidates only the state required before deleting one branch.
-    public func cleanupBranchState(repositoryPath: String, name: String) throws -> CleanupBranchState? {
-        let root = try canonicalRepositoryPath(repositoryPath)
+    public func cleanupBranchState(repositoryPath: String, name: String, canonicalPath: String? = nil, verifyGitAncestor: Bool = true) throws -> CleanupBranchState? {
+        let root = try canonicalPath ?? canonicalRepositoryPath(repositoryPath)
         let defaultBranch = try resolveDefaultBranch(root)
         let records = try worktreeRecords(repositoryPath: root)
         guard let record = try cleanupStateBranchRecord(repositoryPath: root, name: name) else { return nil }
@@ -101,7 +101,7 @@ public final class GitService: @unchecked Sendable {
             defaultBranch: defaultBranch?.name,
             isDefaultBranch: defaultBranch?.name == name,
             worktreePaths: worktreePaths,
-            isGitAncestor: defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false
+            isGitAncestor: verifyGitAncestor && (defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false)
         )
     }
 
