@@ -77,12 +77,22 @@ public final class CleanupService: @unchecked Sendable {
         var completed: [String] = []
         if preview.operation == .deleteMergedBranches || preview.operation == .deleteRemoteGoneBranches {
             if !preview.groups.isEmpty {
-                guard let canonicalPath = try? git.canonicalRepositoryPath(preview.repositoryPath) else { return completed }
                 let needsSessionSafety = preview.groups.contains { $0.allowed && $0.steps.contains { $0.step == .removeWorktree } }
                 let sessionCache = needsSessionSafety ? makeSessionSafetyCache() : nil
                 if needsSessionSafety && sessionCache == nil { return completed }
+                let context: CleanupRepositoryContext?
+                let canonicalPath: String
+                if preview.groups.count == 1 && !needsSessionSafety {
+                    guard let path = try? git.canonicalRepositoryPath(preview.repositoryPath) else { return completed }
+                    canonicalPath = path
+                    context = nil
+                } else {
+                    guard let cleanupContext = try? git.cleanupContext(repositoryPath: preview.repositoryPath), cleanupContext.defaultBranch != nil else { return completed }
+                    canonicalPath = cleanupContext.path
+                    context = cleanupContext
+                }
                 for group in preview.groups where group.allowed {
-                    if executeMergedBranch(repositoryPath: canonicalPath, canonicalPath: canonicalPath, group: group, sessionCache: sessionCache) {
+                    if executeMergedBranch(repositoryPath: canonicalPath, canonicalPath: canonicalPath, context: context, group: group, sessionCache: sessionCache) {
                         completed.append(group.branchName)
                     }
                 }
@@ -99,10 +109,12 @@ public final class CleanupService: @unchecked Sendable {
         let needsSessionSafety = preview.operation == .removeWorktree || preview.operation == .removeStaleWorktrees
         let sessionCache = needsSessionSafety ? makeSessionSafetyCache() : nil
         if needsSessionSafety && sessionCache == nil { return completed }
+        let context = needsSessionSafety ? try? git.cleanupContext(repositoryPath: preview.repositoryPath) : nil
+        if needsSessionSafety && context == nil { return completed }
         for target in preview.allowedItems {
             switch preview.operation {
             case .removeWorktree:
-                if executeRemoveWorktree(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, sessionCache: sessionCache) { completed.append(target.id) }
+                if executeRemoveWorktree(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, sessionCache: sessionCache, context: context) { completed.append(target.id) }
             case .deleteBranch:
                 if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) { completed.append(target.id) }
             case .prune:
@@ -167,34 +179,34 @@ public final class CleanupService: @unchecked Sendable {
         return "\(cleanliness) · \(sessionState) · \(mergeStatus)"
     }
 
-    private func executeMergedBranch(repositoryPath: String, canonicalPath: String, group: CleanupPreviewGroup, sessionCache: SessionCleanupSafetyChecking?) -> Bool {
+    private func executeMergedBranch(repositoryPath: String, canonicalPath: String, context: CleanupRepositoryContext?, group: CleanupPreviewGroup, sessionCache: SessionCleanupSafetyChecking?) -> Bool {
         guard group.allowed, let expectedSHA = group.expectedSHA else { return false }
         let plannedPaths = group.steps.filter { $0.step == .removeWorktree }.map(\.target)
         if plannedPaths.isEmpty {
-            return executeDeleteBranch(repositoryPath: repositoryPath, canonicalPath: canonicalPath, name: group.branchName, expectedSHA: expectedSHA, expectedDefaultBranch: group.expectedDefaultBranch, mergeEvidence: group.mergeEvidence)
+            return executeDeleteBranch(repositoryPath: repositoryPath, canonicalPath: canonicalPath, name: group.branchName, expectedSHA: expectedSHA, expectedDefaultBranch: group.expectedDefaultBranch, mergeEvidence: group.mergeEvidence, context: context)
         }
-        let verifyGitAncestor: Bool
-        if case .githubVerified = group.mergeEvidence { verifyGitAncestor = false } else { verifyGitAncestor = true }
-        guard let current = try? git.cleanupBranchState(repositoryPath: repositoryPath, name: group.branchName, canonicalPath: canonicalPath, verifyGitAncestor: verifyGitAncestor),
-              current.sha == expectedSHA,
-              current.defaultBranch == group.expectedDefaultBranch,
-              Set(current.worktreePaths) == Set(plannedPaths) else { return false }
-
-        for path in plannedPaths {
-            guard executeRemoveWorktree(repositoryPath: canonicalPath, path: path, expectedSHA: expectedSHA, sessionCache: sessionCache, mergeEvidence: group.mergeEvidence, expectedDefaultBranch: group.expectedDefaultBranch, canonicalPath: canonicalPath) else { return false }
+        guard let context else { return false }
+        for (index, path) in plannedPaths.enumerated() {
+            guard executeRemoveWorktree(repositoryPath: canonicalPath, path: path, expectedSHA: expectedSHA, sessionCache: sessionCache, mergeEvidence: group.mergeEvidence, expectedDefaultBranch: group.expectedDefaultBranch, canonicalPath: canonicalPath, context: context, expectedWorktreePaths: Array(plannedPaths.dropFirst(index))) else { return false }
         }
-        return executeDeleteBranch(repositoryPath: repositoryPath, canonicalPath: canonicalPath, name: group.branchName, expectedSHA: expectedSHA, expectedDefaultBranch: group.expectedDefaultBranch, mergeEvidence: group.mergeEvidence)
+        return executeDeleteBranch(repositoryPath: repositoryPath, canonicalPath: canonicalPath, name: group.branchName, expectedSHA: expectedSHA, expectedDefaultBranch: group.expectedDefaultBranch, mergeEvidence: group.mergeEvidence, context: context)
     }
 
-    private func executeRemoveWorktree(repositoryPath: String, path: String, expectedSHA: String?, sessionCache: SessionCleanupSafetyChecking?, mergeEvidence: MergeEvidence? = nil, expectedDefaultBranch: String? = nil, canonicalPath: String? = nil) -> Bool {
-        guard let sessions = sessionCache?.cachedMetadata(), let match = try? git.cleanupWorktree(repositoryPath: canonicalPath ?? repositoryPath, path: path, sessions: sessions, canonicalPath: canonicalPath) else { return false }
+    private func executeRemoveWorktree(repositoryPath: String, path: String, expectedSHA: String?, sessionCache: SessionCleanupSafetyChecking?, mergeEvidence: MergeEvidence? = nil, expectedDefaultBranch: String? = nil, canonicalPath: String? = nil, context: CleanupRepositoryContext?, expectedWorktreePaths: [String] = []) -> Bool {
+        guard let context,
+              let sessions = sessionCache?.cachedMetadata(), let match = try? git.cleanupWorktree(repositoryPath: canonicalPath ?? repositoryPath, path: path, sessions: sessions, canonicalPath: canonicalPath, context: context) else { return false }
         guard let expectedSHA, match.worktree.head == expectedSHA else { return false }
-        let branch = match.worktree.isDetached ? match.branch : revalidatedBranch(repositoryPath: canonicalPath ?? repositoryPath, branch: match.branch, expectedSHA: expectedSHA, mergeEvidence: mergeEvidence, expectedDefaultBranch: expectedDefaultBranch, canonicalPath: canonicalPath)
+        if !match.worktree.isDetached && (context.defaultBranch == nil || context.defaultRef == nil) { return false }
+        let branch = match.worktree.isDetached ? match.branch : revalidatedBranch(repositoryPath: canonicalPath ?? repositoryPath, branch: match.branch, expectedSHA: expectedSHA, mergeEvidence: mergeEvidence, expectedDefaultBranch: expectedDefaultBranch, canonicalPath: canonicalPath, context: context)
         guard decide(worktree: match.worktree, branch: branch).allowed else { return false }
+        if !expectedWorktreePaths.isEmpty {
+            guard let currentBranch = match.branch,
+                  Set(currentBranch.worktrees.map { URL(fileURLWithPath: $0.path).standardizedFileURL.path }) == Set(expectedWorktreePaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path }) else { return false }
+        }
         guard let freshSessions = sessionCache?.freshSessionsForRemoval(),
-              let freshMatch = try? git.cleanupWorktree(repositoryPath: canonicalPath ?? repositoryPath, path: path, sessions: freshSessions, canonicalPath: canonicalPath),
-              freshMatch.worktree.head == expectedSHA,
-              decide(worktree: freshMatch.worktree, branch: branch).allowed else { return false }
+              let freshWorktree = try? git.cleanupWorktreeState(repositoryPath: canonicalPath ?? repositoryPath, path: path, sessions: freshSessions, context: context),
+              freshWorktree.head == expectedSHA,
+              decide(worktree: freshWorktree, branch: branch).allowed else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
     }
 
@@ -202,11 +214,11 @@ public final class CleanupService: @unchecked Sendable {
         executeDeleteBranch(repositoryPath: repositoryPath, canonicalPath: nil, name: name, expectedSHA: expectedSHA, expectedDefaultBranch: nil, mergeEvidence: nil)
     }
 
-    private func executeDeleteBranch(repositoryPath: String, canonicalPath: String?, name: String, expectedSHA: String?, expectedDefaultBranch: String?, mergeEvidence: MergeEvidence?) -> Bool {
+    private func executeDeleteBranch(repositoryPath: String, canonicalPath: String?, name: String, expectedSHA: String?, expectedDefaultBranch: String?, mergeEvidence: MergeEvidence?, context: CleanupRepositoryContext? = nil) -> Bool {
         let executionRoot = canonicalPath ?? repositoryPath
         let verifyGitAncestor: Bool
         if case .githubVerified = mergeEvidence { verifyGitAncestor = false } else { verifyGitAncestor = true }
-        guard let branch = try? git.cleanupBranchState(repositoryPath: executionRoot, name: name, canonicalPath: executionRoot, verifyGitAncestor: verifyGitAncestor),
+        guard let branch = try? git.cleanupBranchState(repositoryPath: executionRoot, name: name, canonicalPath: executionRoot, verifyGitAncestor: verifyGitAncestor, context: context),
               let expectedSHA,
               branch.sha == expectedSHA,
               let defaultBranch = branch.defaultBranch,
@@ -247,11 +259,17 @@ public final class CleanupService: @unchecked Sendable {
         return DiscoverySessionSafetyCache(sessions: sessions)
     }
 
-    private func revalidatedBranch(repositoryPath: String, branch: BranchInfo?, expectedSHA: String?, mergeEvidence: MergeEvidence? = nil, expectedDefaultBranch: String? = nil, canonicalPath: String? = nil) -> BranchInfo? {
+    private func revalidatedBranch(repositoryPath: String, branch: BranchInfo?, expectedSHA: String?, mergeEvidence: MergeEvidence? = nil, expectedDefaultBranch: String? = nil, canonicalPath: String? = nil, context: CleanupRepositoryContext? = nil) -> BranchInfo? {
         guard let branch else { return nil }
         guard let expectedSHA, branch.sha == expectedSHA else { return nil }
         let evidence = mergeEvidence ?? branch.mergeEvidence
-        guard let defaultBranch = try? git.defaultBranchName(repositoryPath: canonicalPath ?? repositoryPath, canonicalPath: canonicalPath),
+        let defaultBranch: String?
+        if let context {
+            defaultBranch = git.validateCleanupDefaultBranch(context) ? context.defaultBranch : nil
+        } else {
+            defaultBranch = try? git.defaultBranchName(repositoryPath: canonicalPath ?? repositoryPath, canonicalPath: canonicalPath)
+        }
+        guard let defaultBranch,
               expectedDefaultBranch == nil || defaultBranch == expectedDefaultBranch else { return nil }
         if evidence == .gitAncestor { return branch }
         let status: GitHubStatus
