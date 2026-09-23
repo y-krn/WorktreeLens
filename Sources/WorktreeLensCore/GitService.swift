@@ -99,21 +99,52 @@ public final class GitService: @unchecked Sendable {
     }
 
     public func validateCleanupDefaultBranch(_ context: CleanupRepositoryContext) -> Bool {
-        guard let name = context.defaultBranch, let locator = context.defaultLocator else { return false }
+        revalidatedCleanupContext(context) != nil
+    }
+
+    /// Resolves and validates the default ref again before destructive cleanup.
+    public func revalidatedCleanupContext(_ context: CleanupRepositoryContext) -> CleanupRepositoryContext? {
+        guard let expectedName = context.defaultBranch,
+              let expectedRef = context.defaultRef,
+              let locator = context.defaultLocator,
+              let branch = freshCleanupDefaultBranch(context.path, expectedName: expectedName, locator: locator),
+              branch.name == expectedName,
+              branch.ref == expectedRef else { return nil }
+        return CleanupRepositoryContext(path: context.path, defaultBranch: branch.name, defaultRef: branch.ref, defaultLocator: branch.locator)
+    }
+
+    public func isGitAncestor(repositoryPath: String, branch: String, defaultRef: String) -> Bool {
+        isAncestor(root: repositoryPath, branch: branch, defaultRef: defaultRef)
+    }
+
+    private func freshCleanupDefaultBranch(_ root: String, expectedName: String, locator: CleanupDefaultBranchLocator) -> DefaultBranch? {
         switch locator {
         case .symbolicRemoteHead(let remote):
-            guard let result = try? run(["-C", context.path, "symbolic-ref", "--quiet", "--short", "refs/remotes/\(remote)/HEAD"]) else { return false }
-            return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "\(remote)/\(name)"
+            guard let result = try? run(["-C", root, "symbolic-ref", "--quiet", "--short", "refs/remotes/\(remote)/HEAD"]) else { return nil }
+            let symbolic = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard symbolic == "\(remote)/\(expectedName)" else { return nil }
+            return DefaultBranch(name: expectedName, ref: symbolic, locator: locator)
         case .remoteShow(let remote):
-            guard let result = try? run(["-C", context.path, "remote", "show", "-n", remote]),
-                  let line = result.stdout.split(whereSeparator: \.isNewline).first(where: { $0.contains("HEAD branch:") }),
-                  let current = line.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespaces) else { return false }
-            return current == name
+            if let symbolic = try? run(["-C", root, "symbolic-ref", "--quiet", "--short", "refs/remotes/\(remote)/HEAD"]),
+               !symbolic.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return nil }
+            guard let result = try? run(["-C", root, "remote", "show", "-n", remote]),
+                  let current = remoteShowHeadBranch(result.stdout),
+                  current == expectedName else { return nil }
+            guard let hasRemoteRef = remoteTrackingRefExists(root: root, remote: remote, branch: expectedName) else { return nil }
+            let ref = hasRemoteRef ? "\(remote)/\(expectedName)" : expectedName
+            return DefaultBranch(name: expectedName, ref: ref, locator: locator)
         case .local:
-            guard let remotes = try? run(["-C", context.path, "remote"]), remotes.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  let result = try? run(["-C", context.path, "for-each-ref", "--format=%(refname:short)", "refs/heads/main", "refs/heads/master"]) else { return false }
+            guard let remotes = try? run(["-C", root, "remote"]) else { return nil }
+            for remote in remotes.stdout.split(whereSeparator: \.isNewline).map(String.init) {
+                if let symbolic = try? run(["-C", root, "symbolic-ref", "--quiet", "--short", "refs/remotes/\(remote)/HEAD"]),
+                   !symbolic.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return nil }
+                guard let shown = try? run(["-C", root, "remote", "show", "-n", remote]) else { return nil }
+                if remoteShowHeadBranch(shown.stdout) != nil { return nil }
+            }
+            guard let result = try? run(["-C", root, "for-each-ref", "--format=%(refname:short)", "refs/heads/main", "refs/heads/master"]) else { return nil }
             let candidates = result.stdout.split(whereSeparator: \.isNewline).map(String.init)
-            return candidates == [name]
+            guard candidates == [expectedName] else { return nil }
+            return DefaultBranch(name: expectedName, ref: expectedName, locator: locator)
         }
     }
 
@@ -131,11 +162,11 @@ public final class GitService: @unchecked Sendable {
     public func cleanupBranchState(repositoryPath: String, name: String, canonicalPath: String? = nil, verifyGitAncestor: Bool = true, context: CleanupRepositoryContext? = nil) throws -> CleanupBranchState? {
         let root = try context?.path ?? canonicalPath ?? canonicalRepositoryPath(repositoryPath)
         let defaultBranch: DefaultBranch?
-        if let context, validateCleanupDefaultBranch(context), let name = context.defaultBranch, let ref = context.defaultRef {
-            guard let locator = context.defaultLocator else { return nil }
+        if let context {
+            guard let fresh = revalidatedCleanupContext(context), let name = fresh.defaultBranch, let ref = fresh.defaultRef, let locator = fresh.defaultLocator else { return nil }
             defaultBranch = DefaultBranch(name: name, ref: ref, locator: locator)
         } else {
-            defaultBranch = try context == nil ? resolveDefaultBranch(root) : nil
+            defaultBranch = try resolveDefaultBranch(root)
         }
         let records = try worktreeRecords(repositoryPath: root)
         guard let record = try cleanupStateBranchRecord(repositoryPath: root, name: name) else { return nil }
@@ -168,7 +199,7 @@ public final class GitService: @unchecked Sendable {
     }
 
     /// Revalidates one worktree's status, branch relation, and linked sessions.
-    public func cleanupWorktree(repositoryPath: String, path: String, sessions: [SessionRecord], includeCleanupUIData: Bool = false, canonicalPath: String? = nil, context: CleanupRepositoryContext? = nil) throws -> (worktree: WorktreeInfo, branch: BranchInfo?) {
+    public func cleanupWorktree(repositoryPath: String, path: String, sessions: [SessionRecord], includeCleanupUIData: Bool = false, includeMergeEvidence: Bool = true, canonicalPath: String? = nil, context: CleanupRepositoryContext? = nil) throws -> (worktree: WorktreeInfo, branch: BranchInfo?) {
         let root = try context?.path ?? canonicalPath ?? canonicalRepositoryPath(repositoryPath)
         let defaultBranch: DefaultBranch?
         if let context, let name = context.defaultBranch, let ref = context.defaultRef {
@@ -184,7 +215,7 @@ public final class GitService: @unchecked Sendable {
         guard let worktree = try makeWorktree(record: record, defaultBranch: defaultBranch, sessions: sessions, includeCleanupUIData: includeCleanupUIData) else {
             throw ProcessRunnerError.failed("Worktree record invalid")
         }
-        let branch = try worktree.branch.flatMap { try cleanupBranchRecord(repositoryPath: root, name: $0, defaultBranch: defaultBranch, records: records) }
+        let branch = try worktree.branch.flatMap { try cleanupBranchRecord(repositoryPath: root, name: $0, defaultBranch: defaultBranch, records: records, includeMergeEvidence: includeMergeEvidence) }
         return (worktree, branch)
     }
 
@@ -208,9 +239,9 @@ public final class GitService: @unchecked Sendable {
         return output.split(separator: "\u{1e}", omittingEmptySubsequences: true).map(String.init).first
     }
 
-    private func cleanupBranchRecord(repositoryPath: String, name: String, defaultBranch: DefaultBranch?, records: [[String: String]]) throws -> BranchInfo? {
+    private func cleanupBranchRecord(repositoryPath: String, name: String, defaultBranch: DefaultBranch?, records: [[String: String]], includeMergeEvidence: Bool = true) throws -> BranchInfo? {
         guard let record = try branchRecord(repositoryPath: repositoryPath, name: name) else { return nil }
-        return parseBranch(record: record, root: repositoryPath, defaultBranch: defaultBranch, worktrees: placeholderWorktrees(records: records, branch: name), includeCleanupUIData: false)
+        return parseBranch(record: record, root: repositoryPath, defaultBranch: defaultBranch, worktrees: placeholderWorktrees(records: records, branch: name), includeCleanupUIData: false, includeMergeEvidence: includeMergeEvidence)
     }
 
     private func placeholderWorktrees(records: [[String: String]], branch: String) -> [WorktreeInfo] {
@@ -227,9 +258,7 @@ public final class GitService: @unchecked Sendable {
                 return DefaultBranch(name: symbolic.replacingOccurrences(of: "\(remote)/", with: ""), ref: symbolic, locator: .symbolicRemoteHead(remote: remote))
             }
             if let shown = try? run(["-C", root, "remote", "show", "-n", remote]).stdout,
-               let line = shown.split(whereSeparator: \.isNewline).first(where: { $0.contains("HEAD branch:") }),
-               let name = line.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespaces),
-               !name.isEmpty {
+               let name = remoteShowHeadBranch(shown) {
                 let remoteRef = "refs/remotes/\(remote)/\(name)"
                 let ref = (try? run(["-C", root, "show-ref", "--verify", "--quiet", remoteRef])).map { _ in "\(remote)/\(name)" } ?? name
                 return DefaultBranch(name: String(name), ref: ref, locator: .remoteShow(remote: remote))
@@ -241,7 +270,25 @@ public final class GitService: @unchecked Sendable {
         return DefaultBranch(name: conventional[0], ref: conventional[0], locator: .local)
     }
 
-    private func parseBranch(record: String, root: String, defaultBranch: DefaultBranch?, worktrees: [WorktreeInfo], includeCleanupUIData: Bool) -> BranchInfo? {
+    private func remoteShowHeadBranch(_ output: String) -> String? {
+        guard let line = output.split(whereSeparator: \.isNewline).first(where: { $0.contains("HEAD branch:") }),
+              let name = line.split(separator: ":", maxSplits: 1).last?.trimmingCharacters(in: .whitespaces),
+              !name.isEmpty,
+              !(name.hasPrefix("(") && name.hasSuffix(")")) else { return nil }
+        return String(name)
+    }
+
+    private func remoteTrackingRefExists(root: String, remote: String, branch: String) -> Bool? {
+        do {
+            let result = try runner.run(gitPath, arguments: ["-C", root, "show-ref", "--verify", "--quiet", "refs/remotes/\(remote)/\(branch)"], currentDirectory: nil, timeout: nil)
+            if result.succeeded { return true }
+            return result.status == 1 ? false : nil
+        } catch {
+            return nil
+        }
+    }
+
+    private func parseBranch(record: String, root: String, defaultBranch: DefaultBranch?, worktrees: [WorktreeInfo], includeCleanupUIData: Bool, includeMergeEvidence: Bool = true) -> BranchInfo? {
         let normalizedRecord = record.trimmingCharacters(in: .whitespacesAndNewlines)
         let fields = normalizedRecord.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
         guard fields.count >= 5 else { return nil }
@@ -255,7 +302,7 @@ public final class GitService: @unchecked Sendable {
         }
         let branchWorktrees = worktrees.filter { $0.branch == name }
         let relation = includeCleanupUIData ? (defaultBranch.flatMap { defaultDelta(root: root, branch: name, defaultRef: $0.ref) } ?? (ahead: 0, behind: 0)) : (ahead: 0, behind: 0)
-        let merged = defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false
+        let merged = includeMergeEvidence && (defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false)
         return BranchInfo(id: name, name: name, sha: fields[1], upstream: fields[2].isEmpty ? nil : fields[2], ahead: aheadBehind.ahead, behind: aheadBehind.behind, isMerged: merged, remoteGone: tracking.contains("gone"), lastCommitAt: strictDate(fields[4]), isDefaultBranch: defaultBranch?.name == name, defaultAhead: relation.ahead, defaultBehind: relation.behind, worktrees: branchWorktrees, mergeEvidence: merged ? .gitAncestor : MergeEvidence.none)
     }
 

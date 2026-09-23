@@ -88,6 +88,27 @@ final class CoreTests: XCTestCase {
         }
     }
 
+    private final class RemovingRemoteTrackingRefRunner: @unchecked Sendable, ProcessRunning {
+        let repositoryPath: String
+        private(set) var arguments: [[String]] = []
+        private(set) var removed = false
+
+        init(repositoryPath: String) { self.repositoryPath = repositoryPath }
+
+        func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+            self.arguments.append(arguments)
+            if arguments.contains("remote"), arguments.contains("show"), arguments.contains("-n"), arguments.contains("origin") {
+                return ProcessResult(status: 0, stdout: "* remote origin\n  HEAD branch: main\n")
+            }
+            let result = try LocalProcessRunner().run(executable, arguments: arguments, currentDirectory: currentDirectory, timeout: timeout)
+            if !removed, result.succeeded, arguments.contains("show-ref"), arguments.contains("refs/remotes/origin/main") {
+                removed = true
+                _ = try LocalProcessRunner().run(executable, arguments: ["-C", repositoryPath, "update-ref", "-d", "refs/remotes/origin/main"], currentDirectory: nil, timeout: timeout)
+            }
+            return result
+        }
+    }
+
     func testRepositorySelectionKeepsBranchAndWorktreeInSync() {
         let worktree = WorktreeInfo(id: "/tmp/alpha", path: "/tmp/alpha", branch: "alpha", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)
         let branches = ["alpha", "beta", "charlie"].map { name in
@@ -747,7 +768,7 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(group.steps[0].detail?.contains("session: none") == true)
         let beforeCleanup = gitRecorder.arguments.count
         XCTAssertEqual(cleanup.execute(preview), ["feature"])
-        XCTAssertEqual(gitRecorder.arguments.count - beforeCleanup, 18, "one-worktree GitHub grouped cleanup process count")
+        XCTAssertEqual(gitRecorder.arguments.count - beforeCleanup, 17, "one-worktree GitHub grouped cleanup process count")
         print("CLEANUP_GIT_SUBPROCESS grouped_github_worktree=\(gitRecorder.arguments.count - beforeCleanup)")
         XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath.path))
@@ -1086,6 +1107,69 @@ final class CoreTests: XCTestCase {
             XCTAssertTrue(cleanup.execute(preview).isEmpty)
             XCTAssertTrue((try GitService().snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
         }
+    }
+
+    func testRemoteWithUnresolvedDefaultKeepsUniqueLocalMainFallbackForSafeWorktreeCleanup() throws {
+        let fixture = try makeFeatureRepository()
+        let remotePath = fixture.root.appendingPathComponent("empty-remote.git")
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["init", "--bare", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "merge", "--no-ff", "feature", "-m", "merge feature"])
+        _ = try runGit(["-C", fixture.repository.path, "remote", "add", "origin", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+
+        let recorder = RecordingRunner()
+        let git = GitService(runner: recorder)
+        let snapshot = try git.snapshot(repositoryPath: fixture.repository.path)
+        XCTAssertEqual(snapshot.defaultBranch, "main")
+        XCTAssertTrue(try XCTUnwrap(snapshot.branches.first { $0.name == "feature" }).isMerged)
+        let attachedPath = try XCTUnwrap(snapshot.branches.first { $0.name == "feature" }?.worktrees.first?.path)
+        let preview = CleanupService().previewRemoveWorktree(snapshot: snapshot, path: attachedPath)
+        XCTAssertTrue(preview.items[0].allowed, "blocked: \(String(describing: preview.items[0].reason))")
+        let beforeCleanup = recorder.arguments.count
+        XCTAssertEqual(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path)).execute(preview), [attachedPath])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachedPath))
+        let count = recorder.arguments.count - beforeCleanup
+        XCTAssertLessThan(count, 20)
+        print("CLEANUP_GIT_SUBPROCESS safe_worktree_local_fallback=\(count)")
+
+        let cachedContext = try git.cleanupContext(repositoryPath: fixture.repository.path)
+        XCTAssertEqual(cachedContext.defaultRef, "main")
+        _ = try runGit(["-C", fixture.repository.path, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"])
+        XCTAssertFalse(git.validateCleanupDefaultBranch(cachedContext), "newly resolvable remote default must invalidate local fallback")
+        XCTAssertTrue((try GitService().snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+    }
+
+    func testDefaultRefSourceDriftAfterContextAcquisitionBlocksGroupedMutation() throws {
+        let fixture = try makeFeatureRepository()
+        let remotePath = fixture.root.appendingPathComponent("remote.git")
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["init", "--bare", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "merge", "--no-ff", "feature", "-m", "merge feature"])
+        _ = try runGit(["-C", fixture.repository.path, "remote", "add", "origin", remotePath.path])
+        _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "main"])
+        _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "feature"])
+        _ = try runGit(["-C", fixture.repository.path, "fetch", "origin"])
+        _ = try runGit(["-C", fixture.repository.path, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"])
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+
+        let git = GitService()
+        let snapshot = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(snapshot.branches.first { $0.name == "feature" })
+        XCTAssertTrue(branch.isMerged)
+        XCTAssertEqual(snapshot.defaultBranch, "main")
+        let preview = CleanupService().previewMergedBranches(snapshot: RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: [branch]))
+        XCTAssertEqual(preview.groups.count, 1)
+        let runner = RemovingRemoteTrackingRefRunner(repositoryPath: fixture.repository.path)
+        let cleanup = CleanupService(git: GitService(runner: runner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path))
+
+        XCTAssertTrue(cleanup.execute(preview).isEmpty)
+        XCTAssertTrue(runner.removed, "fixture must change default ref source after context acquisition")
+        XCTAssertFalse(runner.arguments.contains { $0.contains("worktree") && $0.contains("remove") })
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
+        XCTAssertTrue((try GitService().snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
     }
 
     func testBranchOnlyPreviewBlocksLocalSHADriftBeforeGitHubVerification() throws {

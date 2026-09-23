@@ -194,7 +194,7 @@ public final class CleanupService: @unchecked Sendable {
 
     private func executeRemoveWorktree(repositoryPath: String, path: String, expectedSHA: String?, sessionCache: SessionCleanupSafetyChecking?, mergeEvidence: MergeEvidence? = nil, expectedDefaultBranch: String? = nil, canonicalPath: String? = nil, context: CleanupRepositoryContext?, expectedWorktreePaths: [String] = []) -> Bool {
         guard let context,
-              let sessions = sessionCache?.cachedMetadata(), let match = try? git.cleanupWorktree(repositoryPath: canonicalPath ?? repositoryPath, path: path, sessions: sessions, canonicalPath: canonicalPath, context: context) else { return false }
+              let sessions = sessionCache?.cachedMetadata(), let match = try? git.cleanupWorktree(repositoryPath: canonicalPath ?? repositoryPath, path: path, sessions: sessions, includeMergeEvidence: false, canonicalPath: canonicalPath, context: context) else { return false }
         guard let expectedSHA, match.worktree.head == expectedSHA else { return false }
         if !match.worktree.isDetached && (context.defaultBranch == nil || context.defaultRef == nil) { return false }
         let branch = match.worktree.isDetached ? match.branch : revalidatedBranch(repositoryPath: canonicalPath ?? repositoryPath, branch: match.branch, expectedSHA: expectedSHA, mergeEvidence: mergeEvidence, expectedDefaultBranch: expectedDefaultBranch, canonicalPath: canonicalPath, context: context)
@@ -264,14 +264,23 @@ public final class CleanupService: @unchecked Sendable {
         guard let expectedSHA, branch.sha == expectedSHA else { return nil }
         let evidence = mergeEvidence ?? branch.mergeEvidence
         let defaultBranch: String?
+        var freshContext: CleanupRepositoryContext?
         if let context {
-            defaultBranch = git.validateCleanupDefaultBranch(context) ? context.defaultBranch : nil
+            freshContext = git.revalidatedCleanupContext(context)
+            defaultBranch = freshContext?.defaultBranch
         } else {
-            defaultBranch = try? git.defaultBranchName(repositoryPath: canonicalPath ?? repositoryPath, canonicalPath: canonicalPath)
+            freshContext = try? git.cleanupContext(repositoryPath: canonicalPath ?? repositoryPath)
+            defaultBranch = freshContext?.defaultBranch
         }
         guard let defaultBranch,
               expectedDefaultBranch == nil || defaultBranch == expectedDefaultBranch else { return nil }
-        if evidence == .gitAncestor { return branch }
+        if evidence == .gitAncestor || evidence == .none {
+            guard let defaultRef = freshContext?.defaultRef else { return nil }
+            if git.isGitAncestor(repositoryPath: canonicalPath ?? repositoryPath, branch: branch.name, defaultRef: defaultRef) {
+                return branch.withMergeEvidence(.gitAncestor)
+            }
+            if evidence == .gitAncestor { return nil }
+        }
         let status: GitHubStatus
         if case .githubVerified(let prNumber, _) = evidence {
             status = github.cleanupStatus(repositoryPath: repositoryPath, pullRequestNumber: prNumber)
