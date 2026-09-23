@@ -190,10 +190,16 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.id), ["chatgpt-first"])
         XCTAssertEqual(counter.sqlite, 2, "unchanged Codex databases must not be queried again")
 
-        try Data("[{\"id\":\"first\",\"cwd\":\"/tmp/worktree\"},{\"id\":\"second\",\"cwd\":\"/tmp/worktree\"}]".utf8).write(to: sessionsFile, options: .atomic)
+        let addedSessionFile = chatRoot.appendingPathComponent("conversations.json")
+        try Data("[{\"id\":\"second\",\"cwd\":\"/tmp/worktree\"}]".utf8).write(to: addedSessionFile)
         XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.id).sorted(), ["chatgpt-first", "chatgpt-second"])
         XCTAssertEqual(counter.sqlite, 2, "ChatGPT source change must not refresh unchanged Codex metadata")
         XCTAssertEqual(counter.ps, 3, "activity check must use a fresh process scan for each removal")
+        try FileManager.default.removeItem(at: addedSessionFile)
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.id), ["chatgpt-first"], "candidate removal must invalidate cached ChatGPT metadata")
+        try Data("wal update".utf8).write(to: sqlite.appendingPathComponent("state_5.sqlite-wal"))
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.id), ["chatgpt-first"])
+        XCTAssertEqual(counter.sqlite, 4, "Codex WAL changes must refresh Codex metadata only")
     }
 
     func testCleanupSafetyCacheDetectsSessionBecomingActiveAndUnknown() throws {
@@ -875,15 +881,10 @@ final class CoreTests: XCTestCase {
     }
 
     func testTenGroupedWorktreeCleanupSessionOperationMeasurement() throws {
-        final class Counts: @unchecked Sendable {
-            var ps = 0
-            var sqlite = 0
-        }
         struct SessionRunner: ProcessRunning {
-            let counts: Counts
             func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
-                if executable == "/bin/ps" { counts.ps += 1; return ProcessResult(status: 0, stdout: "123 /usr/bin/other-process\n") }
-                if executable == "/usr/bin/sqlite3" { counts.sqlite += 1; return ProcessResult(status: 0, stdout: "") }
+                if executable == "/bin/ps" { return ProcessResult(status: 0, stdout: "123 /usr/bin/other-process\n") }
+                if executable == "/usr/bin/sqlite3" { return ProcessResult(status: 0, stdout: "") }
                 return ProcessResult(status: 1)
             }
         }
@@ -908,25 +909,13 @@ final class CoreTests: XCTestCase {
         try Data().write(to: sqlite.appendingPathComponent("codex-dev.db"))
         try Data("[]".utf8).write(to: chatRoot.appendingPathComponent("sessions.json"))
 
-        let counts = Counts()
-        let sessionService = SessionService(home: home.path, runner: SessionRunner(counts: counts))
-        var baselineJSONScans = 0
-        var baselineJSONReads = 0
+        let metrics = SessionDiscoveryMetrics()
+        let sessionService = SessionService(home: home.path, runner: SessionRunner(), metrics: metrics)
         for _ in 0..<10 {
-            let discovery = sessionService.discover()
-            let scanCount = discovery.notes.compactMap { note -> Int? in
-                guard note.contains("JSON/JSONL candidate scan") else { return nil }
-                return Int(note.components(separatedBy: "files=").last?.components(separatedBy: ",").first ?? "0")
-            }.count
-            baselineJSONScans += scanCount
-            baselineJSONReads += discovery.notes.compactMap { note -> Int? in
-                guard note.contains("JSON/JSONL candidate scan") else { return nil }
-                return Int(note.components(separatedBy: "files=").last?.components(separatedBy: ",").first ?? "0")
-            }.reduce(0, +)
+            _ = sessionService.discover()
         }
-        let before = (ps: counts.ps, sqlite: counts.sqlite, chatScans: baselineJSONScans, chatReads: baselineJSONReads)
-        counts.ps = 0
-        counts.sqlite = 0
+        let before = metrics.snapshot()
+        metrics.reset()
 
         let local = try GitService().snapshot(repositoryPath: fixture.repository.path)
         let branches = local.branches.compactMap { branch -> BranchInfo? in
@@ -946,20 +935,57 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(preview.groups.allSatisfy { $0.steps.filter { $0.step == .removeWorktree }.count == 1 })
         XCTAssertEqual(cleanup.execute(preview).count, 10)
 
-        let afterJSONScans = 1 // One changed-source discovery for the execution-scoped ChatGPT metadata cache.
-        let afterJSONReads = 1 // The fixture has one candidate JSON file.
-        let after = (ps: counts.ps, sqlite: counts.sqlite, chatScans: afterJSONScans, chatReads: afterJSONReads)
-        XCTAssertEqual(before.ps, 10)
-        XCTAssertEqual(before.sqlite, 20)
-        XCTAssertEqual(before.chatScans, 10)
-        XCTAssertEqual(before.chatReads, 10)
-        XCTAssertEqual(after.ps, 10)
-        XCTAssertEqual(after.sqlite, 2)
-        XCTAssertEqual(after.chatScans, 1)
-        XCTAssertEqual(after.chatReads, 1)
-        XCTAssertEqual(before.ps + before.sqlite + before.chatScans + before.chatReads, 50)
-        XCTAssertEqual(after.ps + after.sqlite + after.chatScans + after.chatReads, 14)
+        let after = metrics.snapshot()
+        print("SESSION_METRICS before=\(before) total=\(before.totalOperations) after=\(after) total=\(after.totalOperations)")
+        XCTAssertEqual(before.processScans, 10)
+        XCTAssertEqual(before.codexSQLiteQueries, 20)
+        XCTAssertEqual(before.chatGPTMetadataScans, 10)
+        XCTAssertEqual(before.chatGPTFileReads, 10)
+        XCTAssertEqual(before.providerFingerprintCalls, 0)
+        XCTAssertEqual(after.processScans, 10)
+        XCTAssertEqual(after.codexSQLiteQueries, 2)
+        XCTAssertLessThan(after.chatGPTMetadataScans, before.chatGPTMetadataScans)
+        XCTAssertLessThan(after.chatGPTFileReads, before.chatGPTFileReads)
+        XCTAssertGreaterThan(after.providerFingerprintCalls, 0)
+        XCTAssertLessThan(after.chatGPTDirectoryEnumerations, before.chatGPTDirectoryEnumerations)
+        XCTAssertLessThanOrEqual(after.fileAttributeChecks, 400, "fingerprint stat work must stay within the measured bound")
+        XCTAssertLessThanOrEqual(after.totalOperations, 450, "session operation count must stay within the measured bound")
         XCTAssertTrue(worktreePaths.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    func testTenGroupSessionSafetyElapsedSmokeRepeats() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-elapsed-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let sqliteDirectory = home.appendingPathComponent(".codex/sqlite")
+        let chatRoot = home.appendingPathComponent("Library/Application Support/com.openai.chat")
+        try FileManager.default.createDirectory(at: sqliteDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: chatRoot, withIntermediateDirectories: true)
+        let runner = LocalProcessRunner()
+        let statePath = sqliteDirectory.appendingPathComponent("state_5.sqlite")
+        let catalogPath = sqliteDirectory.appendingPathComponent("codex-dev.db")
+        let stateSQL = "CREATE TABLE threads (id TEXT, title TEXT, updated_at REAL, updated_at_ms REAL, cwd TEXT, git_branch TEXT);"
+        let catalogSQL = "CREATE TABLE local_thread_catalog (thread_id TEXT, display_title TEXT, source_updated_at REAL, cwd TEXT, git_branch TEXT);"
+        XCTAssertTrue(try runner.run("/usr/bin/sqlite3", arguments: [statePath.path, stateSQL], currentDirectory: nil).succeeded)
+        XCTAssertTrue(try runner.run("/usr/bin/sqlite3", arguments: [catalogPath.path, catalogSQL], currentDirectory: nil).succeeded)
+        try Data("[]".utf8).write(to: chatRoot.appendingPathComponent("sessions.json"))
+        let service = SessionService(home: home.path, runner: runner)
+
+        func elapsed(_ body: () -> Void) -> Double {
+            let start = ProcessInfo.processInfo.systemUptime
+            body()
+            return ProcessInfo.processInfo.systemUptime - start
+        }
+        var before: [Double] = []
+        var after: [Double] = []
+        for _ in 0..<3 {
+            before.append(elapsed { for _ in 0..<10 { _ = service.discover() } })
+            after.append(elapsed {
+                guard let cache = service.makeCleanupSafetyCache() else { XCTFail("Missing cleanup cache"); return }
+                XCTAssertNotNil(cache.cachedMetadata())
+                for _ in 0..<10 { XCTAssertNotNil(cache.freshSessionsForRemoval()) }
+            })
+        }
+        print("SESSION_ELAPSED_SECONDS groups=10x1 repeats=3 before=\(before) after=\(after)")
     }
 
     func testTenGitAncestorBranchOnlyGroupsKeepFreshMergeBaseChecks() throws {
