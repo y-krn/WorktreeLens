@@ -768,6 +768,36 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
     }
 
+    func testRemoteGonePreviewKeepsUnmergedBranchBlockedAlongsideVerifiedMergedBranch() async throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let git = GitService()
+        let github = GitHubService(runner: verifiedGitHubRunner(number: 140, sha: fixture.featureSHA), executable: "gh")
+        let mainSHA = try runGit(["-C", fixture.repository.path, "rev-parse", "main"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = try runGit(["-C", fixture.repository.path, "switch", "-c", "unmerged", mainSHA])
+        FileManager.default.createFile(atPath: fixture.repository.appendingPathComponent("unmerged.txt").path, contents: Data("unmerged\n".utf8))
+        _ = try runGit(["-C", fixture.repository.path, "add", "."])
+        _ = try runGit(["-C", fixture.repository.path, "commit", "-m", "unmerged branch"])
+        _ = try runGit(["-C", fixture.repository.path, "switch", "main"])
+        _ = try runGit(["-C", fixture.repository.path, "merge", "--no-ff", "feature", "-m", "merge feature"])
+
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let feature = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let unmerged = try XCTUnwrap(local.branches.first { $0.name == "unmerged" })
+        let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
+        let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
+        let branches = [
+            feature.withMergeEvidence(.githubVerified(prNumber: 140, mergedAt: mergedAt), github: status).withRemoteGone(true),
+            unmerged.withRemoteGone(true)
+        ]
+        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
+            .previewRemoteGoneBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: branches))
+
+        XCTAssertEqual(preview.groups.count, 2)
+        XCTAssertEqual(preview.groups.filter(\.allowed).count, 1)
+        XCTAssertEqual(preview.groups.first { $0.branchName == "unmerged" }?.steps.last?.reason, .unmergedBranch)
+    }
+
     func testRemoteGoneUnsafeAttachedWorktreeBlocksBranchCleanup() {
         let reasons: [(CleanupBlockReason, WorktreeInfo)] = [
             (.dirtyWorktree, WorktreeInfo(id: "dirty", path: "/tmp/dirty", branch: "feature", head: "abc", isBare: false, isLocked: false, isClean: false, stagedCount: 1, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)),

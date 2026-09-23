@@ -11,6 +11,6 @@ let package = Package(
     targets: [
         .target(name: "WorktreeLensCore"),
         .executableTarget(name: "WorktreeLensApp", dependencies: ["WorktreeLensCore"]),
-        .testTarget(name: "WorktreeLensCoreTests", dependencies: ["WorktreeLensCore"])
+        .testTarget(name: "WorktreeLensCoreTests", dependencies: ["WorktreeLensCore", "WorktreeLensApp"])
     ]
 )
