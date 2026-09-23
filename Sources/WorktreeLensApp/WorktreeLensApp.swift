@@ -232,6 +232,10 @@ final class ApplicationModel: ObservableObject {
         return snapshot?.branches.first { $0.id == selectedBranchID }
     }
 
+    func requestCleanupAfterMenuDismissal(_ request: @escaping @MainActor @Sendable () -> Void) {
+        DispatchQueue.main.async(execute: request)
+    }
+
     func requestRemoveSelectedWorktree() {
         guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path, let worktree = selectedWorktree() else { return }
         let cleanup = self.cleanup
@@ -483,15 +487,15 @@ struct ContentView: View {
 
     private var cleanupMenu: some View {
         Group {
-            Button("Remove Selected Worktree…") { model.requestRemoveSelectedWorktree() }
+            Button("Remove Selected Worktree…") { model.requestCleanupAfterMenuDismissal { model.requestRemoveSelectedWorktree() } }
                 .disabled(model.selectedWorktree() == nil)
-            Button("Delete Selected Branch…") { model.requestDeleteSelectedBranch() }
+            Button("Delete Selected Branch…") { model.requestCleanupAfterMenuDismissal { model.requestDeleteSelectedBranch() } }
                 .disabled(model.selectedBranch() == nil)
             Divider()
-            Button("Prune Worktree Metadata…") { model.requestPrune() }
-            Button("Clean Up Merged Branches…") { model.requestDeleteMergedBranches() }
-            Button("Delete Stale Worktrees (\(model.staleDays)d)…") { model.requestRemoveStaleWorktrees() }
-            Button("Clean Up Merged Remote-gone Branches…") { model.requestDeleteRemoteGoneBranches() }
+            Button("Prune Worktree Metadata…") { model.requestCleanupAfterMenuDismissal { model.requestPrune() } }
+            Button("Clean Up Merged Branches…") { model.requestCleanupAfterMenuDismissal { model.requestDeleteMergedBranches() } }
+            Button("Delete Stale Worktrees (\(model.staleDays)d)…") { model.requestCleanupAfterMenuDismissal { model.requestRemoveStaleWorktrees() } }
+            Button("Clean Up Merged Remote-gone Branches…") { model.requestCleanupAfterMenuDismissal { model.requestDeleteRemoteGoneBranches() } }
             Divider()
             Stepper("Stale threshold: \(model.staleDays) days", value: $model.staleDays, in: 1...365)
         }
