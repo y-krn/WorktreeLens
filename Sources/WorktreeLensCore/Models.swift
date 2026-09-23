@@ -339,12 +339,16 @@ public struct CleanupPreviewGroup: Identifiable, Sendable {
     public let id: String
     public let branchName: String
     public let expectedSHA: String?
+    public let expectedDefaultBranch: String?
+    public let mergeEvidence: MergeEvidence
     public let steps: [CleanupPreviewItem]
 
-    public init(branchName: String, expectedSHA: String?, steps: [CleanupPreviewItem]) {
+    public init(branchName: String, expectedSHA: String?, expectedDefaultBranch: String? = nil, mergeEvidence: MergeEvidence = .none, steps: [CleanupPreviewItem]) {
         self.id = branchName
         self.branchName = branchName
         self.expectedSHA = expectedSHA
+        self.expectedDefaultBranch = expectedDefaultBranch
+        self.mergeEvidence = mergeEvidence
         self.steps = steps
     }
 

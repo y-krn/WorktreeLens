@@ -69,6 +69,16 @@ public final class GitHubService: @unchecked Sendable {
         }
     }
 
+    /// Fetches one known PR directly so destructive cleanup does not enumerate PRs for the branch.
+    public func cleanupStatus(repositoryPath: String, pullRequestNumber: Int, timeout: TimeInterval = GitHubService.requestTimeout) -> GitHubStatus {
+        do {
+            let pr = try queryObject(repositoryPath: repositoryPath, arguments: ["pr", "view", String(pullRequestNumber), "--json", "number,state,baseRefName,headRefName,headRefOid,mergedAt"], timeout: timeout)
+            return GitHubStatus(issues: [], pullRequests: [pullRequest(pr)].compactMap { $0 }, actions: [], error: nil, isLoaded: true)
+        } catch {
+            return GitHubStatus(issues: [], pullRequests: [], actions: [], error: error.localizedDescription, isLoaded: false)
+        }
+    }
+
     private func query(repositoryPath: String, arguments: [String], timeout: TimeInterval) throws -> [[String: Any]] {
         let executable: String
         if let configuredExecutable {
@@ -84,6 +94,26 @@ public final class GitHubService: @unchecked Sendable {
         if fallback.timedOut { throw ProcessRunnerError.timedOut("gh") }
         guard fallback.succeeded else { throw ProcessRunnerError.failed(fallback.stderr.trimmingCharacters(in: .whitespacesAndNewlines)) }
         guard let data = fallback.stdout.data(using: .utf8), let json = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw ProcessRunnerError.failed("Invalid JSON from gh")
+        }
+        return json
+    }
+
+    private func queryObject(repositoryPath: String, arguments: [String], timeout: TimeInterval) throws -> [String: Any] {
+        let executable: String
+        if let configuredExecutable {
+            executable = configuredExecutable
+        } else if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/gh") {
+            executable = "/opt/homebrew/bin/gh"
+        } else if FileManager.default.isExecutableFile(atPath: "/usr/local/bin/gh") {
+            executable = "/usr/local/bin/gh"
+        } else {
+            throw ProcessRunnerError.executableNotFound("gh")
+        }
+        let result = try runner.run(executable, arguments: arguments, currentDirectory: repositoryPath, timeout: timeout)
+        if result.timedOut { throw ProcessRunnerError.timedOut("gh") }
+        guard result.succeeded else { throw ProcessRunnerError.failed(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        guard let data = result.stdout.data(using: .utf8), let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ProcessRunnerError.failed("Invalid JSON from gh")
         }
         return json
