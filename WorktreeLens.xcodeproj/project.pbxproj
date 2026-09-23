@@ -1,0 +1,93 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* WorktreeLensApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* WorktreeLensApp.swift */; };
+		A10000000000000000000002 /* CleanupService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* CleanupService.swift */; };
+		A10000000000000000000003 /* GitHubService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* GitHubService.swift */; };
+		A10000000000000000000004 /* GitService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* GitService.swift */; };
+		A10000000000000000000005 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* Models.swift */; };
+		A10000000000000000000006 /* ProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* ProcessRunner.swift */; };
+		A10000000000000000000007 /* RepositoryScanService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* RepositoryScanService.swift */; };
+		A10000000000000000000008 /* RepositoryStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* RepositoryStore.swift */; };
+		A10000000000000000000009 /* SessionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* SessionService.swift */; };
+		A1000000000000000000000A /* WorktreeLensCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* WorktreeLensCore.framework */; };
+		A1000000000000000000000B /* WorktreeLensCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* WorktreeLensCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A30000000000000000000001 /* PBXContainerItemProxy */ = {isa = PBXContainerItemProxy; containerPortal = A40000000000000000000001 /* Project object */; proxyType = 1; remoteGlobalIDString = A50000000000000000000002; remoteInfo = WorktreeLensCore; };
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A60000000000000000000001 /* Embed Frameworks */ = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 10; files = (A1000000000000000000000B /* WorktreeLensCore.framework in Embed Frameworks */, ); name = "Embed Frameworks"; runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		A20000000000000000000001 /* WorktreeLensApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensApp/WorktreeLensApp.swift; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000002 /* CleanupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensCore/CleanupService.swift; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000003 /* GitHubService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensCore/GitHubService.swift; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000004 /* GitService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensCore/GitService.swift; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000005 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensCore/Models.swift; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000006 /* ProcessRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensCore/ProcessRunner.swift; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000007 /* RepositoryScanService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensCore/RepositoryScanService.swift; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000008 /* RepositoryStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensCore/RepositoryStore.swift; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000009 /* SessionService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensCore/SessionService.swift; sourceTree = SOURCE_ROOT; };
+		A2000000000000000000000A /* WorktreeLens.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WorktreeLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A2000000000000000000000B /* WorktreeLensCore.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = WorktreeLensCore.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A70000000000000000000001 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A1000000000000000000000A /* WorktreeLensCore.framework in Frameworks */, ); runOnlyForDeploymentPostprocessing = 0; };
+		A70000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A80000000000000000000001 = {isa = PBXGroup; children = (A80000000000000000000002 /* WorktreeLens */, A80000000000000000000003 /* Products */, ); sourceTree = "<group>"; };
+		A80000000000000000000002 /* WorktreeLens */ = {isa = PBXGroup; children = (A20000000000000000000001 /* WorktreeLensApp.swift */, A80000000000000000000005 /* WorktreeLensCore */, ); path = .; sourceTree = SOURCE_ROOT; };
+		A80000000000000000000003 /* Products */ = {isa = PBXGroup; children = (A2000000000000000000000A /* WorktreeLens.app */, A2000000000000000000000B /* WorktreeLensCore.framework */, ); name = Products; sourceTree = "<group>"; };
+		A80000000000000000000005 /* WorktreeLensCore */ = {isa = PBXGroup; children = (A20000000000000000000002 /* CleanupService.swift */, A20000000000000000000003 /* GitHubService.swift */, A20000000000000000000004 /* GitService.swift */, A20000000000000000000005 /* Models.swift */, A20000000000000000000006 /* ProcessRunner.swift */, A20000000000000000000007 /* RepositoryScanService.swift */, A20000000000000000000008 /* RepositoryStore.swift */, A20000000000000000000009 /* SessionService.swift */, ); name = WorktreeLensCore; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A50000000000000000000001 /* WorktreeLens */ = {isa = PBXNativeTarget; buildConfigurationList = A90000000000000000000001 /* Build configuration list for PBXNativeTarget "WorktreeLens" */; buildPhases = (A70000000000000000000001 /* Frameworks */, A50000000000000000000003 /* Sources */, A60000000000000000000001 /* Embed Frameworks */, ); buildRules = (); dependencies = (A50000000000000000000005 /* PBXTargetDependency */, ); name = WorktreeLens; productName = WorktreeLens; productReference = A2000000000000000000000A /* WorktreeLens.app */; productType = "com.apple.product-type.application"; };
+		A50000000000000000000002 /* WorktreeLensCore */ = {isa = PBXNativeTarget; buildConfigurationList = A90000000000000000000002 /* Build configuration list for PBXNativeTarget "WorktreeLensCore" */; buildPhases = (A70000000000000000000002 /* Frameworks */, A50000000000000000000004 /* Sources */, ); buildRules = (); dependencies = (); name = WorktreeLensCore; productName = WorktreeLensCore; productReference = A2000000000000000000000B /* WorktreeLensCore.framework */; productType = "com.apple.product-type.framework"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A40000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = {BuildIndependentTargetsInParallel = 1; LastUpgradeCheck = 2700; TargetAttributes = {A50000000000000000000001 = {CreatedOnToolsVersion = 27.0; }; A50000000000000000000002 = {CreatedOnToolsVersion = 27.0; }; }; }; buildConfigurationList = A90000000000000000000003 /* Build configuration list for PBXProject "WorktreeLens" */; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base, ); mainGroup = A80000000000000000000001; productRefGroup = A80000000000000000000003 /* Products */; projectDirPath = ""; projectRoot = ""; targets = (A50000000000000000000001 /* WorktreeLens */, A50000000000000000000002 /* WorktreeLensCore */, ); };
+/* End PBXProject section */
+
+/* Begin PBXProject information */
+/* End PBXProject information */
+
+/* Begin PBXTargetDependency section */
+		A50000000000000000000005 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = A50000000000000000000002 /* WorktreeLensCore */; targetProxy = A30000000000000000000001 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A50000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* WorktreeLensApp.swift in Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
+		A50000000000000000000004 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000002 /* CleanupService.swift in Sources */, A10000000000000000000003 /* GitHubService.swift in Sources */, A10000000000000000000004 /* GitService.swift in Sources */, A10000000000000000000005 /* Models.swift in Sources */, A10000000000000000000006 /* ProcessRunner.swift in Sources */, A10000000000000000000007 /* RepositoryScanService.swift in Sources */, A10000000000000000000008 /* RepositoryStore.swift in Sources */, A10000000000000000000009 /* SessionService.swift in Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		AA0000000000000000000001 /* Debug app */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = "Worktree Lens"; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools"; MACOSX_DEPLOYMENT_TARGET = 13.0; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.ykrn.WorktreeLens; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; }; name = Debug; };
+		AA0000000000000000000002 /* Release app */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = YES; INFOPLIST_KEY_CFBundleDisplayName = "Worktree Lens"; INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools"; MACOSX_DEPLOYMENT_TARGET = 13.0; MARKETING_VERSION = 1.0; PRODUCT_BUNDLE_IDENTIFIER = com.ykrn.WorktreeLens; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; }; name = Release; };
+		AA0000000000000000000003 /* Debug core */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEFINES_MODULE = YES; DYLIB_COMPATIBILITY_VERSION = 1; DYLIB_CURRENT_VERSION = 1; GENERATE_INFOPLIST_FILE = YES; INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks"; MACOSX_DEPLOYMENT_TARGET = 13.0; PRODUCT_BUNDLE_IDENTIFIER = com.ykrn.WorktreeLensCore; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; }; name = Debug; };
+		AA0000000000000000000004 /* Release core */ = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEFINES_MODULE = YES; DYLIB_COMPATIBILITY_VERSION = 1; DYLIB_CURRENT_VERSION = 1; GENERATE_INFOPLIST_FILE = YES; INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks"; MACOSX_DEPLOYMENT_TARGET = 13.0; PRODUCT_BUNDLE_IDENTIFIER = com.ykrn.WorktreeLensCore; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = macosx; SKIP_INSTALL = YES; SWIFT_VERSION = 5.0; }; name = Release; };
+		AA0000000000000000000005 /* Debug project */ = {isa = XCBuildConfiguration; buildSettings = {MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Debug; };
+		AA0000000000000000000006 /* Release project */ = {isa = XCBuildConfiguration; buildSettings = {MACOSX_DEPLOYMENT_TARGET = 13.0; SDKROOT = macosx; SWIFT_VERSION = 5.0; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A90000000000000000000001 /* Build configuration list for PBXNativeTarget "WorktreeLens" */ = {isa = XCConfigurationList; buildConfigurations = (AA0000000000000000000001 /* Debug app */, AA0000000000000000000002 /* Release app */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A90000000000000000000002 /* Build configuration list for PBXNativeTarget "WorktreeLensCore" */ = {isa = XCConfigurationList; buildConfigurations = (AA0000000000000000000003 /* Debug core */, AA0000000000000000000004 /* Release core */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A90000000000000000000003 /* Build configuration list for PBXProject "WorktreeLens" */ = {isa = XCConfigurationList; buildConfigurations = (AA0000000000000000000005 /* Debug project */, AA0000000000000000000006 /* Release project */, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+	};
+	rootObject = A40000000000000000000001 /* Project object */;
+}
