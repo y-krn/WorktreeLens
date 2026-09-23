@@ -172,11 +172,12 @@ final class ApplicationModel: ObservableObject {
                 await MainActor.run {
                     guard self.refreshToken == token, self.selectedPath == path else { return }
                     self.snapshot = enriched
-                    self.saveCurrentView()
+                    self.selection = self.normalizedSelection(self.selection, in: enriched)
                     self.isLoading = false
                     self.canCancelGitHub = false
                     self.scanPhase = nil
                     self.statusMessage = Task.isCancelled ? "GitHub loading cancelled" : nil
+                    self.saveCurrentView()
                     self.loadGitHubDetailForCurrentSelection()
                 }
             } catch {
@@ -285,7 +286,7 @@ final class ApplicationModel: ObservableObject {
     }
 
     private func saveCurrentView() {
-        guard let selectedPath, let snapshot, snapshot.path == selectedPath else { return }
+        guard !isLoading, let selectedPath, let snapshot, snapshot.path == selectedPath else { return }
         viewCache[selectedPath] = RepositoryViewCache(snapshot: snapshot, sessionNotes: sessionNotes, selection: selection)
     }
 

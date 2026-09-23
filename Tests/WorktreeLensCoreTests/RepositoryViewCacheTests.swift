@@ -11,8 +11,13 @@ final class RepositoryViewCacheTests: XCTestCase {
         private(set) var sessionScans = 0
         private(set) var gitScans: [String: Int] = [:]
         private(set) var bulkRefreshes: [String: Int] = [:]
+        private let blockedBulkCall: (path: String, call: Int, expectation: XCTestExpectation)?
+        private var blockedBulkContinuation: CheckedContinuation<RepositorySnapshot, Never>?
 
-        init(results: [String: [RepositoryLocalScanResult]]) { self.results = results }
+        init(results: [String: [RepositoryLocalScanResult]], blockedBulkCall: (path: String, call: Int, expectation: XCTestExpectation)? = nil) {
+            self.results = results
+            self.blockedBulkCall = blockedBulkCall
+        }
 
         func scanSessions() -> SessionDiscoveryResult {
             lock.lock(); defer { lock.unlock() }
@@ -32,7 +37,13 @@ final class RepositoryViewCacheTests: XCTestCase {
         }
 
         func enrichGitHub(local: RepositoryLocalScanResult, progress: @escaping @Sendable (Int, Int) -> Void) async -> RepositorySnapshot {
-            recordBulkRefresh(for: local.snapshot.path)
+            let call = recordBulkRefresh(for: local.snapshot.path)
+            if let blockedBulkCall, blockedBulkCall.path == local.snapshot.path, blockedBulkCall.call == call {
+                return await withCheckedContinuation { continuation in
+                    lock.lock(); blockedBulkContinuation = continuation; lock.unlock()
+                    blockedBulkCall.expectation.fulfill()
+                }
+            }
             return local.snapshot
         }
 
@@ -41,9 +52,15 @@ final class RepositoryViewCacheTests: XCTestCase {
             return (gitScans[path, default: 0], bulkRefreshes[path, default: 0])
         }
 
-        private func recordBulkRefresh(for path: String) {
+        func releaseBlockedBulkRefresh() {
+            lock.lock(); let pending = blockedBulkContinuation; blockedBulkContinuation = nil; lock.unlock()
+            pending?.resume(returning: RepositorySnapshot(path: "/released", defaultBranch: nil, branches: []))
+        }
+
+        private func recordBulkRefresh(for path: String) -> Int {
             lock.lock(); defer { lock.unlock() }
             bulkRefreshes[path, default: 0] += 1
+            return bulkRefreshes[path, default: 0]
         }
     }
 
@@ -121,6 +138,65 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertEqual(model.snapshot?.branches.first?.id, "new")
         XCTAssertEqual(scanner.counts(for: first.snapshot.path).git, 2)
         XCTAssertEqual(scanner.counts(for: first.snapshot.path).bulk, 2)
+    }
+
+    func testFirstLoadSwitchedDuringBulkDoesNotLeavePartialCache() async throws {
+        let bulkStarted = expectation(description: "A initial bulk refresh blocked")
+        let partialA = localResult(path: "/tmp/partial-first-A", branch: "partial")
+        let freshA = localResult(path: "/tmp/partial-first-A", branch: "fresh")
+        let b = localResult(path: "/tmp/partial-first-B", branch: "b")
+        let scanner = CountingScanner(
+            results: [partialA.snapshot.path: [partialA, freshA], b.snapshot.path: [b]],
+            blockedBulkCall: (path: partialA.snapshot.path, call: 1, expectation: bulkStarted)
+        )
+        let model = makeModel(paths: [partialA.snapshot.path, b.snapshot.path], scanner: scanner)
+
+        model.selectRepository(path: partialA.snapshot.path)
+        await fulfillment(of: [bulkStarted], timeout: 2)
+        XCTAssertTrue(model.isLoading)
+        XCTAssertEqual(model.snapshot?.branches.first?.id, "partial")
+        model.selectRepository(path: b.snapshot.path)
+        await waitForRefresh(model)
+        model.selectRepository(path: partialA.snapshot.path)
+        await waitForRefresh(model, branchID: "fresh")
+        scanner.releaseBlockedBulkRefresh()
+        await Task.yield()
+
+        XCTAssertEqual(model.snapshot?.branches.first?.id, "fresh")
+        XCTAssertEqual(scanner.counts(for: partialA.snapshot.path).git, 2)
+        XCTAssertEqual(scanner.counts(for: partialA.snapshot.path).bulk, 2)
+    }
+
+    func testInterruptedExplicitRefreshRestoresPriorCompletedCacheAndSelection() async throws {
+        let refreshBulkStarted = expectation(description: "A explicit refresh bulk blocked")
+        let completedA = localResult(path: "/tmp/partial-refresh-A", branches: ["complete", "chosen"])
+        let partialA = localResult(path: "/tmp/partial-refresh-A", branches: ["partial", "chosen"])
+        let b = localResult(path: "/tmp/partial-refresh-B", branch: "b")
+        let scanner = CountingScanner(
+            results: [completedA.snapshot.path: [completedA, partialA], b.snapshot.path: [b]],
+            blockedBulkCall: (path: completedA.snapshot.path, call: 2, expectation: refreshBulkStarted)
+        )
+        let model = makeModel(paths: [completedA.snapshot.path, b.snapshot.path], scanner: scanner)
+
+        model.selectRepository(path: completedA.snapshot.path)
+        await waitForRefresh(model)
+        model.selectBranch(id: "chosen")
+        model.refreshSelected()
+        await fulfillment(of: [refreshBulkStarted], timeout: 2)
+        XCTAssertTrue(model.isLoading)
+        XCTAssertEqual(model.snapshot?.branches.map(\.id), ["partial", "chosen"])
+        model.selectBranch(id: "partial")
+        model.selectRepository(path: b.snapshot.path)
+        await waitForRefresh(model)
+        model.selectRepository(path: completedA.snapshot.path)
+        scanner.releaseBlockedBulkRefresh()
+        await Task.yield()
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.snapshot?.branches.map(\.id), ["complete", "chosen"])
+        XCTAssertEqual(model.selection, .branch("chosen"))
+        XCTAssertEqual(scanner.counts(for: completedA.snapshot.path).git, 2)
+        XCTAssertEqual(scanner.counts(for: completedA.snapshot.path).bulk, 2)
     }
 
     func testCleanupCompletionRefreshesAndReplacesCachedSnapshot() async throws {
@@ -220,6 +296,13 @@ final class RepositoryViewCacheTests: XCTestCase {
         let branchInfo = BranchInfo(id: branch, name: branch, sha: "sha", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: worktrees, github: githubLoaded ? GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil) : .unavailable)
         let snapshot = RepositorySnapshot(path: path, defaultBranch: "main", branches: [branchInfo])
         return RepositoryLocalScanResult(snapshot: snapshot, sessionNotes: notes)
+    }
+
+    private func localResult(path: String, branches: [String], notes: [String] = []) -> RepositoryLocalScanResult {
+        let branchInfos = branches.map { branch in
+            BranchInfo(id: branch, name: branch, sha: "sha-\(branch)", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [], github: GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil))
+        }
+        return RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: path, defaultBranch: "main", branches: branchInfos), sessionNotes: notes)
     }
 
     private func waitForRefresh(_ model: ApplicationModel, branchID: String? = nil) async {
