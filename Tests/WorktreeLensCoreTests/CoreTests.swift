@@ -541,6 +541,49 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(counter.processScans, 2, "each removal freshness check uses one shared process snapshot")
     }
 
+    func testCleanupSafetyCacheBlocksClaudeProcessesWithoutKnownSessionMetadata() throws {
+        final class Counter: @unchecked Sendable { var processScans = 0 }
+        struct Runner: ProcessRunning {
+            let counter: Counter
+            let processes: String
+            func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+                if executable == "/bin/ps" { counter.processScans += 1; return ProcessResult(status: 0, stdout: processes) }
+                return ProcessResult(status: 0, stdout: "")
+            }
+        }
+
+        for processLine in ["123 claude\n", "123 claude --resume unknown-id\n"] {
+            let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-unresolved-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: home) }
+            let counter = Counter()
+            let cache = try XCTUnwrap(SessionService(home: home.path, runner: Runner(counter: counter, processes: processLine)).makeCleanupSafetyCache())
+
+            XCTAssertNil(cache.freshSessionsForRemoval(), "unresolved Claude process must fail closed: \(processLine)")
+            XCTAssertEqual(counter.processScans, 1, "one process snapshot per fresh cleanup check")
+        }
+
+        let knownHome = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-known-\(UUID().uuidString)")
+        let history = knownHome.appendingPathComponent(".claude/history.jsonl")
+        try FileManager.default.createDirectory(at: history.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: knownHome) }
+        try Data("{\"sessionId\":\"known-session\",\"project\":\"/tmp/wt\"}\n".utf8).write(to: history)
+        let knownCounter = Counter()
+        let knownCache = try XCTUnwrap(SessionService(home: knownHome.path, runner: Runner(counter: knownCounter, processes: "123 /opt/homebrew/bin/claude --resume known-session\n")).makeCleanupSafetyCache())
+        XCTAssertEqual(knownCache.freshSessionsForRemoval()?.map(\.activity), [.active])
+        XCTAssertEqual(knownCounter.processScans, 1)
+
+        let inactiveCounter = Counter()
+        let inactiveHome = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-absent-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: inactiveHome) }
+        let inactiveCache = try XCTUnwrap(SessionService(home: inactiveHome.path, runner: Runner(counter: inactiveCounter, processes: "123 /usr/bin/unrelated\n")).makeCleanupSafetyCache())
+        XCTAssertEqual(inactiveCache.freshSessionsForRemoval()?.count, 0)
+        XCTAssertEqual(inactiveCounter.processScans, 1)
+
+        let worktree = WorktreeInfo(id: "/tmp/wt", path: "/tmp/wt", branch: "feature", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: Date())
+        let branch = BranchInfo(id: "feature", name: "feature", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: false, lastCommitAt: Date(), worktrees: [worktree])
+        XCTAssertTrue(CleanupService().decide(worktree: worktree, branch: branch).allowed)
+    }
+
     func testLocalProcessRunnerDrainsLargeStdoutAndStderr() throws {
         let result = try LocalProcessRunner().run("/bin/zsh", arguments: ["-c", "i=0; while ((i < 200000)); do print -n x; ((i++)); done & i=0; while ((i < 200000)); do print -nu2 y; ((i++)); done; wait"], currentDirectory: nil)
         XCTAssertTrue(result.succeeded, result.stderr)

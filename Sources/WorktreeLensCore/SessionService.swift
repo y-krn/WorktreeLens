@@ -227,6 +227,14 @@ public struct ProcessActivityProbe: SessionActivityProbing {
         return appRunning ? (.unknown, "provider process running; session ID not exposed") : (.inactive, "provider process not running")
     }
 
+    fileprivate func hasUnresolvedClaudeProcess(snapshot: ProcessActivitySnapshot, knownSessionIDs: Set<String>) -> Bool {
+        guard snapshot.isAvailable else { return true }
+        return snapshot.processes.contains { line in
+            guard isClaudeProcess(line) else { return false }
+            return !knownSessionIDs.contains { containsExactArgument($0, in: line) }
+        }
+    }
+
     private func containsSessionID(_ token: String, in line: String) -> Bool {
         line.range(of: token, options: [.caseInsensitive, .diacriticInsensitive]) != nil
     }
@@ -715,6 +723,8 @@ public final class SessionCleanupSafetyCache: SessionCleanupSafetyChecking, @unc
     public func freshSessionsForRemoval() -> [SessionRecord]? {
         guard initializeIfNeeded(), refreshChangedProviders() else { return nil }
         let processSnapshot = processProbe.snapshot()
+        let knownClaudeSessionIDs = Set((metadata[.claude] ?? []).map(rawID))
+        guard !processProbe.hasUnresolvedClaudeProcess(snapshot: processSnapshot, knownSessionIDs: knownClaudeSessionIDs) else { return nil }
         let sourceStamps = fingerprints
         var result: [SessionRecord] = []
         for session in allMetadata {
