@@ -398,6 +398,17 @@ final class CoreTests: XCTestCase {
         try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: worktree, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: home) }
+        let gitRunner = LocalProcessRunner()
+        func runGit(_ arguments: [String]) throws {
+            let result = try gitRunner.run("/usr/bin/git", arguments: ["-C", worktree.path] + arguments, currentDirectory: nil)
+            XCTAssertTrue(result.succeeded, result.stderr)
+        }
+        try runGit(["init", "-b", "main"])
+        try runGit(["config", "user.email", "worktree-lens@example.invalid"])
+        try runGit(["config", "user.name", "Worktree Lens Test"])
+        try Data("fixture\n".utf8).write(to: worktree.appendingPathComponent("fixture.txt"))
+        try runGit(["add", "."])
+        try runGit(["commit", "-m", "fixture"])
         let rows = [
             "{\"sessionId\":\"claude-session-1\",\"project\":\"\(worktree.path)\",\"display\":\"First title\",\"timestamp\":1700000000}",
             "{\"sessionId\":\"claude-session-1\",\"project\":\"\(worktree.path)\",\"display\":\"Latest title\",\"timestamp\":1700000001}"
@@ -412,6 +423,8 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(session.cwd, worktree.path)
         XCTAssertNil(session.url)
         XCTAssertEqual(session.activity, .inactive)
+        let snapshot = try GitService().snapshot(repositoryPath: worktree.path, sessions: [session])
+        XCTAssertEqual(snapshot.branches.flatMap(\.worktrees).flatMap(\.sessions).map(\.id), [session.id])
     }
 
     func testClaudeProjectsFallbackReadsOnlySessionsAbsentFromHistory() throws {
