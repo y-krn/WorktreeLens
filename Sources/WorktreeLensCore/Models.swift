@@ -375,6 +375,23 @@ public struct CleanupPreview: Identifiable, Sendable {
     public var allowedItems: [CleanupPreviewItem] { items.filter(\.allowed) }
 }
 
+public struct CleanupExecutionResult: Equatable, Sendable {
+    public let completedTargetIDs: [String]
+    public let removedWorktreePaths: [String]
+    public let deletedLocalBranches: [String]
+    public let requiresFullRefresh: Bool
+
+    public init(completedTargetIDs: [String] = [], removedWorktreePaths: [String] = [], deletedLocalBranches: [String] = [], requiresFullRefresh: Bool = false) {
+        self.completedTargetIDs = completedTargetIDs
+        self.removedWorktreePaths = removedWorktreePaths
+        self.deletedLocalBranches = deletedLocalBranches
+        self.requiresFullRefresh = requiresFullRefresh
+    }
+
+    public var count: Int { completedTargetIDs.count }
+    public var isEmpty: Bool { completedTargetIDs.isEmpty && removedWorktreePaths.isEmpty && deletedLocalBranches.isEmpty && !requiresFullRefresh }
+}
+
 public struct CleanupDecision: Equatable, Sendable {
     public let allowed: Bool
     public let reason: CleanupBlockReason?

@@ -62,6 +62,7 @@ final class ApplicationModel: ObservableObject {
     let sessions: SessionService
     let github: GitHubService
     private let detailLoader: any GitHubDetailLoading
+    private let cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)?
     let scanner: any RepositoryScanning
     lazy var cleanup = CleanupService(git: git, sessions: sessions, github: github)
     private var viewCache: [String: RepositoryViewCache] = [:]
@@ -71,12 +72,13 @@ final class ApplicationModel: ObservableObject {
     private var githubDetailTask: Task<Void, Never>?
     private var cleanupPreviewToken = UUID()
 
-    init(loadRepositories: Bool = true, repositoryStore: RepositoryStore = RepositoryStore(), git: GitService = GitService(), sessions: SessionService = SessionService(), github: GitHubService = GitHubService(), detailLoader: (any GitHubDetailLoading)? = nil, scanner injectedScanner: (any RepositoryScanning)? = nil) {
+    init(loadRepositories: Bool = true, repositoryStore: RepositoryStore = RepositoryStore(), git: GitService = GitService(), sessions: SessionService = SessionService(), github: GitHubService = GitHubService(), detailLoader: (any GitHubDetailLoading)? = nil, scanner injectedScanner: (any RepositoryScanning)? = nil, cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil) {
         self.repositoryStore = repositoryStore
         self.git = git
         self.sessions = sessions
         self.github = github
         self.detailLoader = detailLoader ?? github
+        self.cleanupExecutor = cleanupExecutor
         self.scanner = injectedScanner ?? RepositoryScanService(git: git, sessions: sessions, github: github)
         registeredPaths = repositoryStore.paths
         selectedPath = nil
@@ -357,17 +359,75 @@ final class ApplicationModel: ObservableObject {
 
     func executeCleanup(_ preview: CleanupPreview) {
         guard cleanupExecutionState == .idle, !isCleanupPreviewLoading, cleanupPreview?.id == preview.id else { return }
+        let repositoryPath = URL(fileURLWithPath: preview.repositoryPath).standardizedFileURL.path
+        invalidateRepositoryTasks()
+        isLoading = false
+        scanPhase = nil
+        canCancelGitHub = false
+        if selectedPath == repositoryPath { saveCurrentView() }
         cleanupExecutionState = .running
         let cleanup = self.cleanup
+        let cleanupExecutor = self.cleanupExecutor
         Task.detached(priority: .userInitiated) {
-            let completed = cleanup.execute(preview)
+            let result = cleanupExecutor?(preview) ?? cleanup.execute(preview)
             await MainActor.run {
                 guard self.cleanupPreview?.id == preview.id else { return }
-                self.cleanupExecutionState = .completed(completed.count)
-                self.statusMessage = completed.isEmpty ? "Completed 0 target(s) — no changes after final guard" : "Completed \(completed.count) target(s)"
-                self.refreshSelected()
+                self.publishCleanupResult(result, repositoryPath: repositoryPath)
             }
         }
+    }
+
+    func publishCleanupResult(_ result: CleanupExecutionResult, repositoryPath: String) {
+        cleanupExecutionState = .completed(result.count)
+        statusMessage = result.count == 0 ? "Completed 0 target(s) — no changes after final guard" : "Completed \(result.count) target(s)"
+        if result.requiresFullRefresh, selectedPath != repositoryPath {
+            viewCache.removeValue(forKey: repositoryPath)
+            return
+        }
+        guard var cached = viewCache[repositoryPath], cached.snapshot.path == repositoryPath else {
+            if selectedPath == repositoryPath, let current = snapshot, current.path == repositoryPath {
+                let patched = patchedSnapshot(current, with: result)
+                selection = normalizedSelection(selection, from: current, after: result, in: patched)
+                snapshot = patched
+                saveCurrentView()
+            }
+            if result.requiresFullRefresh, selectedPath == repositoryPath { refreshSelected() }
+            return
+        }
+        let original = cached.snapshot
+        cached.snapshot = patchedSnapshot(original, with: result)
+        cached.selection = normalizedSelection(cached.selection, from: original, after: result, in: cached.snapshot)
+        viewCache[repositoryPath] = cached
+        if selectedPath == repositoryPath {
+            snapshot = cached.snapshot
+            sessionNotes = cached.sessionNotes
+            selection = cached.selection
+            if result.requiresFullRefresh { refreshSelected() }
+        }
+    }
+
+    private func patchedSnapshot(_ snapshot: RepositorySnapshot, with result: CleanupExecutionResult) -> RepositorySnapshot {
+        guard !result.removedWorktreePaths.isEmpty || !result.deletedLocalBranches.isEmpty else { return snapshot }
+        let removedPaths = Set(result.removedWorktreePaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        let deletedBranches = Set(result.deletedLocalBranches)
+        let branches = snapshot.branches.compactMap { branch -> BranchInfo? in
+            guard !deletedBranches.contains(branch.name) else { return nil }
+            let worktrees = branch.worktrees.filter { !removedPaths.contains(URL(fileURLWithPath: $0.path).standardizedFileURL.path) }
+            guard worktrees.count != branch.worktrees.count else { return branch }
+            return BranchInfo(id: branch.id, name: branch.name, sha: branch.sha, upstream: branch.upstream, ahead: branch.ahead, behind: branch.behind, isMerged: branch.isMerged, remoteGone: branch.remoteGone, lastCommitAt: branch.lastCommitAt, isDefaultBranch: branch.isDefaultBranch, isDetachedGroup: branch.isDetachedGroup, defaultAhead: branch.defaultAhead, defaultBehind: branch.defaultBehind, worktrees: worktrees, github: branch.github, mergeEvidence: branch.mergeEvidence)
+        }
+        return RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: branches, refreshedAt: snapshot.refreshedAt)
+    }
+
+    private func normalizedSelection(_ selection: RepositorySelection?, from oldSnapshot: RepositorySnapshot, after result: CleanupExecutionResult, in newSnapshot: RepositorySnapshot) -> RepositorySelection? {
+        if case .worktree(let id) = selection,
+           let oldBranch = oldSnapshot.branches.first(where: { $0.worktrees.contains { $0.id == id } }),
+           let oldWorktree = oldBranch.worktrees.first(where: { $0.id == id }),
+           result.removedWorktreePaths.contains(URL(fileURLWithPath: oldWorktree.path).standardizedFileURL.path),
+           newSnapshot.branches.contains(where: { $0.id == oldBranch.id }) {
+            return .branch(oldBranch.id)
+        }
+        return normalizedSelection(selection, in: newSnapshot)
     }
 
     func cancelCleanupPreview() {
