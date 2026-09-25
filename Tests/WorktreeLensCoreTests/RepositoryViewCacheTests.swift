@@ -274,6 +274,38 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertEqual(scanner.sessionScans, 1)
     }
 
+    func testRemovingLastDetachedWorktreeRemovesEmptyGroupFromSnapshotAndCache() async throws {
+        let path = "/tmp/cleanup-detached-A"
+        let detachedPath = "\(path)/detached-wt"
+        let worktree = WorktreeInfo(id: "detached-wt", path: detachedPath, branch: nil, head: "detached-sha", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)
+        let detachedGroup = BranchInfo(id: "detached-group", name: "Detached worktrees", sha: "detached-sha", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, isDetachedGroup: true, worktrees: [worktree])
+        let a = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: path, defaultBranch: "main", branches: [detachedGroup]), sessionNotes: [])
+        let b = localResult(path: "/tmp/cleanup-detached-B", branch: "other")
+        let scanner = CountingScanner(results: [path: [a], b.snapshot.path: [b]])
+        let result = CleanupExecutionResult(completedTargetIDs: [detachedPath], removedWorktreePaths: [detachedPath])
+        let model = makeModel(paths: [path, b.snapshot.path], scanner: scanner, cleanupExecutor: { _ in result })
+
+        model.selectRepository(path: path)
+        await waitForRefresh(model)
+        model.selectWorktree(id: "detached-wt")
+        let before = scanner.counts(for: path)
+        let preview = CleanupPreview(operation: .removeWorktree, repositoryPath: path, items: [])
+        model.cleanupPreview = preview
+        model.executeCleanup(preview)
+        await waitForCleanup(model)
+
+        XCTAssertEqual(model.snapshot?.branches, [])
+        XCTAssertNil(model.selection)
+        model.selectRepository(path: b.snapshot.path)
+        await waitForRefresh(model)
+        model.selectRepository(path: path)
+        XCTAssertEqual(model.snapshot?.branches, [])
+        XCTAssertNil(model.selection)
+        XCTAssertEqual(scanner.counts(for: path).git, before.git)
+        XCTAssertEqual(scanner.counts(for: path).bulk, before.bulk)
+        XCTAssertEqual(scanner.sessionScans, 2)
+    }
+
     func testGroupedCleanupPatchesOnlySuccessfulMutationsIncludingPartialFailure() async throws {
         let a = localResult(path: "/tmp/cleanup-partial-A", branches: ["first", "second"], worktrees: ["first": "first-wt", "second": "second-wt"])
         let scanner = CountingScanner(results: [a.snapshot.path: [a]])
@@ -325,22 +357,31 @@ final class RepositoryViewCacheTests: XCTestCase {
 
     func testCleanupInvalidatesBlockedRefreshBeforePublishingPatch() async throws {
         let blocked = expectation(description: "refresh bulk blocked")
+        let cleanupStarted = expectation(description: "cleanup executor started")
+        let releaseCleanup = DispatchSemaphore(value: 0)
         let initial = localResult(path: "/tmp/cleanup-refresh-A", branches: ["chosen", "obsolete"])
-        let refreshing = localResult(path: initial.snapshot.path, branches: ["obsolete", "chosen"])
+        let refreshing = localResult(path: initial.snapshot.path, branches: ["transient", "obsolete", "chosen"])
+        let other = localResult(path: "/tmp/cleanup-refresh-B", branch: "other")
         let scanner = CountingScanner(
-            results: [initial.snapshot.path: [initial, refreshing]],
+            results: [initial.snapshot.path: [initial, refreshing], other.snapshot.path: [other]],
             blockedBulkCall: (path: initial.snapshot.path, call: 2, expectation: blocked)
         )
         let result = CleanupExecutionResult(completedTargetIDs: ["obsolete"], deletedLocalBranches: ["obsolete"])
-        let model = makeModel(paths: [initial.snapshot.path], scanner: scanner, cleanupExecutor: { _ in result })
+        let model = makeModel(paths: [initial.snapshot.path, other.snapshot.path], scanner: scanner, cleanupExecutor: { _ in
+            cleanupStarted.fulfill()
+            releaseCleanup.wait()
+            return result
+        })
         model.selectRepository(path: initial.snapshot.path)
         await waitForRefresh(model)
-        model.refreshSelected()
-        await fulfillment(of: [blocked], timeout: 2)
 
         let preview = CleanupPreview(operation: .deleteBranch, repositoryPath: initial.snapshot.path, items: [])
         model.cleanupPreview = preview
         model.executeCleanup(preview)
+        await fulfillment(of: [cleanupStarted], timeout: 2)
+        model.refreshSelected()
+        await fulfillment(of: [blocked], timeout: 2)
+        releaseCleanup.signal()
         await waitForCleanup(model)
         scanner.releaseBlockedBulkRefresh()
         await Task.yield()
@@ -349,6 +390,37 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertFalse(model.isLoading)
         XCTAssertEqual(scanner.counts(for: initial.snapshot.path).git, 2)
         XCTAssertEqual(scanner.counts(for: initial.snapshot.path).bulk, 2)
+        model.selectRepository(path: other.snapshot.path)
+        await waitForRefresh(model)
+        model.selectRepository(path: initial.snapshot.path)
+        XCTAssertEqual(model.snapshot?.branches.map(\.id), ["chosen"])
+        XCTAssertEqual(scanner.counts(for: initial.snapshot.path).git, 2)
+    }
+
+    func testCleanupDuringInitialGitHubEnrichmentFallsBackWithoutCachingPartialSnapshot() async throws {
+        let blocked = expectation(description: "initial GitHub enrichment blocked")
+        let initialPartial = localResult(path: "/tmp/cleanup-first-load-A", branches: ["partial-only", "obsolete"])
+        let afterCleanup = localResult(path: initialPartial.snapshot.path, branches: ["keep"])
+        let scanner = CountingScanner(
+            results: [initialPartial.snapshot.path: [initialPartial, afterCleanup]],
+            blockedBulkCall: (path: initialPartial.snapshot.path, call: 1, expectation: blocked)
+        )
+        let result = CleanupExecutionResult(completedTargetIDs: ["obsolete"], deletedLocalBranches: ["obsolete"])
+        let model = makeModel(paths: [initialPartial.snapshot.path], scanner: scanner, cleanupExecutor: { _ in result })
+        model.selectRepository(path: initialPartial.snapshot.path)
+        await fulfillment(of: [blocked], timeout: 2)
+
+        let preview = CleanupPreview(operation: .deleteBranch, repositoryPath: initialPartial.snapshot.path, items: [])
+        model.cleanupPreview = preview
+        model.executeCleanup(preview)
+        await waitForRefresh(model, branchID: "keep")
+        scanner.releaseBlockedBulkRefresh()
+        await Task.yield()
+
+        XCTAssertEqual(model.snapshot?.branches.map(\.id), ["keep"])
+        XCTAssertEqual(scanner.counts(for: initialPartial.snapshot.path).git, 2)
+        XCTAssertEqual(scanner.counts(for: initialPartial.snapshot.path).bulk, 2)
+        XCTAssertEqual(scanner.sessionScans, 2)
     }
 
     func testCleanupInvalidatesLateGitHubDetailForPatchedSnapshot() async throws {

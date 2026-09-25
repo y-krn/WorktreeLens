@@ -68,8 +68,10 @@ final class ApplicationModel: ObservableObject {
     private var viewCache: [String: RepositoryViewCache] = [:]
     private var refreshToken = UUID()
     private var refreshTask: Task<Void, Never>?
+    private var refreshTaskPath: String?
     private var githubDetailToken = UUID()
     private var githubDetailTask: Task<Void, Never>?
+    private var githubDetailTaskPath: String?
     private var cleanupPreviewToken = UUID()
 
     init(loadRepositories: Bool = true, repositoryStore: RepositoryStore = RepositoryStore(), git: GitService = GitService(), sessions: SessionService = SessionService(), github: GitHubService = GitHubService(), detailLoader: (any GitHubDetailLoading)? = nil, scanner injectedScanner: (any RepositoryScanning)? = nil, cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil) {
@@ -137,6 +139,7 @@ final class ApplicationModel: ObservableObject {
         githubDetailToken = UUID()
         let token = UUID()
         refreshToken = token
+        refreshTaskPath = path
         isLoading = true
         scanPhase = "Scanning sessions…"
         canCancelGitHub = false
@@ -248,6 +251,7 @@ final class ApplicationModel: ObservableObject {
         githubDetailTask?.cancel()
         let token = UUID()
         githubDetailToken = token
+        githubDetailTaskPath = path
         let refreshToken = self.refreshToken
         let detailLoader = self.detailLoader
         githubDetailTask = Task.detached(priority: .utility) {
@@ -275,7 +279,24 @@ final class ApplicationModel: ObservableObject {
         refreshToken = UUID()
         githubDetailToken = UUID()
         refreshTask = nil
+        refreshTaskPath = nil
         githubDetailTask = nil
+        githubDetailTaskPath = nil
+    }
+
+    private func invalidateRepositoryTasks(for path: String) {
+        if refreshTaskPath == path {
+            refreshTask?.cancel()
+            refreshToken = UUID()
+            refreshTask = nil
+            refreshTaskPath = nil
+        }
+        if githubDetailTaskPath == path {
+            githubDetailTask?.cancel()
+            githubDetailToken = UUID()
+            githubDetailTask = nil
+            githubDetailTaskPath = nil
+        }
     }
 
     private func clearVisibleRepository() {
@@ -360,11 +381,21 @@ final class ApplicationModel: ObservableObject {
     func executeCleanup(_ preview: CleanupPreview) {
         guard cleanupExecutionState == .idle, !isCleanupPreviewLoading, cleanupPreview?.id == preview.id else { return }
         let repositoryPath = URL(fileURLWithPath: preview.repositoryPath).standardizedFileURL.path
-        invalidateRepositoryTasks()
-        isLoading = false
-        scanPhase = nil
-        canCancelGitHub = false
-        if selectedPath == repositoryPath { saveCurrentView() }
+        invalidateRepositoryTasks(for: repositoryPath)
+        if selectedPath == repositoryPath {
+            if let cached = viewCache[repositoryPath], cached.snapshot.path == repositoryPath {
+                snapshot = cached.snapshot
+                sessionNotes = cached.sessionNotes
+                selection = normalizedSelection(cached.selection, in: cached.snapshot)
+                isLoading = false
+                scanPhase = nil
+                canCancelGitHub = false
+            } else {
+                isLoading = true
+                scanPhase = "Cleaning up…"
+                canCancelGitHub = false
+            }
+        }
         cleanupExecutionState = .running
         let cleanup = self.cleanup
         let cleanupExecutor = self.cleanupExecutor
@@ -378,31 +409,42 @@ final class ApplicationModel: ObservableObject {
     }
 
     func publishCleanupResult(_ result: CleanupExecutionResult, repositoryPath: String) {
+        invalidateRepositoryTasks(for: repositoryPath)
         cleanupExecutionState = .completed(result.count)
         statusMessage = result.count == 0 ? "Completed 0 target(s) — no changes after final guard" : "Completed \(result.count) target(s)"
         if result.requiresFullRefresh, selectedPath != repositoryPath {
             viewCache.removeValue(forKey: repositoryPath)
             return
         }
-        guard var cached = viewCache[repositoryPath], cached.snapshot.path == repositoryPath else {
-            if selectedPath == repositoryPath, let current = snapshot, current.path == repositoryPath {
-                let patched = patchedSnapshot(current, with: result)
-                selection = normalizedSelection(selection, from: current, after: result, in: patched)
-                snapshot = patched
-                saveCurrentView()
+        if result.requiresFullRefresh {
+            viewCache.removeValue(forKey: repositoryPath)
+            if selectedPath == repositoryPath {
+                isLoading = true
+                scanPhase = nil
+                refreshSelected()
             }
-            if result.requiresFullRefresh, selectedPath == repositoryPath { refreshSelected() }
+            return
+        }
+        guard var cached = viewCache[repositoryPath], cached.snapshot.path == repositoryPath else {
+            if selectedPath == repositoryPath {
+                isLoading = true
+                scanPhase = nil
+                refreshSelected()
+            }
             return
         }
         let original = cached.snapshot
         cached.snapshot = patchedSnapshot(original, with: result)
-        cached.selection = normalizedSelection(cached.selection, from: original, after: result, in: cached.snapshot)
+        let priorSelection = selectedPath == repositoryPath ? selection : cached.selection
+        cached.selection = normalizedSelection(priorSelection, from: original, after: result, in: cached.snapshot)
         viewCache[repositoryPath] = cached
         if selectedPath == repositoryPath {
             snapshot = cached.snapshot
             sessionNotes = cached.sessionNotes
             selection = cached.selection
-            if result.requiresFullRefresh { refreshSelected() }
+            isLoading = false
+            scanPhase = nil
+            canCancelGitHub = false
         }
     }
 
@@ -414,6 +456,7 @@ final class ApplicationModel: ObservableObject {
             guard !deletedBranches.contains(branch.name) else { return nil }
             let worktrees = branch.worktrees.filter { !removedPaths.contains(URL(fileURLWithPath: $0.path).standardizedFileURL.path) }
             guard worktrees.count != branch.worktrees.count else { return branch }
+            if branch.isDetachedGroup && worktrees.isEmpty { return nil }
             return BranchInfo(id: branch.id, name: branch.name, sha: branch.sha, upstream: branch.upstream, ahead: branch.ahead, behind: branch.behind, isMerged: branch.isMerged, remoteGone: branch.remoteGone, lastCommitAt: branch.lastCommitAt, isDefaultBranch: branch.isDefaultBranch, isDetachedGroup: branch.isDetachedGroup, defaultAhead: branch.defaultAhead, defaultBehind: branch.defaultBehind, worktrees: worktrees, github: branch.github, mergeEvidence: branch.mergeEvidence)
         }
         return RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: branches, refreshedAt: snapshot.refreshedAt)
