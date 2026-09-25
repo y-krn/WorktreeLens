@@ -30,11 +30,12 @@ public struct SessionDiscoveryMetricSnapshot: Equatable, Sendable {
     public let chatGPTMetadataScans: Int
     public let chatGPTDirectoryEnumerations: Int
     public let chatGPTFileReads: Int
+    public let claudeFileReads: Int
     public let fileAttributeChecks: Int
     public let providerFingerprintCalls: Int
 
     public var totalOperations: Int {
-        processScans + codexSQLiteQueries + chatGPTMetadataScans + chatGPTDirectoryEnumerations + chatGPTFileReads + fileAttributeChecks + providerFingerprintCalls
+        processScans + codexSQLiteQueries + chatGPTMetadataScans + chatGPTDirectoryEnumerations + chatGPTFileReads + claudeFileReads + fileAttributeChecks + providerFingerprintCalls
     }
 }
 
@@ -45,6 +46,7 @@ public final class SessionDiscoveryMetrics: @unchecked Sendable {
     private var chatGPTMetadataScans = 0
     private var chatGPTDirectoryEnumerations = 0
     private var chatGPTFileReads = 0
+    private var claudeFileReads = 0
     private var fileAttributeChecks = 0
     private var providerFingerprintCalls = 0
 
@@ -52,12 +54,12 @@ public final class SessionDiscoveryMetrics: @unchecked Sendable {
 
     public func snapshot() -> SessionDiscoveryMetricSnapshot {
         lock.lock(); defer { lock.unlock() }
-        return SessionDiscoveryMetricSnapshot(processScans: processScans, codexSQLiteQueries: codexSQLiteQueries, chatGPTMetadataScans: chatGPTMetadataScans, chatGPTDirectoryEnumerations: chatGPTDirectoryEnumerations, chatGPTFileReads: chatGPTFileReads, fileAttributeChecks: fileAttributeChecks, providerFingerprintCalls: providerFingerprintCalls)
+        return SessionDiscoveryMetricSnapshot(processScans: processScans, codexSQLiteQueries: codexSQLiteQueries, chatGPTMetadataScans: chatGPTMetadataScans, chatGPTDirectoryEnumerations: chatGPTDirectoryEnumerations, chatGPTFileReads: chatGPTFileReads, claudeFileReads: claudeFileReads, fileAttributeChecks: fileAttributeChecks, providerFingerprintCalls: providerFingerprintCalls)
     }
 
     public func reset() {
         lock.lock(); defer { lock.unlock() }
-        processScans = 0; codexSQLiteQueries = 0; chatGPTMetadataScans = 0; chatGPTDirectoryEnumerations = 0; chatGPTFileReads = 0; fileAttributeChecks = 0; providerFingerprintCalls = 0
+        processScans = 0; codexSQLiteQueries = 0; chatGPTMetadataScans = 0; chatGPTDirectoryEnumerations = 0; chatGPTFileReads = 0; claudeFileReads = 0; fileAttributeChecks = 0; providerFingerprintCalls = 0
     }
 
     fileprivate func recordProcessScan() { lock.lock(); processScans += 1; lock.unlock() }
@@ -65,6 +67,7 @@ public final class SessionDiscoveryMetrics: @unchecked Sendable {
     fileprivate func recordMetadataScan() { lock.lock(); chatGPTMetadataScans += 1; lock.unlock() }
     fileprivate func recordDirectoryEnumeration() { lock.lock(); chatGPTDirectoryEnumerations += 1; lock.unlock() }
     fileprivate func recordFileRead() { lock.lock(); chatGPTFileReads += 1; lock.unlock() }
+    fileprivate func recordClaudeFileRead() { lock.lock(); claudeFileReads += 1; lock.unlock() }
     fileprivate func recordAttributeCheck() { lock.lock(); fileAttributeChecks += 1; lock.unlock() }
     fileprivate func recordProviderFingerprint() { lock.lock(); providerFingerprintCalls += 1; lock.unlock() }
 }
@@ -117,6 +120,49 @@ public final class SessionSourceFingerprintCache: @unchecked Sendable {
         }
         return fingerprints.sorted().joined(separator: "\n")
     }
+
+    fileprivate func claudeFingerprint(history: URL, projects: URL, metrics: SessionDiscoveryMetrics) -> String? {
+        var entries: [String] = []
+        guard appendFingerprint(history, to: &entries, metrics: metrics) else { return nil }
+        metrics.recordAttributeCheck()
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: projects.path)
+            guard attrs[.type] as? FileAttributeType == .typeDirectory else { return nil }
+            entries.append("dir:\(projects.path):\(attrs[.modificationDate] as? Date ?? .distantPast):\(attrs[.systemFileNumber] ?? "")")
+        } catch where isMissingFileError(error) {
+            entries.append("missing:\(projects.path)")
+            return entries.joined(separator: "\n")
+        } catch { return nil }
+        guard let projectDirs = try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
+        for project in projectDirs.sorted(by: { $0.path < $1.path }).prefix(128) {
+            metrics.recordAttributeCheck()
+            let attrs: [FileAttributeKey: Any]
+            do { attrs = try FileManager.default.attributesOfItem(atPath: project.path) }
+            catch where isMissingFileError(error) { continue }
+            catch { return nil }
+            guard attrs[.type] as? FileAttributeType == .typeDirectory else { continue }
+            entries.append("dir:\(project.path):\(attrs[.modificationDate] as? Date ?? .distantPast):\(attrs[.systemFileNumber] ?? "")")
+            guard let files = try? FileManager.default.contentsOfDirectory(at: project, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return nil }
+            for file in files.filter({ $0.pathExtension == "jsonl" }).sorted(by: { $0.path < $1.path }).prefix(256 - min(entries.count, 255)) {
+                guard appendFingerprint(file, to: &entries, metrics: metrics) else { return nil }
+            }
+            if entries.count >= 257 { break }
+        }
+        return entries.sorted().joined(separator: "\n")
+    }
+
+    private func appendFingerprint(_ url: URL, to entries: inout [String], metrics: SessionDiscoveryMetrics) -> Bool {
+        metrics.recordAttributeCheck()
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard let size = attrs[.size] as? NSNumber, let modified = attrs[.modificationDate] as? Date else { return false }
+            entries.append("file:\(url.path):\(size):\(modified.timeIntervalSince1970):\(attrs[.systemFileNumber] ?? "")")
+            return true
+        } catch where isMissingFileError(error) {
+            entries.append("missing:\(url.path)")
+            return true
+        } catch { return false }
+    }
 }
 
 public struct ProcessActivitySnapshot: Sendable {
@@ -158,19 +204,37 @@ public struct ProcessActivityProbe: SessionActivityProbing {
         guard snapshot.isAvailable else {
             return (.unknown, "process scan unavailable")
         }
-        if snapshot.processes.contains(where: { containsExactToken(sessionID, in: $0) }) {
+        let hasSessionEvidence = snapshot.processes.contains { line in
+            provider == .claude ? containsExactArgument(sessionID, in: line) : containsSessionID(sessionID, in: line)
+        }
+        if hasSessionEvidence {
             return (.active, "running process contains exact session ID")
         }
-        let appName = provider == .codex ? "Codex" : "ChatGPT"
+        let appName: String
+        switch provider {
+        case .codex: appName = "Codex"
+        case .chatGPT: appName = "ChatGPT"
+        case .claude: appName = "Claude"
+        }
         let appRunning = snapshot.processes.contains { line in
             let lower = line.lowercased()
+            if provider == .claude {
+                return lower.contains("/claude") || lower.contains("claude-code") || lower.contains("claude desktop")
+            }
             return lower.contains("/\(appName.lowercased()).app/") || lower.contains("\(appName.lowercased()) desktop")
         }
         return appRunning ? (.unknown, "provider process running; session ID not exposed") : (.inactive, "provider process not running")
     }
 
-    private func containsExactToken(_ token: String, in line: String) -> Bool {
+    private func containsSessionID(_ token: String, in line: String) -> Bool {
         line.range(of: token, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    }
+
+    private func containsExactArgument(_ token: String, in line: String) -> Bool {
+        line.split(whereSeparator: \.isWhitespace).contains { argument in
+            let value = argument.trimmingCharacters(in: CharacterSet(charactersIn: "\"'(),[]"))
+            return value == token || value.split(separator: "=", maxSplits: 1).last.map(String.init) == token
+        }
     }
 }
 
@@ -474,6 +538,122 @@ private struct LegacyJSONAdapter {
     }
 }
 
+public struct ClaudeSessionProvider: SessionProvider {
+    public let kind: SessionProviderKind = .claude
+    private let home: String
+    private let activityProbe: any SessionActivityProbing
+    private let metrics: SessionDiscoveryMetrics
+
+    public init(home: String = NSHomeDirectory(), activityProbe: any SessionActivityProbing = ProcessActivityProbe(), metrics: SessionDiscoveryMetrics = SessionDiscoveryMetrics()) {
+        self.home = home
+        self.activityProbe = activityProbe
+        self.metrics = metrics
+    }
+
+    public func discover() -> SessionDiscoveryResult { discover(processSnapshot: activityProbe.snapshot()) }
+
+    public func discover(processSnapshot: ProcessActivitySnapshot) -> SessionDiscoveryResult {
+        let history = historyURL
+        var historyIDs = Set<String>()
+        var records: [String: ClaudeMetadata] = [:]
+        var notes: [String] = []
+        if let data = boundedData(at: history, limit: 4_000_000, fromEnd: true) {
+            metrics.recordClaudeFileRead()
+            for row in jsonLines(data) {
+                guard let id = row["sessionId"] as? String, !id.isEmpty else { continue }
+                historyIDs.insert(id)
+                guard let cwd = absolutePath(row["project"] as? String) else { continue }
+                let metadata = ClaudeMetadata(id: id, title: (row["display"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled session", updatedAt: claudeDate(row["timestamp"]), cwd: cwd, branch: nil, source: "~/.claude/history.jsonl explicit project/sessionId")
+                if records[id] == nil || (records[id]?.updatedAt ?? .distantPast) <= (metadata.updatedAt ?? .distantPast) { records[id] = metadata }
+            }
+            notes.append("Claude: history.jsonl bounded read-only scan")
+        } else {
+            notes.append("Claude: history.jsonl missing/unreadable")
+        }
+
+        let projects = projectsURL
+        var inspected = 0
+        var bytesRead = 0
+        if let projectDirs = try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            for project in projectDirs.sorted(by: { $0.path < $1.path }).prefix(128) {
+                guard let files = try? FileManager.default.contentsOfDirectory(at: project, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+                for file in files.filter({ $0.pathExtension == "jsonl" }).sorted(by: { $0.path < $1.path }) {
+                    guard inspected < 64, bytesRead < 2_000_000 else { break }
+                    inspected += 1
+                    let limit = min(128_000, 2_000_000 - bytesRead)
+                    guard let data = boundedData(at: file, limit: limit, fromEnd: false) else { continue }
+                    bytesRead += data.count
+                    metrics.recordClaudeFileRead()
+                    for row in jsonLines(data) {
+                        guard let id = row["sessionId"] as? String, !id.isEmpty, !historyIDs.contains(id), records[id] == nil,
+                              let cwd = absolutePath(row["cwd"] as? String) else { continue }
+                        records[id] = ClaudeMetadata(id: id, title: (row["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled session", updatedAt: claudeDate(row["timestamp"]), cwd: cwd, branch: row["gitBranch"] as? String, source: "~/.claude/projects/*.jsonl explicit cwd/sessionId")
+                    }
+                }
+                if inspected >= 64 || bytesRead >= 2_000_000 { break }
+            }
+        }
+        notes.append("Claude: projects fallback bounded; files=\(inspected), bytes=\(bytesRead), history-missing sessions only")
+
+        let sessions = records.values.map { metadata -> SessionRecord in
+            let state = activityProbe.activity(for: metadata.id, provider: .claude, snapshot: processSnapshot)
+            var evidence = metadata.source
+            if let branch = metadata.branch, !branch.isEmpty { evidence += "; explicit gitBranch=\(branch)" }
+            return SessionRecord(id: "claude-\(metadata.id)", provider: .claude, title: metadata.title, updatedAt: metadata.updatedAt, cwd: metadata.cwd, branch: metadata.branch, url: nil, activity: state.0, evidence: evidence + "; " + state.1)
+        }.sorted { $0.updatedAt ?? .distantPast > $1.updatedAt ?? .distantPast }
+        return SessionDiscoveryResult(sessions: sessions, notes: notes + ["Claude: no inferred cwd/branch/time association; no URL scheme"])
+    }
+
+    public func sourceFingerprint() -> String? {
+        SessionSourceFingerprintCache().claudeFingerprint(history: historyURL, projects: projectsURL, metrics: metrics)
+    }
+
+    public func sourceFingerprint(using cache: SessionSourceFingerprintCache, metrics: SessionDiscoveryMetrics) -> String? {
+        cache.claudeFingerprint(history: historyURL, projects: projectsURL, metrics: metrics)
+    }
+
+    private var historyURL: URL { URL(fileURLWithPath: home).appendingPathComponent(".claude/history.jsonl") }
+    private var projectsURL: URL { URL(fileURLWithPath: home).appendingPathComponent(".claude/projects") }
+
+    private func boundedData(at url: URL, limit: Int, fromEnd: Bool) -> Data? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        if fromEnd, let size = try? handle.seekToEnd() {
+            try? handle.seek(toOffset: size > UInt64(limit) ? size - UInt64(limit) : 0)
+        }
+        return try? handle.read(upToCount: limit)
+    }
+
+    private func jsonLines(_ data: Data) -> [[String: Any]] {
+        data.split(separator: 10).compactMap { line in
+            (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any]
+        }
+    }
+
+    private func absolutePath(_ value: String?) -> String? {
+        guard let value, value.first == "/" else { return nil }
+        return value
+    }
+
+    private func claudeDate(_ value: Any?) -> Date? {
+        if let number = value as? NSNumber { return Date(timeIntervalSince1970: number.doubleValue > 10_000_000_000 ? number.doubleValue / 1000 : number.doubleValue) }
+        if let string = value as? String {
+            if let number = Double(string) { return Date(timeIntervalSince1970: number > 10_000_000_000 ? number / 1000 : number) }
+            return ISO8601DateFormatter().date(from: string)
+        }
+        return nil
+    }
+}
+
+private struct ClaudeMetadata {
+    let id: String
+    let title: String
+    let updatedAt: Date?
+    let cwd: String
+    let branch: String?
+    let source: String
+}
+
 public final class SessionService: @unchecked Sendable, SessionDiscovering {
     private let providers: [any SessionProvider]
     private let processProbe: ProcessActivityProbe
@@ -483,7 +663,7 @@ public final class SessionService: @unchecked Sendable, SessionDiscovering {
         self.metrics = metrics
         let probe = ProcessActivityProbe(runner: runner, metrics: metrics)
         processProbe = probe
-        providers = [CodexSessionProvider(home: home, runner: runner, activityProbe: probe, metrics: metrics), ChatGPTSessionProvider(home: home, activityProbe: probe, metrics: metrics)]
+        providers = [CodexSessionProvider(home: home, runner: runner, activityProbe: probe, metrics: metrics), ChatGPTSessionProvider(home: home, activityProbe: probe, metrics: metrics), ClaudeSessionProvider(home: home, activityProbe: probe, metrics: metrics)]
     }
 
     public func discover() -> SessionDiscoveryResult {
@@ -501,7 +681,7 @@ public final class SessionService: @unchecked Sendable, SessionDiscovering {
     }
 
     private func rawThreadID(_ session: SessionRecord) -> String {
-        let prefix = session.provider == .codex ? "codex-" : "chatgpt-"
+        let prefix = providerPrefix(session.provider)
         return session.id.hasPrefix(prefix) ? String(session.id.dropFirst(prefix.count)) : session.id
     }
 }
@@ -568,7 +748,7 @@ public final class SessionCleanupSafetyCache: SessionCleanupSafetyChecking, @unc
     }
 
     private func rawID(_ session: SessionRecord) -> String {
-        let prefix = session.provider == .codex ? "codex-" : "chatgpt-"
+        let prefix = providerPrefix(session.provider)
         return session.id.hasPrefix(prefix) ? String(session.id.dropFirst(prefix.count)) : session.id
     }
 
@@ -583,6 +763,14 @@ public final class SessionCleanupSafetyCache: SessionCleanupSafetyChecking, @unc
 
     private func withActivity(_ session: SessionRecord, _ activity: SessionActivity, _ evidence: String) -> SessionRecord {
         SessionRecord(id: session.id, provider: session.provider, title: session.title, updatedAt: session.updatedAt, cwd: session.cwd, branch: session.branch, url: session.url, activity: activity, evidence: metadataEvidence(session) + "; " + evidence)
+    }
+}
+
+private func providerPrefix(_ provider: SessionProviderKind) -> String {
+    switch provider {
+    case .codex: return "codex-"
+    case .chatGPT: return "chatgpt-"
+    case .claude: return "claude-"
     }
 }
 

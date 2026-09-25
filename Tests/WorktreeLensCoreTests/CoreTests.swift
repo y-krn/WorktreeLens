@@ -391,6 +391,124 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(result.notes.contains { $0.contains("skipped=2") })
     }
 
+    func testClaudeHistoryUsesExplicitProjectAndDeduplicatesSessionRows() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-history-\(UUID().uuidString)")
+        let source = home.appendingPathComponent(".claude/history.jsonl")
+        let worktree = home.appendingPathComponent("repos/exact-worktree")
+        try FileManager.default.createDirectory(at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: worktree, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let rows = [
+            "{\"sessionId\":\"claude-session-1\",\"project\":\"\(worktree.path)\",\"display\":\"First title\",\"timestamp\":1700000000}",
+            "{\"sessionId\":\"claude-session-1\",\"project\":\"\(worktree.path)\",\"display\":\"Latest title\",\"timestamp\":1700000001}"
+        ].joined(separator: "\n")
+        try Data((rows + "\n").utf8).write(to: source)
+
+        let session = try XCTUnwrap(ClaudeSessionProvider(home: home.path, activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))).discover().sessions.first)
+
+        XCTAssertEqual(session.id, "claude-claude-session-1")
+        XCTAssertEqual(session.provider, .claude)
+        XCTAssertEqual(session.title, "Latest title")
+        XCTAssertEqual(session.cwd, worktree.path)
+        XCTAssertNil(session.url)
+        XCTAssertEqual(session.activity, .inactive)
+    }
+
+    func testClaudeProjectsFallbackReadsOnlySessionsAbsentFromHistory() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-fallback-\(UUID().uuidString)")
+        let project = home.appendingPathComponent(".claude/projects/slug")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let transcript = "{\"sessionId\":\"fallback-id\",\"cwd\":\"/tmp/explicit-worktree\",\"gitBranch\":\"feature\",\"timestamp\":1700000010,\"title\":\"Transcript title\"}\n"
+        try Data(transcript.utf8).write(to: project.appendingPathComponent("fallback-id.jsonl"))
+
+        let result = ClaudeSessionProvider(home: home.path, activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))).discover()
+
+        XCTAssertEqual(result.sessions.map(\.id), ["claude-fallback-id"])
+        XCTAssertEqual(result.sessions.first?.cwd, "/tmp/explicit-worktree")
+        XCTAssertEqual(result.sessions.first?.branch, "feature")
+        XCTAssertEqual(result.sessions.first?.title, "Transcript title")
+    }
+
+    func testClaudeMalformedAndMissingSourcesAreSafe() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-malformed-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: home) }
+        let history = home.appendingPathComponent(".claude/history.jsonl")
+        try FileManager.default.createDirectory(at: history.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{bad json}\n{\"sessionId\":\"missing-cwd\",\"display\":\"No project\"}\n".utf8).write(to: history)
+        let provider = ClaudeSessionProvider(home: home.path, activityProbe: ProcessActivityProbe(runner: StaticRunner(output: "")))
+
+        XCTAssertTrue(provider.discover().sessions.isEmpty)
+        XCTAssertNotNil(provider.sourceFingerprint())
+        try FileManager.default.removeItem(at: history)
+        XCTAssertTrue(provider.discover().sessions.isEmpty)
+        XCTAssertNotNil(provider.sourceFingerprint())
+    }
+
+    func testClaudeActivityIsFailClosedAndInactiveSessionCanPassCleanupDecision() throws {
+        let id = "claude-active-id"
+        let activeProbe = ProcessActivityProbe(runner: StaticRunner(output: "123 /usr/local/bin/claude --resume \(id)\n"))
+        let unknownProbe = ProcessActivityProbe(runner: StaticRunner(output: "123 /opt/homebrew/bin/claude\n"))
+        let inactiveProbe = ProcessActivityProbe(runner: StaticRunner(output: "123 /usr/bin/other-process\n"))
+        let fixtureHome = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-activity-\(UUID().uuidString)")
+        let history = fixtureHome.appendingPathComponent(".claude/history.jsonl")
+        try FileManager.default.createDirectory(at: history.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fixtureHome) }
+        try Data("{\"sessionId\":\"\(id)\",\"project\":\"/tmp/wt\"}\n".utf8).write(to: history)
+        let activeSession = try XCTUnwrap(ClaudeSessionProvider(home: fixtureHome.path, activityProbe: activeProbe).discover().sessions.first)
+        let unknownSession = try XCTUnwrap(ClaudeSessionProvider(home: fixtureHome.path, activityProbe: unknownProbe).discover().sessions.first)
+        let inactiveSession = try XCTUnwrap(ClaudeSessionProvider(home: fixtureHome.path, activityProbe: inactiveProbe).discover().sessions.first)
+        XCTAssertEqual(activeSession.activity, .active)
+        XCTAssertEqual(unknownSession.activity, .unknown)
+        XCTAssertEqual(inactiveSession.activity, .inactive)
+
+        func decision(_ session: SessionRecord) -> CleanupDecision {
+            let worktree = WorktreeInfo(id: "/tmp/wt", path: "/tmp/wt", branch: "feature", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: Date(), sessions: [session])
+            let branch = BranchInfo(id: "feature", name: "feature", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: false, lastCommitAt: Date(), worktrees: [worktree])
+            return CleanupService().decide(worktree: worktree, branch: branch)
+        }
+        XCTAssertEqual(decision(activeSession).reason, .activeSession)
+        XCTAssertEqual(decision(unknownSession).reason, .unknownSessionActivity)
+        XCTAssertTrue(decision(inactiveSession).allowed)
+    }
+
+    func testClaudeSourceMutationInvalidatesOnlyClaudeMetadataCache() throws {
+        final class Counter: @unchecked Sendable { var processScans = 0; var sqlite = 0 }
+        struct Runner: ProcessRunning {
+            let counter: Counter
+            func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+                if executable == "/bin/ps" { counter.processScans += 1; return ProcessResult(status: 0, stdout: "123 /usr/bin/other-process\n") }
+                if executable == "/usr/bin/sqlite3" { counter.sqlite += 1; return ProcessResult(status: 0, stdout: "") }
+                return ProcessResult(status: 0, stdout: "")
+            }
+        }
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-cache-\(UUID().uuidString)")
+        let history = home.appendingPathComponent(".claude/history.jsonl")
+        let sqlite = home.appendingPathComponent(".codex/sqlite")
+        try FileManager.default.createDirectory(at: history.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sqlite, withIntermediateDirectories: true)
+        try Data().write(to: sqlite.appendingPathComponent("state_5.sqlite"))
+        try Data().write(to: history)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let counter = Counter()
+        let service = SessionService(home: home.path, runner: Runner(counter: counter))
+        let cache = try XCTUnwrap(service.makeCleanupSafetyCache())
+        XCTAssertEqual(cache.cachedMetadata()?.count, 0)
+        let before = service.metrics.snapshot()
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.count, 0)
+        let unchanged = service.metrics.snapshot()
+        XCTAssertEqual(unchanged.claudeFileReads, before.claudeFileReads, "unchanged Claude source must not be reparsed")
+        XCTAssertEqual(counter.processScans, 1, "one fresh process snapshot is shared across providers")
+        try Data("{\"sessionId\":\"new-claude\",\"project\":\"/tmp/wt\"}\n".utf8).write(to: history)
+
+        XCTAssertEqual(cache.freshSessionsForRemoval()?.map(\.id), ["claude-new-claude"])
+        let after = service.metrics.snapshot()
+        XCTAssertEqual(after.codexSQLiteQueries, before.codexSQLiteQueries)
+        XCTAssertEqual(after.chatGPTMetadataScans, before.chatGPTMetadataScans)
+        XCTAssertGreaterThan(after.claudeFileReads, unchanged.claudeFileReads, "changed Claude source must be reparsed")
+        XCTAssertEqual(counter.processScans, 2, "each removal freshness check uses one shared process snapshot")
+    }
+
     func testLocalProcessRunnerDrainsLargeStdoutAndStderr() throws {
         let result = try LocalProcessRunner().run("/bin/zsh", arguments: ["-c", "i=0; while ((i < 200000)); do print -n x; ((i++)); done & i=0; while ((i < 200000)); do print -nu2 y; ((i++)); done; wait"], currentDirectory: nil)
         XCTAssertTrue(result.succeeded, result.stderr)
