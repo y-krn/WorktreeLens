@@ -644,8 +644,8 @@ final class CoreTests: XCTestCase {
         let secondPreview = cleanup.previewRemoveWorktree(snapshot: snapshot, path: second.path)
         XCTAssertEqual(firstPreview.items[0].expectedSHA, first.head)
         XCTAssertEqual(secondPreview.items[0].expectedSHA, second.head)
-        XCTAssertEqual(cleanup.execute(firstPreview), [first.path])
-        XCTAssertEqual(cleanup.execute(secondPreview), [second.path])
+        XCTAssertEqual(cleanup.execute(firstPreview).removedWorktreePaths, [first.path])
+        XCTAssertEqual(cleanup.execute(secondPreview).removedWorktreePaths, [second.path])
 
         let remaining = try git.snapshot(repositoryPath: repository.path).branches.flatMap(\.worktrees)
         XCTAssertFalse(remaining.contains { $0.path == first.path || $0.path == second.path })
@@ -796,7 +796,10 @@ final class CoreTests: XCTestCase {
         let mergedPreview = cleanup.previewMergedBranches(snapshot: snapshot)
         XCTAssertTrue(mergedPreview.items.contains { $0.target == "merged" && $0.allowed })
         _ = try git(["reset", "--hard", "HEAD~1"])
-        XCTAssertTrue(cleanup.execute(mergedPreview).isEmpty)
+        let result = cleanup.execute(mergedPreview)
+        XCTAssertTrue(result.deletedLocalBranches.isEmpty)
+        XCTAssertTrue(result.removedWorktreePaths.allSatisfy { !FileManager.default.fileExists(atPath: $0) })
+        XCTAssertTrue((try GitService().snapshot(repositoryPath: repository.path)).branches.contains { $0.name == "merged" })
     }
 
     func testSquashMergeEquivalentUsesGitHubVerifiedEvidenceAndExpectedSHADeletion() async throws {
@@ -933,7 +936,7 @@ final class CoreTests: XCTestCase {
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         XCTAssertTrue(preview.items[0].allowed)
         let beforeCleanup = gitRecorder.arguments.count
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(gitRecorder.arguments.count - beforeCleanup, 7, "standalone verified branch deletion process count")
     }
 
@@ -960,7 +963,7 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(group.steps[0].detail?.contains("clean") == true)
         XCTAssertTrue(group.steps[0].detail?.contains("session: none") == true)
         let beforeCleanup = gitRecorder.arguments.count
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(gitRecorder.arguments.count - beforeCleanup, 17, "one-worktree GitHub grouped cleanup process count")
         print("CLEANUP_GIT_SUBPROCESS grouped_github_worktree=\(gitRecorder.arguments.count - beforeCleanup)")
         XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
@@ -994,7 +997,7 @@ final class CoreTests: XCTestCase {
         let group = try XCTUnwrap(preview.groups.first)
         XCTAssertEqual(group.steps.map(\.step), [.removeWorktree, .deleteBranch])
         XCTAssertTrue(group.allowed)
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath.path))
         XCTAssertTrue((try runGit(["-C", fixture.repository.path, "show-ref", "--verify", "refs/remotes/origin/feature"])).contains(fixture.featureSHA))
@@ -1022,7 +1025,7 @@ final class CoreTests: XCTestCase {
         let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path))
 
         let preview = cleanup.previewMergedBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch]))
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath.path))
         XCTAssertTrue((try runGit(["-C", fixture.repository.path, "show-ref", "--verify", "refs/remotes/origin/feature"])).contains(fixture.featureSHA))
@@ -1051,7 +1054,7 @@ final class CoreTests: XCTestCase {
 
         let preview = cleanup.previewMergedBranches(snapshot: snapshot)
         XCTAssertEqual(preview.groups.first?.steps.map(\.step), [.deleteBranch])
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(sessionDiscovery.count, 0)
         XCTAssertEqual(executionRecorder.arguments.count, 6)
         XCTAssertEqual(executionRecorder.arguments.filter { $0.contains("for-each-ref") }.count, 1)
@@ -1321,7 +1324,7 @@ final class CoreTests: XCTestCase {
         let preview = CleanupService().previewRemoveWorktree(snapshot: snapshot, path: attachedPath)
         XCTAssertTrue(preview.items[0].allowed, "blocked: \(String(describing: preview.items[0].reason))")
         let beforeCleanup = recorder.arguments.count
-        XCTAssertEqual(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path)).execute(preview), [attachedPath])
+        XCTAssertEqual(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path)).execute(preview).removedWorktreePaths, [attachedPath])
         XCTAssertFalse(FileManager.default.fileExists(atPath: attachedPath))
         let count = recorder.arguments.count - beforeCleanup
         XCTAssertLessThan(count, 20)
@@ -1395,7 +1398,7 @@ final class CoreTests: XCTestCase {
         let ghRecorder = StubRecordingRunner { _ in ProcessResult(status: 0, stdout: exactPR) }
         let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: GitHubService(runner: ghRecorder, executable: "gh"))
 
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(ghRecorder.currentDirectories.compactMap { $0 }, [canonicalPath])
         XCTAssertEqual(gitRecorder.arguments.filter { $0.contains("rev-parse") && $0.contains("--show-toplevel") }.count, 1)
         XCTAssertTrue(gitRecorder.arguments.contains { $0.starts(with: ["-C", canonicalPath]) && $0.contains("update-ref") && $0.contains("-d") })
@@ -1419,7 +1422,7 @@ final class CoreTests: XCTestCase {
         let ghRecorder = StubRecordingRunner { _ in ProcessResult(status: 0, stdout: exactPR) }
         let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: GitHubService(runner: ghRecorder, executable: "gh"))
 
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(ghRecorder.currentDirectories.compactMap { $0 }, [canonicalPath, canonicalPath])
         XCTAssertEqual(gitRecorder.arguments.filter { $0.contains("rev-parse") && $0.contains("--show-toplevel") }.count, 1)
         XCTAssertTrue(gitRecorder.arguments.contains { $0.starts(with: ["-C", canonicalPath]) && $0.contains("worktree") && $0.contains("remove") })
@@ -1442,7 +1445,7 @@ final class CoreTests: XCTestCase {
         let gitRecorder = RecordingRunner()
         let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path))
 
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertLessThanOrEqual(gitRecorder.arguments.count, 20, "one-worktree Git-ancestor grouped cleanup process budget")
         print("CLEANUP_GIT_SUBPROCESS git_ancestor_branch_only=\(gitRecorder.arguments.count)")
         XCTAssertTrue(gitRecorder.arguments.contains { $0.starts(with: ["-C", canonicalPath, "branch", "-d"]) })
@@ -1484,7 +1487,7 @@ final class CoreTests: XCTestCase {
         let cleanup = CleanupService(git: GitService(runner: recorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path))
 
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(recorder.arguments.count, 19, "one-worktree Git-ancestor grouped cleanup process count")
         print("CLEANUP_GIT_SUBPROCESS grouped_git_ancestor_worktree=\(recorder.arguments.count)")
         XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
@@ -1642,7 +1645,11 @@ final class CoreTests: XCTestCase {
         let runner = AddingWorktreeAfterRemovalRunner(repositoryPath: fixture.repository.path, replacementPath: replacementPath.path)
         let cleanup = CleanupService(git: GitService(runner: runner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path), github: github)
 
-        XCTAssertTrue(cleanup.execute(cleanup.previewRemoteGoneBranches(snapshot: snapshot)).isEmpty)
+        let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
+        let plannedPath = try XCTUnwrap(preview.groups.first?.steps.first(where: { $0.step == .removeWorktree })?.target)
+        let result = cleanup.execute(preview)
+        XCTAssertEqual(result.removedWorktreePaths, [plannedPath])
+        XCTAssertTrue(result.deletedLocalBranches.isEmpty)
         XCTAssertTrue((try readWriteGit.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
         XCTAssertTrue(FileManager.default.fileExists(atPath: replacementPath.path))
         XCTAssertTrue(runner.arguments.contains { $0.contains("branch") && $0.contains("-d") } == false)
@@ -1674,7 +1681,7 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(preview.items[0].allowed)
         XCTAssertEqual(preview.items[0].expectedSHA, fixture.featureSHA)
         let beforeCleanup = recorder.arguments.count
-        XCTAssertEqual(cleanup.execute(preview), [actualPath])
+        XCTAssertEqual(cleanup.execute(preview).removedWorktreePaths, [actualPath])
         XCTAssertEqual(recorder.arguments.count - beforeCleanup, 13, "safe worktree removal process count")
         print("CLEANUP_GIT_SUBPROCESS safe_worktree=\(recorder.arguments.count - beforeCleanup)")
         XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.flatMap(\.worktrees).contains { $0.path == actualPath })
@@ -1694,7 +1701,7 @@ final class CoreTests: XCTestCase {
         let actualPath = try XCTUnwrap(enriched.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
         let preview = cleanup.previewStaleWorktrees(snapshot: enriched, staleDays: 0)
         XCTAssertTrue(preview.items.contains { $0.target == actualPath && $0.allowed })
-        XCTAssertEqual(cleanup.execute(preview), [actualPath])
+        XCTAssertEqual(cleanup.execute(preview).removedWorktreePaths, [actualPath])
     }
 
     func testGitHubVerifiedWorktreeSHAChangeBlocksFinalRevalidation() async throws {
@@ -1763,7 +1770,7 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(preview.items[0].allowed)
         XCTAssertEqual(preview.items[0].expectedSHA, fixture.featureSHA)
         let beforeCleanup = recorder.arguments.count
-        XCTAssertEqual(cleanup.execute(preview), ["feature"])
+        XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(recorder.arguments.count - beforeCleanup, 7, "standalone verified branch deletion process count")
         print("CLEANUP_GIT_SUBPROCESS standalone_github_branch=\(recorder.arguments.count - beforeCleanup)")
         XCTAssertTrue(recorder.arguments.contains { $0.suffix(4).elementsEqual(["update-ref", "-d", "refs/heads/feature", fixture.featureSHA]) })

@@ -73,61 +73,81 @@ public final class CleanupService: @unchecked Sendable {
         return CleanupPreview(operation: .deleteRemoteGoneBranches, repositoryPath: snapshot.path, items: groupItems(groups), groups: groups)
     }
 
-    public func execute(_ preview: CleanupPreview) -> [String] {
+    public func execute(_ preview: CleanupPreview) -> CleanupExecutionResult {
         var completed: [String] = []
+        var removedWorktrees: [String] = []
+        var deletedBranches: [String] = []
+        var requiresFullRefresh = false
         if preview.operation == .deleteMergedBranches || preview.operation == .deleteRemoteGoneBranches {
             if !preview.groups.isEmpty {
                 let needsSessionSafety = preview.groups.contains { $0.allowed && $0.steps.contains { $0.step == .removeWorktree } }
                 let sessionCache = needsSessionSafety ? makeSessionSafetyCache() : nil
-                if needsSessionSafety && sessionCache == nil { return completed }
+                if needsSessionSafety && sessionCache == nil { return CleanupExecutionResult() }
                 let context: CleanupRepositoryContext?
                 let canonicalPath: String
                 if preview.groups.count == 1 && !needsSessionSafety {
-                    guard let path = try? git.canonicalRepositoryPath(preview.repositoryPath) else { return completed }
+                    guard let path = try? git.canonicalRepositoryPath(preview.repositoryPath) else { return CleanupExecutionResult() }
                     canonicalPath = path
                     context = nil
                 } else {
-                    guard let cleanupContext = try? git.cleanupContext(repositoryPath: preview.repositoryPath), cleanupContext.defaultBranch != nil else { return completed }
+                    guard let cleanupContext = try? git.cleanupContext(repositoryPath: preview.repositoryPath), cleanupContext.defaultBranch != nil else { return CleanupExecutionResult() }
                     canonicalPath = cleanupContext.path
                     context = cleanupContext
                 }
                 for group in preview.groups where group.allowed {
-                    if executeMergedBranch(repositoryPath: canonicalPath, canonicalPath: canonicalPath, context: context, group: group, sessionCache: sessionCache) {
-                        completed.append(group.branchName)
-                    }
+                    let result = executeMergedBranch(repositoryPath: canonicalPath, canonicalPath: canonicalPath, context: context, group: group, sessionCache: sessionCache)
+                    removedWorktrees.append(contentsOf: result.removedWorktreePaths)
+                    deletedBranches.append(contentsOf: result.deletedLocalBranches)
+                    if !result.removedWorktreePaths.isEmpty || !result.deletedLocalBranches.isEmpty { completed.append(group.branchName) }
                 }
             } else {
                 for target in preview.allowedItems {
                     if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) {
                         completed.append(target.id)
+                        deletedBranches.append(target.id)
                     }
                 }
             }
-            return completed
+            return CleanupExecutionResult(completedTargetIDs: completed, removedWorktreePaths: removedWorktrees, deletedLocalBranches: deletedBranches, requiresFullRefresh: requiresFullRefresh)
         }
 
         let needsSessionSafety = preview.operation == .removeWorktree || preview.operation == .removeStaleWorktrees
         let sessionCache = needsSessionSafety ? makeSessionSafetyCache() : nil
-        if needsSessionSafety && sessionCache == nil { return completed }
+        if needsSessionSafety && sessionCache == nil { return CleanupExecutionResult() }
         let context = needsSessionSafety ? try? git.cleanupContext(repositoryPath: preview.repositoryPath) : nil
-        if needsSessionSafety && context == nil { return completed }
+        if needsSessionSafety && context == nil { return CleanupExecutionResult() }
         for target in preview.allowedItems {
             switch preview.operation {
             case .removeWorktree:
-                if executeRemoveWorktree(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, sessionCache: sessionCache, context: context) { completed.append(target.id) }
+                if executeRemoveWorktree(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, sessionCache: sessionCache, context: context) {
+                    completed.append(target.id)
+                    removedWorktrees.append(target.id)
+                }
             case .deleteBranch:
-                if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) { completed.append(target.id) }
+                if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) {
+                    completed.append(target.id)
+                    deletedBranches.append(target.id)
+                }
             case .prune:
-                if (try? git.pruneWorktrees(repositoryPath: preview.repositoryPath)) != nil { completed.append(target.id) }
+                if (try? git.pruneWorktrees(repositoryPath: preview.repositoryPath)) != nil {
+                    completed.append(target.id)
+                    requiresFullRefresh = true
+                }
             case .deleteMergedBranches:
-                if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) { completed.append(target.id) }
+                if executeDeleteBranch(repositoryPath: preview.repositoryPath, name: target.id, expectedSHA: target.expectedSHA) {
+                    completed.append(target.id)
+                    deletedBranches.append(target.id)
+                }
             case .removeStaleWorktrees:
-                if executeRemoveStale(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, staleDays: preview.staleDays ?? 7, sessionCache: sessionCache) { completed.append(target.id) }
+                if executeRemoveStale(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, staleDays: preview.staleDays ?? 7, sessionCache: sessionCache) {
+                    completed.append(target.id)
+                    removedWorktrees.append(target.id)
+                }
             case .deleteRemoteGoneBranches:
                 break
             }
         }
-        return completed
+        return CleanupExecutionResult(completedTargetIDs: completed, removedWorktreePaths: removedWorktrees, deletedLocalBranches: deletedBranches, requiresFullRefresh: requiresFullRefresh)
     }
 
     private func branchDecision(_ branch: BranchInfo, defaultBranch: String?, allowAttachedWorktrees: Bool = false) -> CleanupDecision {
@@ -179,17 +199,23 @@ public final class CleanupService: @unchecked Sendable {
         return "\(cleanliness) · \(sessionState) · \(mergeStatus)"
     }
 
-    private func executeMergedBranch(repositoryPath: String, canonicalPath: String, context: CleanupRepositoryContext?, group: CleanupPreviewGroup, sessionCache: SessionCleanupSafetyChecking?) -> Bool {
-        guard group.allowed, let expectedSHA = group.expectedSHA else { return false }
+    private func executeMergedBranch(repositoryPath: String, canonicalPath: String, context: CleanupRepositoryContext?, group: CleanupPreviewGroup, sessionCache: SessionCleanupSafetyChecking?) -> CleanupExecutionResult {
+        guard group.allowed, let expectedSHA = group.expectedSHA else { return CleanupExecutionResult() }
         let plannedPaths = group.steps.filter { $0.step == .removeWorktree }.map(\.target)
         if plannedPaths.isEmpty {
-            return executeDeleteBranch(repositoryPath: repositoryPath, canonicalPath: canonicalPath, name: group.branchName, expectedSHA: expectedSHA, expectedDefaultBranch: group.expectedDefaultBranch, mergeEvidence: group.mergeEvidence, context: context)
+            let deleted = executeDeleteBranch(repositoryPath: repositoryPath, canonicalPath: canonicalPath, name: group.branchName, expectedSHA: expectedSHA, expectedDefaultBranch: group.expectedDefaultBranch, mergeEvidence: group.mergeEvidence, context: context)
+            return CleanupExecutionResult(deletedLocalBranches: deleted ? [group.branchName] : [])
         }
-        guard let context else { return false }
+        guard let context else { return CleanupExecutionResult() }
+        var removed: [String] = []
         for (index, path) in plannedPaths.enumerated() {
-            guard executeRemoveWorktree(repositoryPath: canonicalPath, path: path, expectedSHA: expectedSHA, sessionCache: sessionCache, mergeEvidence: group.mergeEvidence, expectedDefaultBranch: group.expectedDefaultBranch, canonicalPath: canonicalPath, context: context, expectedWorktreePaths: Array(plannedPaths.dropFirst(index))) else { return false }
+            guard executeRemoveWorktree(repositoryPath: canonicalPath, path: path, expectedSHA: expectedSHA, sessionCache: sessionCache, mergeEvidence: group.mergeEvidence, expectedDefaultBranch: group.expectedDefaultBranch, canonicalPath: canonicalPath, context: context, expectedWorktreePaths: Array(plannedPaths.dropFirst(index))) else {
+                return CleanupExecutionResult(removedWorktreePaths: removed)
+            }
+            removed.append(path)
         }
-        return executeDeleteBranch(repositoryPath: repositoryPath, canonicalPath: canonicalPath, name: group.branchName, expectedSHA: expectedSHA, expectedDefaultBranch: group.expectedDefaultBranch, mergeEvidence: group.mergeEvidence, context: context)
+        let deleted = executeDeleteBranch(repositoryPath: repositoryPath, canonicalPath: canonicalPath, name: group.branchName, expectedSHA: expectedSHA, expectedDefaultBranch: group.expectedDefaultBranch, mergeEvidence: group.mergeEvidence, context: context)
+        return CleanupExecutionResult(removedWorktreePaths: removed, deletedLocalBranches: deleted ? [group.branchName] : [])
     }
 
     private func executeRemoveWorktree(repositoryPath: String, path: String, expectedSHA: String?, sessionCache: SessionCleanupSafetyChecking?, mergeEvidence: MergeEvidence? = nil, expectedDefaultBranch: String? = nil, canonicalPath: String? = nil, context: CleanupRepositoryContext?, expectedWorktreePaths: [String] = []) -> Bool {
