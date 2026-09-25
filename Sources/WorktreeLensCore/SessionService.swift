@@ -205,7 +205,8 @@ public struct ProcessActivityProbe: SessionActivityProbing {
             return (.unknown, "process scan unavailable")
         }
         let hasSessionEvidence = snapshot.processes.contains { line in
-            provider == .claude ? containsExactArgument(sessionID, in: line) : containsSessionID(sessionID, in: line)
+            if provider == .claude { return isClaudeProcess(line) && containsExactArgument(sessionID, in: line) }
+            return containsSessionID(sessionID, in: line)
         }
         if hasSessionEvidence {
             return (.active, "running process contains exact session ID")
@@ -219,7 +220,7 @@ public struct ProcessActivityProbe: SessionActivityProbing {
         let appRunning = snapshot.processes.contains { line in
             let lower = line.lowercased()
             if provider == .claude {
-                return lower.contains("/claude") || lower.contains("claude-code") || lower.contains("claude desktop")
+                return isClaudeProcess(line)
             }
             return lower.contains("/\(appName.lowercased()).app/") || lower.contains("\(appName.lowercased()) desktop")
         }
@@ -231,10 +232,15 @@ public struct ProcessActivityProbe: SessionActivityProbing {
     }
 
     private func containsExactArgument(_ token: String, in line: String) -> Bool {
-        line.split(whereSeparator: \.isWhitespace).contains { argument in
-            let value = argument.trimmingCharacters(in: CharacterSet(charactersIn: "\"'(),[]"))
-            return value == token || value.split(separator: "=", maxSplits: 1).last.map(String.init) == token
+        line.split(whereSeparator: \.isWhitespace).dropFirst(2).contains { argument in
+            argument.trimmingCharacters(in: CharacterSet(charactersIn: "\"'(),[]")) == token
         }
+    }
+
+    private func isClaudeProcess(_ line: String) -> Bool {
+        guard let executable = line.split(whereSeparator: \.isWhitespace).dropFirst().first else { return false }
+        let token = executable.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        return URL(fileURLWithPath: token).lastPathComponent == "claude"
     }
 }
 
@@ -561,8 +567,8 @@ public struct ClaudeSessionProvider: SessionProvider {
             metrics.recordClaudeFileRead()
             for row in jsonLines(data) {
                 guard let id = row["sessionId"] as? String, !id.isEmpty else { continue }
-                historyIDs.insert(id)
                 guard let cwd = absolutePath(row["project"] as? String) else { continue }
+                historyIDs.insert(id)
                 let metadata = ClaudeMetadata(id: id, title: (row["display"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Untitled session", updatedAt: claudeDate(row["timestamp"]), cwd: cwd, branch: nil, source: "~/.claude/history.jsonl explicit project/sessionId")
                 if records[id] == nil || (records[id]?.updatedAt ?? .distantPast) <= (metadata.updatedAt ?? .distantPast) { records[id] = metadata }
             }

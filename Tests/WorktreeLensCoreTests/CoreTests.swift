@@ -434,6 +434,8 @@ final class CoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: home) }
         let transcript = "{\"sessionId\":\"fallback-id\",\"cwd\":\"/tmp/explicit-worktree\",\"gitBranch\":\"feature\",\"timestamp\":1700000010,\"title\":\"Transcript title\"}\n"
         try Data(transcript.utf8).write(to: project.appendingPathComponent("fallback-id.jsonl"))
+        let history = home.appendingPathComponent(".claude/history.jsonl")
+        try Data("{\"sessionId\":\"fallback-id\",\"display\":\"No project\"}\n".utf8).write(to: history)
 
         let result = ClaudeSessionProvider(home: home.path, activityProbe: ProcessActivityProbe(runner: StaticRunner(output: ""))).discover()
 
@@ -441,6 +443,14 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(result.sessions.first?.cwd, "/tmp/explicit-worktree")
         XCTAssertEqual(result.sessions.first?.branch, "feature")
         XCTAssertEqual(result.sessions.first?.title, "Transcript title")
+
+        for (processes, activity) in [("123 claude --resume fallback-id\n", SessionActivity.active), ("123 claude\n", SessionActivity.unknown)] {
+            let restored = try XCTUnwrap(ClaudeSessionProvider(home: home.path, activityProbe: ProcessActivityProbe(runner: StaticRunner(output: processes))).discover().sessions.first)
+            XCTAssertEqual(restored.activity, activity)
+            let worktree = WorktreeInfo(id: "/tmp/explicit-worktree", path: "/tmp/explicit-worktree", branch: "feature", head: "abc", isBare: false, isLocked: false, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: Date(), sessions: [restored])
+            let branch = BranchInfo(id: "feature", name: "feature", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: false, lastCommitAt: Date(), worktrees: [worktree])
+            XCTAssertFalse(CleanupService().decide(worktree: worktree, branch: branch).allowed)
+        }
     }
 
     func testClaudeMalformedAndMissingSourcesAreSafe() throws {
@@ -462,6 +472,9 @@ final class CoreTests: XCTestCase {
         let id = "claude-active-id"
         let activeProbe = ProcessActivityProbe(runner: StaticRunner(output: "123 /usr/local/bin/claude --resume \(id)\n"))
         let unknownProbe = ProcessActivityProbe(runner: StaticRunner(output: "123 /opt/homebrew/bin/claude\n"))
+        let bareProbe = ProcessActivityProbe(runner: StaticRunner(output: "123 claude\n"))
+        let nonExactIDProbe = ProcessActivityProbe(runner: StaticRunner(output: "123 /usr/local/bin/claude --resume \(id)-suffix\n"))
+        let unrelatedProbe = ProcessActivityProbe(runner: StaticRunner(output: "123 /tmp/claude-data/tool\n"))
         let inactiveProbe = ProcessActivityProbe(runner: StaticRunner(output: "123 /usr/bin/other-process\n"))
         let fixtureHome = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-activity-\(UUID().uuidString)")
         let history = fixtureHome.appendingPathComponent(".claude/history.jsonl")
@@ -470,9 +483,15 @@ final class CoreTests: XCTestCase {
         try Data("{\"sessionId\":\"\(id)\",\"project\":\"/tmp/wt\"}\n".utf8).write(to: history)
         let activeSession = try XCTUnwrap(ClaudeSessionProvider(home: fixtureHome.path, activityProbe: activeProbe).discover().sessions.first)
         let unknownSession = try XCTUnwrap(ClaudeSessionProvider(home: fixtureHome.path, activityProbe: unknownProbe).discover().sessions.first)
+        let bareSession = try XCTUnwrap(ClaudeSessionProvider(home: fixtureHome.path, activityProbe: bareProbe).discover().sessions.first)
+        let nonExactIDSession = try XCTUnwrap(ClaudeSessionProvider(home: fixtureHome.path, activityProbe: nonExactIDProbe).discover().sessions.first)
+        let unrelatedSession = try XCTUnwrap(ClaudeSessionProvider(home: fixtureHome.path, activityProbe: unrelatedProbe).discover().sessions.first)
         let inactiveSession = try XCTUnwrap(ClaudeSessionProvider(home: fixtureHome.path, activityProbe: inactiveProbe).discover().sessions.first)
         XCTAssertEqual(activeSession.activity, .active)
         XCTAssertEqual(unknownSession.activity, .unknown)
+        XCTAssertEqual(bareSession.activity, .unknown)
+        XCTAssertEqual(nonExactIDSession.activity, .unknown)
+        XCTAssertEqual(unrelatedSession.activity, .inactive)
         XCTAssertEqual(inactiveSession.activity, .inactive)
 
         func decision(_ session: SessionRecord) -> CleanupDecision {
