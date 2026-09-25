@@ -3,6 +3,7 @@ import Foundation
 public enum SessionProviderKind: String, Codable, Sendable {
     case codex = "Codex"
     case chatGPT = "ChatGPT"
+    case claude = "Claude"
 }
 
 public enum SessionActivity: String, Codable, Sendable {
