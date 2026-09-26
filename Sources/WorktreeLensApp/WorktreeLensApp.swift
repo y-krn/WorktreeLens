@@ -347,6 +347,12 @@ final class ApplicationModel: ObservableObject {
         requestPreview { cleanup.previewRemoveWorktree(snapshot: snapshot, path: worktree.path) }
     }
 
+    func requestRemoveCleanWorktrees() {
+        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
+        let cleanup = self.cleanup
+        requestPreview { cleanup.previewCleanWorktrees(snapshot: snapshot) }
+    }
+
     func requestDeleteSelectedBranch() {
         guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path, let branch = selectedBranch() else { return }
         let cleanup = self.cleanup
@@ -676,6 +682,7 @@ struct ContentView: View {
             Button("Delete Selected Branch…") { model.requestCleanupAfterMenuDismissal { model.requestDeleteSelectedBranch() } }
                 .disabled(model.selectedBranch() == nil)
             Divider()
+            Button("Remove Clean Worktrees (Keep Branches)…") { model.requestCleanupAfterMenuDismissal { model.requestRemoveCleanWorktrees() } }
             Button("Prune Worktree Metadata…") { model.requestCleanupAfterMenuDismissal { model.requestPrune() } }
             Button("Clean Up Merged Branches…") { model.requestCleanupAfterMenuDismissal { model.requestDeleteMergedBranches() } }
             Button("Delete Stale Worktrees (\(model.staleDays)d)…") { model.requestCleanupAfterMenuDismissal { model.requestRemoveStaleWorktrees() } }

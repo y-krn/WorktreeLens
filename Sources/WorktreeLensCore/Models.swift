@@ -281,6 +281,8 @@ public enum CleanupBlockReason: Equatable, Sendable {
     case defaultBranch
     case worktreeAttached
     case githubVerificationUnavailable
+    case mainWorktree
+    case processRunning
     case commandFailed(String)
 
     public var message: String {
@@ -297,6 +299,8 @@ public enum CleanupBlockReason: Equatable, Sendable {
         case .defaultBranch: return "Default branch cannot be deleted"
         case .worktreeAttached: return "Branch has worktree"
         case .githubVerificationUnavailable: return "GitHub verification unavailable"
+        case .mainWorktree: return "Main worktree cannot be removed"
+        case .processRunning: return "Process running in worktree"
         case .commandFailed(let message): return message
         }
     }
@@ -309,6 +313,7 @@ public enum CleanupOperation: String, Sendable {
     case deleteMergedBranches = "Clean up merged branches"
     case removeStaleWorktrees = "Remove stale worktrees"
     case deleteRemoteGoneBranches = "Clean up merged remote-gone branches"
+    case removeCleanWorktrees = "Remove clean worktrees (keep branches)"
 }
 
 public enum CleanupPlanStep: String, Sendable {
