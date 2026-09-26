@@ -1857,6 +1857,35 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(cleanup.execute(cleanup.previewRemoveWorktree(snapshot: snapshot, path: worktree.path)).removedWorktreePaths, [worktree.path])
     }
 
+    func testMergedWorktreesRemovesOnlyCheckoutsContainedInDefaultBranch() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let detachedPath = fixture.root.appendingPathComponent("detached-wt")
+        let donePath = fixture.root.appendingPathComponent("done-wt")
+        let featurePath = fixture.root.appendingPathComponent("feature-wt")
+        let movedPath = fixture.root.appendingPathComponent("moved-wt")
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", "--detach", detachedPath.path, "main"])
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", "-b", "done", donePath.path, "main"])
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", featurePath.path, "feature"])
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", "--detach", movedPath.path, "main"])
+
+        let git = GitService()
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()))
+        let snapshot = try git.snapshot(repositoryPath: fixture.repository.path)
+        let preview = cleanup.previewMergedWorktrees(snapshot: snapshot)
+        XCTAssertEqual(preview.operation, .removeMergedWorktrees)
+        XCTAssertEqual(Set(preview.allowedItems.map { URL(fileURLWithPath: $0.target).lastPathComponent }), ["detached-wt", "done-wt", "moved-wt"], "unmerged feature and main worktree are not candidates")
+
+        // A commit made after the preview leaves the checkout ahead of main, so it must stay.
+        _ = try runGit(["-C", movedPath.path, "commit", "--allow-empty", "-m", "later"])
+        let result = cleanup.execute(preview)
+        XCTAssertEqual(Set(result.removedWorktreePaths.map { URL(fileURLWithPath: $0).lastPathComponent }), ["detached-wt", "done-wt"])
+        XCTAssertTrue(result.deletedLocalBranches.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: featurePath.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: movedPath.path))
+        XCTAssertTrue(try git.snapshot(repositoryPath: fixture.repository.path).branches.contains { $0.name == "done" }, "branch is kept")
+    }
+
     func testWorktreeWithRunningProcessIsNotRemoved() throws {
         let fixture = try makeFeatureRepository()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

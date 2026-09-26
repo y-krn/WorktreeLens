@@ -314,6 +314,7 @@ public enum CleanupOperation: String, Sendable {
     case removeStaleWorktrees = "Remove stale worktrees"
     case deleteRemoteGoneBranches = "Clean up merged remote-gone branches"
     case removeCleanWorktrees = "Remove clean worktrees (keep branches)"
+    case removeMergedWorktrees = "Remove worktrees merged into default branch (keep branches)"
 }
 
 public enum CleanupPlanStep: String, Sendable {

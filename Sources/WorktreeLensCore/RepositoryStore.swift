@@ -19,4 +19,10 @@ public final class RepositoryStore: @unchecked Sendable {
     public func remove(_ path: String) {
         defaults.set(paths.filter { $0 != path }, forKey: key)
     }
+
+    /// Removes worktrees already contained in the default branch after each refresh. Off unless the user opts in.
+    public var autoRemoveMergedWorktrees: Bool {
+        get { defaults.bool(forKey: "autoRemoveMergedWorktrees") }
+        set { defaults.set(newValue, forKey: "autoRemoveMergedWorktrees") }
+    }
 }

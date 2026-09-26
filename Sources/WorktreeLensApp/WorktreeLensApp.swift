@@ -56,6 +56,10 @@ final class ApplicationModel: ObservableObject {
     @Published var scanPhase: String?
     @Published var canCancelGitHub = false
     @Published var staleDays = 7
+    @Published var autoRemoveMergedWorktrees = false {
+        didSet { repositoryStore.autoRemoveMergedWorktrees = autoRemoveMergedWorktrees }
+    }
+    @Published private(set) var isAutoCleanupRunning = false
 
     let repositoryStore: RepositoryStore
     let git: GitService
@@ -83,6 +87,7 @@ final class ApplicationModel: ObservableObject {
         self.cleanupExecutor = cleanupExecutor
         self.scanner = injectedScanner ?? RepositoryScanService(git: git, sessions: sessions, github: github)
         registeredPaths = repositoryStore.paths
+        autoRemoveMergedWorktrees = repositoryStore.autoRemoveMergedWorktrees
         selectedPath = nil
         if loadRepositories, let path = registeredPaths.first { selectRepository(path: path) }
     }
@@ -184,6 +189,7 @@ final class ApplicationModel: ObservableObject {
                     self.statusMessage = Task.isCancelled ? "GitHub loading cancelled" : nil
                     self.saveCurrentView()
                     self.loadGitHubDetailForCurrentSelection()
+                    self.autoRemoveMergedWorktreesIfEnabled(snapshot: enriched)
                 }
             } catch {
                 await MainActor.run {
@@ -414,10 +420,34 @@ final class ApplicationModel: ObservableObject {
         }
     }
 
+    /// Runs after a refresh without a preview sheet; the same final guards as manual cleanup apply per worktree.
+    func autoRemoveMergedWorktreesIfEnabled(snapshot: RepositorySnapshot) {
+        guard autoRemoveMergedWorktrees, !isAutoCleanupRunning, cleanupExecutionState == .idle, cleanupPreview == nil, !isCleanupPreviewLoading else { return }
+        let cleanup = self.cleanup
+        let preview = cleanup.previewMergedWorktrees(snapshot: snapshot)
+        guard !preview.allowedItems.isEmpty else { return }
+        let repositoryPath = URL(fileURLWithPath: preview.repositoryPath).standardizedFileURL.path
+        let cleanupExecutor = self.cleanupExecutor
+        isAutoCleanupRunning = true
+        Task.detached(priority: .utility) {
+            let result = cleanupExecutor?(preview) ?? cleanup.execute(preview)
+            await MainActor.run {
+                self.isAutoCleanupRunning = false
+                guard !result.removedWorktreePaths.isEmpty else { return }
+                self.applyCleanupResult(result, repositoryPath: repositoryPath)
+                self.statusMessage = "Auto-removed \(result.removedWorktreePaths.count) merged worktree(s)"
+            }
+        }
+    }
+
     func publishCleanupResult(_ result: CleanupExecutionResult, repositoryPath: String) {
-        invalidateRepositoryTasks(for: repositoryPath)
         cleanupExecutionState = .completed(result.count)
         statusMessage = result.count == 0 ? "Completed 0 target(s) — no changes after final guard" : "Completed \(result.count) target(s)"
+        applyCleanupResult(result, repositoryPath: repositoryPath)
+    }
+
+    private func applyCleanupResult(_ result: CleanupExecutionResult, repositoryPath: String) {
+        invalidateRepositoryTasks(for: repositoryPath)
         if result.requiresFullRefresh, selectedPath != repositoryPath {
             viewCache.removeValue(forKey: repositoryPath)
             return
@@ -525,7 +555,7 @@ final class ApplicationModel: ObservableObject {
     }
 
     private func canRequestCleanup() -> Bool {
-        if cleanupExecutionState == .running {
+        if cleanupExecutionState == .running || isAutoCleanupRunning {
             statusMessage = "Cleanup already running"
             return false
         }
@@ -688,6 +718,7 @@ struct ContentView: View {
             Button("Delete Stale Worktrees (\(model.staleDays)d)…") { model.requestCleanupAfterMenuDismissal { model.requestRemoveStaleWorktrees() } }
             Button("Clean Up Merged Remote-gone Branches…") { model.requestCleanupAfterMenuDismissal { model.requestDeleteRemoteGoneBranches() } }
             Divider()
+            Toggle("Auto-remove Merged Worktrees on Refresh", isOn: $model.autoRemoveMergedWorktrees)
             Stepper("Stale threshold: \(model.staleDays) days", value: $model.staleDays, in: 1...365)
         }
     }

@@ -274,6 +274,40 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertEqual(scanner.sessionScans, 1)
     }
 
+    func testRefreshAutoRemovesMergedWorktreesOnlyWhenEnabled() async throws {
+        let path = "/tmp/auto-merged-A"
+        let mergedPath = "\(path)/merged-wt"
+        let merged = WorktreeInfo(id: "merged-wt", path: mergedPath, branch: nil, head: "sha", isBare: false, isLocked: false, isDetached: true, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil)
+        let ahead = WorktreeInfo(id: "ahead-wt", path: "\(path)/ahead-wt", branch: nil, head: "sha2", isBare: false, isLocked: false, isDetached: true, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil, defaultAhead: 1)
+        let group = BranchInfo(id: "detached", name: "Detached worktrees", sha: "sha", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, isDetachedGroup: true, worktrees: [merged, ahead])
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: path, defaultBranch: "main", branches: [group]), sessionNotes: [])
+        final class Calls: @unchecked Sendable { var previews: [CleanupPreview] = [] }
+        let calls = Calls()
+        let executor: @Sendable (CleanupPreview) -> CleanupExecutionResult = { preview in
+            calls.previews.append(preview)
+            return CleanupExecutionResult(completedTargetIDs: [mergedPath], removedWorktreePaths: [mergedPath])
+        }
+
+        let disabled = makeModel(paths: [path], scanner: CountingScanner(results: [path: [local]]), cleanupExecutor: executor)
+        disabled.selectRepository(path: path)
+        await waitForRefresh(disabled)
+        XCTAssertTrue(calls.previews.isEmpty)
+
+        let enabled = makeModel(paths: [path], scanner: CountingScanner(results: [path: [local]]), cleanupExecutor: executor)
+        enabled.autoRemoveMergedWorktrees = true
+        enabled.selectRepository(path: path)
+        await waitForRefresh(enabled)
+        let removed = expectation(description: "auto cleanup applied")
+        let cancellable = enabled.$snapshot.first { $0?.branches.flatMap(\.worktrees).contains { $0.path == mergedPath } == false }.sink { _ in removed.fulfill() }
+        await fulfillment(of: [removed], timeout: 5)
+        withExtendedLifetime(cancellable) {}
+        XCTAssertEqual(calls.previews.map(\.operation), [.removeMergedWorktrees])
+        XCTAssertEqual(calls.previews.first?.allowedItems.map(\.target), [mergedPath], "worktrees ahead of the default branch are not candidates")
+        XCTAssertEqual(enabled.snapshot?.branches.flatMap(\.worktrees).map(\.path), ["\(path)/ahead-wt"])
+        XCTAssertEqual(enabled.statusMessage, "Auto-removed 1 merged worktree(s)")
+        XCTAssertEqual(enabled.cleanupExecutionState, .idle, "automatic cleanup does not open the preview flow")
+    }
+
     func testRemovingLastDetachedWorktreeRemovesEmptyGroupFromSnapshotAndCache() async throws {
         let path = "/tmp/cleanup-detached-A"
         let detachedPath = "\(path)/detached-wt"
