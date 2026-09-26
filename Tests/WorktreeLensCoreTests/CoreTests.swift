@@ -13,6 +13,7 @@ final class CoreTests: XCTestCase {
     private struct NoAgentProcessRunner: ProcessRunning {
         func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
             if executable == "/bin/ps" { return ProcessResult(status: 0, stdout: "1 /sbin/launchd\n") }
+            if executable.hasSuffix("/lsof") { return ProcessResult(status: 0) }
             return try LocalProcessRunner().run(executable, arguments: arguments, currentDirectory: currentDirectory, timeout: timeout)
         }
     }
@@ -154,6 +155,50 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(unknown.activity(for: "thread-123", provider: .codex, snapshot: unknownSnapshot).0, .unknown)
     }
 
+    private struct ProcessTableRunner: ProcessRunning {
+        let ps: String
+        let lsof: String?
+        func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
+            if executable.hasSuffix("lsof") { return lsof.map { ProcessResult(status: 0, stdout: $0) } ?? ProcessResult(status: 1) }
+            return ProcessResult(status: 0, stdout: ps)
+        }
+    }
+
+    func testClaudeDesktopProcessWithSpacedPathAndEqualsResumeIsDetected() {
+        let line = "42 /Users/me/Library/Application Support/Claude/claude-code/2.1.0/claude.app/Contents/MacOS/claude --output-format stream-json --resume=abc-123\n"
+        let probe = ProcessActivityProbe(runner: ProcessTableRunner(ps: line, lsof: "p42\nfcwd\nn/tmp/wt-a\n"))
+        let snapshot = probe.snapshot()
+        XCTAssertEqual(probe.activity(for: "abc-123", provider: .claude, snapshot: snapshot).0, .active)
+        XCTAssertEqual(probe.activity(for: "other", provider: .claude, snapshot: snapshot).0, .unknown)
+    }
+
+    func testClaudeUnknownResolvesByProcessWorkingDirectory() {
+        let ps = "42 /usr/local/bin/claude\n43 /usr/local/bin/claude\n"
+        let probe = ProcessActivityProbe(runner: ProcessTableRunner(ps: ps, lsof: "p42\nfcwd\nn/tmp/wt-a\np43\nfcwd\nn/tmp/root\n"))
+        let snapshot = probe.snapshot()
+        XCTAssertEqual(probe.activity(for: "s", provider: .claude, cwd: "/tmp/wt-a", updatedAt: nil, snapshot: snapshot).0, .unknown, "claude process runs in the session directory")
+        XCTAssertEqual(probe.activity(for: "s", provider: .claude, cwd: "/tmp/wt-b", updatedAt: nil, snapshot: snapshot).0, .inactive)
+        XCTAssertEqual(probe.activity(for: "s", provider: .claude, cwd: "/tmp", updatedAt: nil, snapshot: snapshot).0, .inactive, "claude cwd match is exact, not ancestor")
+
+        let partial = ProcessActivityProbe(runner: ProcessTableRunner(ps: ps, lsof: "p42\nfcwd\nn/tmp/wt-a\n"))
+        XCTAssertEqual(partial.activity(for: "s", provider: .claude, cwd: "/tmp/wt-b", updatedAt: nil, snapshot: partial.snapshot()).0, .unknown, "unreadable claude cwd fails closed")
+        let failed = ProcessActivityProbe(runner: ProcessTableRunner(ps: ps, lsof: nil))
+        XCTAssertEqual(failed.activity(for: "s", provider: .claude, cwd: "/tmp/wt-b", updatedAt: nil, snapshot: failed.snapshot()).0, .unknown, "lsof failure fails closed")
+    }
+
+    func testCodexUnknownResolvesOnlyWhenIdleAndNoProcessInDirectory() {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        let ps = "10 /Applications/Codex.app/Contents/MacOS/Codex\n11 /bin/zsh\n"
+        let probe = ProcessActivityProbe(runner: ProcessTableRunner(ps: ps, lsof: "p10\nfcwd\nn/\np11\nfcwd\nn/tmp/busy/sub\n"), now: { now })
+        let snapshot = probe.snapshot()
+        let old = now.addingTimeInterval(-ProcessActivityProbe.idleSessionInterval - 1)
+        let recent = now.addingTimeInterval(-60)
+        XCTAssertEqual(probe.activity(for: "thread-xyz", provider: .codex, cwd: "/tmp/idle", updatedAt: old, snapshot: snapshot).0, .inactive)
+        XCTAssertEqual(probe.activity(for: "thread-xyz", provider: .codex, cwd: "/tmp/idle", updatedAt: recent, snapshot: snapshot).0, .unknown, "recent session stays unknown")
+        XCTAssertEqual(probe.activity(for: "thread-xyz", provider: .codex, cwd: "/tmp/idle", updatedAt: nil, snapshot: snapshot).0, .unknown, "missing timestamp stays unknown")
+        XCTAssertEqual(probe.activity(for: "thread-xyz", provider: .codex, cwd: "/tmp/busy", updatedAt: old, snapshot: snapshot).0, .unknown, "process inside session directory")
+    }
+
     func testSessionActivityMatchingAcrossManyProcessLines() {
         let output = [
             "1 /usr/bin/other-process",
@@ -182,7 +227,7 @@ final class CoreTests: XCTestCase {
         struct CountingRunner: ProcessRunning {
             let counter: Counter
             func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
-                counter.value += 1
+                if executable == "/bin/ps" { counter.value += 1 }
                 return ProcessResult(status: 0, stdout: "123 /usr/bin/other-process\n")
             }
         }
@@ -1138,7 +1183,7 @@ final class CoreTests: XCTestCase {
         struct SessionRunner: ProcessRunning {
             func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
                 if executable == "/bin/ps" { return ProcessResult(status: 0, stdout: "123 /usr/bin/other-process\n") }
-                if executable == "/usr/bin/sqlite3" { return ProcessResult(status: 0, stdout: "") }
+                if executable == "/usr/bin/sqlite3" || executable == "/usr/sbin/lsof" { return ProcessResult(status: 0, stdout: "") }
                 return ProcessResult(status: 1)
             }
         }
@@ -1711,7 +1756,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(preview.items[0].expectedSHA, fixture.featureSHA)
         let beforeCleanup = recorder.arguments.count
         XCTAssertEqual(cleanup.execute(preview).removedWorktreePaths, [actualPath])
-        XCTAssertEqual(recorder.arguments.count - beforeCleanup, 13, "safe worktree removal process count")
+        XCTAssertEqual(recorder.arguments.count - beforeCleanup, 7, "safe worktree removal process count")
         print("CLEANUP_GIT_SUBPROCESS safe_worktree=\(recorder.arguments.count - beforeCleanup)")
         XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.flatMap(\.worktrees).contains { $0.path == actualPath })
     }
@@ -1757,7 +1802,82 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.flatMap(\.worktrees).contains { $0.path == actualPath })
     }
 
-    func testGitHubFailureBlocksGitHubVerifiedWorktreeExecute() async throws {
+    func testCleanWorktreesRemovesUnmergedCheckoutsButKeepsBranches() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let featurePath = fixture.root.appendingPathComponent("feature-wt")
+        let dirtyPath = fixture.root.appendingPathComponent("dirty-wt")
+        let detachedPath = fixture.root.appendingPathComponent("detached-wt")
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", featurePath.path, "feature"])
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", "-b", "dirty", dirtyPath.path, "main"])
+        try Data("wip\n".utf8).write(to: dirtyPath.appendingPathComponent("wip.txt"))
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", "--detach", detachedPath.path, "main"])
+        _ = try runGit(["-C", detachedPath.path, "commit", "--allow-empty", "-m", "orphan"])
+        try FileManager.default.createDirectory(at: featurePath.appendingPathComponent("node_modules"), withIntermediateDirectories: true)
+        try Data("*\n".utf8).write(to: featurePath.appendingPathComponent("node_modules/.gitignore"))
+
+        let git = GitService()
+        let sessions = SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: ""))
+        let cleanup = CleanupService(git: git, sessions: sessions)
+        let snapshot = try git.snapshot(repositoryPath: fixture.repository.path)
+        let preview = cleanup.previewCleanWorktrees(snapshot: snapshot)
+        func item(_ url: URL) -> CleanupPreviewItem? {
+            preview.items.first { URL(fileURLWithPath: $0.target).resolvingSymlinksInPath().path == url.resolvingSymlinksInPath().path }
+        }
+        XCTAssertEqual(item(fixture.repository)?.reason, .mainWorktree)
+        XCTAssertEqual(item(featurePath)?.allowed, true, "unmerged branch checkout is removable because the branch is kept")
+        XCTAssertEqual(item(dirtyPath)?.reason, .dirtyWorktree)
+        XCTAssertEqual(item(detachedPath)?.allowed, true, "reachability is checked at execution")
+
+        let result = cleanup.execute(preview)
+        XCTAssertEqual(result.removedWorktreePaths.map { URL(fileURLWithPath: $0).lastPathComponent }, ["feature-wt"])
+        XCTAssertTrue(result.deletedLocalBranches.isEmpty)
+        let after = try git.snapshot(repositoryPath: fixture.repository.path)
+        XCTAssertEqual(after.branches.first { $0.name == "feature" }?.sha, fixture.featureSHA)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: featurePath.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dirtyPath.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: detachedPath.path), "detached HEAD with unreachable commit must stay")
+    }
+
+    func testCleanWorktreesBlocksUnknownSessionAndAllowsReachableDetachedHead() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let detachedPath = fixture.root.appendingPathComponent("detached-wt")
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", "--detach", detachedPath.path, "feature"])
+        let git = GitService()
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")))
+        let snapshot = try git.snapshot(repositoryPath: fixture.repository.path)
+        let worktree = try XCTUnwrap(snapshot.branches.flatMap(\.worktrees).first { $0.isDetached })
+
+        let unknown = SessionRecord(id: "claude-x", provider: .claude, title: "x", updatedAt: nil, cwd: worktree.path, branch: nil, url: nil, activity: .unknown, evidence: "")
+        let blocked = WorktreeInfo(id: worktree.id, path: worktree.path, branch: nil, head: worktree.head, isBare: false, isLocked: false, isDetached: true, isClean: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, lastActivity: nil, sessions: [unknown])
+        let blockedSnapshot = RepositorySnapshot(path: snapshot.path, defaultBranch: "main", branches: [BranchInfo(id: "detached", name: "Detached worktrees", sha: worktree.head, upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, isDetachedGroup: true, worktrees: [blocked])])
+        XCTAssertEqual(cleanup.previewCleanWorktrees(snapshot: blockedSnapshot).items.first?.reason, .unknownSessionActivity)
+
+        XCTAssertEqual(cleanup.execute(cleanup.previewRemoveWorktree(snapshot: snapshot, path: worktree.path)).removedWorktreePaths, [worktree.path])
+    }
+
+    func testWorktreeWithRunningProcessIsNotRemoved() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let featurePath = fixture.root.appendingPathComponent("feature-wt")
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", featurePath.path, "feature"])
+        let git = GitService()
+        let snapshot = try git.snapshot(repositoryPath: fixture.repository.path)
+        let path = try XCTUnwrap(snapshot.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
+
+        let busy = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: ProcessTableRunner(ps: "", lsof: "p7\nfcwd\nn\(featurePath.resolvingSymlinksInPath().path)/src\n")))
+        let busyPreview = busy.previewCleanWorktrees(snapshot: snapshot)
+        XCTAssertEqual(busyPreview.items.first { $0.target == path }?.reason, .processRunning)
+        let idlePreview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: ""))).previewRemoveWorktree(snapshot: snapshot, path: path)
+        XCTAssertTrue(idlePreview.items[0].allowed)
+        XCTAssertTrue(busy.execute(idlePreview).isEmpty, "a process appearing after preview blocks removal")
+        let unscannable = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: ProcessTableRunner(ps: "", lsof: nil)))
+        XCTAssertTrue(unscannable.execute(idlePreview).isEmpty, "cwd scan failure fails closed")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: featurePath.path))
+    }
+
+    func testWorktreeRemovalKeepsBranchWithoutGitHubVerification() async throws {
         let fixture = try makeFeatureRepository()
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -1772,9 +1892,12 @@ final class CoreTests: XCTestCase {
         let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: goodGitHub).previewRemoveWorktree(snapshot: enriched, path: actualPath)
         XCTAssertTrue(preview.items[0].allowed)
 
+        // Removing only the checkout keeps the branch, so merge verification (and GitHub) is not consulted.
         let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: failedGitHub)
-        XCTAssertTrue(cleanup.execute(preview).isEmpty)
-        XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.flatMap(\.worktrees).contains { $0.path == actualPath })
+        XCTAssertEqual(cleanup.execute(preview).removedWorktreePaths, [actualPath])
+        let after = try git.snapshot(repositoryPath: fixture.repository.path)
+        XCTAssertFalse(after.branches.flatMap(\.worktrees).contains { $0.path == actualPath })
+        XCTAssertEqual(after.branches.first { $0.name == "feature" }?.sha, fixture.featureSHA)
     }
 
     private func assertGitHubVerifiedDeletion(prNumber: Int) async throws {

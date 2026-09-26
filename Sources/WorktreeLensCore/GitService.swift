@@ -191,11 +191,18 @@ public final class GitService: @unchecked Sendable {
     /// Minimal fresh worktree state for the last guard before removal.
     public func cleanupWorktreeState(repositoryPath: String, path: String, sessions: [SessionRecord], context: CleanupRepositoryContext) throws -> WorktreeInfo {
         let records = try worktreeRecords(repositoryPath: context.path)
-        guard let record = records.first(where: { isPath($0["worktree"] ?? "", equalTo: path) }),
-              let worktree = try makeWorktree(record: record, defaultBranch: nil, sessions: sessions, includeCleanupUIData: false) else {
-            throw ProcessRunnerError.failed("Worktree missing or invalid")
+        // The first record is the main worktree, which is never a removal target.
+        guard let index = records.firstIndex(where: { isPath($0["worktree"] ?? "", equalTo: path) }), index > 0,
+              let worktree = try makeWorktree(record: records[index], defaultBranch: nil, sessions: sessions, includeCleanupUIData: false) else {
+            throw ProcessRunnerError.failed("Worktree missing, main, or invalid")
         }
         return worktree
+    }
+
+    /// True when a branch, remote-tracking ref, or tag still contains `sha`, so removing a detached worktree loses no commits.
+    public func isReachableFromRefs(repositoryPath: String, sha: String) -> Bool {
+        guard let result = try? run(["-C", repositoryPath, "for-each-ref", "--contains", sha, "--count=1", "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"]) else { return false }
+        return !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// Revalidates one worktree's status, branch relation, and linked sessions.

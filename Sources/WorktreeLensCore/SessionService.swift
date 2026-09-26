@@ -13,10 +13,13 @@ public struct SessionDiscoveryResult: Sendable {
 public protocol SessionDiscovering: Sendable {
     func discover() -> SessionDiscoveryResult
     func makeCleanupSafetyCache() -> SessionCleanupSafetyCache?
+    /// Current working directory of every readable process, or nil when it cannot be determined.
+    func processWorkingDirectories() -> [String]?
 }
 
 public extension SessionDiscovering {
     func makeCleanupSafetyCache() -> SessionCleanupSafetyCache? { nil }
+    func processWorkingDirectories() -> [String]? { nil }
 }
 
 public protocol SessionCleanupSafetyChecking: Sendable {
@@ -172,15 +175,21 @@ public struct ProcessActivitySnapshot: Sendable {
     fileprivate let loweredProcessBytes: [UInt8]
     /// Exact arguments of each `claude` process line.
     fileprivate let claudeArguments: [Set<String>]
+    fileprivate let claudePIDs: [Int?]
     fileprivate let claudeArgumentUnion: Set<String>
     fileprivate let providerAppRunning: Set<SessionProviderKind>
+    /// Working directory per PID, or nil when the cwd scan failed.
+    fileprivate let processCwds: [Int: String]?
 
-    fileprivate init(processes: [String], isAvailable: Bool) {
+    fileprivate init(processes: [String], isAvailable: Bool, processCwds: [Int: String]? = nil) {
         self.processes = processes
         self.isAvailable = isAvailable
+        self.processCwds = processCwds
         let lowered = processes.map { $0.lowercased() }
         loweredProcessBytes = Array(lowered.joined(separator: "\n").utf8)
-        claudeArguments = processes.filter(ProcessActivityProbe.isClaudeProcess).map(ProcessActivityProbe.exactArguments)
+        let claudeLines = processes.filter(ProcessActivityProbe.isClaudeProcess)
+        claudeArguments = claudeLines.map(ProcessActivityProbe.exactArguments)
+        claudePIDs = claudeLines.map { $0.split(whereSeparator: \.isWhitespace).first.flatMap { Int($0) } }
         claudeArgumentUnion = claudeArguments.reduce(into: Set<String>()) { $0.formUnion($1) }
         var running = Set<SessionProviderKind>()
         for (kind, appName) in [(SessionProviderKind.codex, "codex"), (.chatGPT, "chatgpt")] where lowered.contains(where: { $0.contains("/\(appName).app/") || $0.contains("\(appName) desktop") }) {
@@ -193,38 +202,108 @@ public struct ProcessActivitySnapshot: Sendable {
 
 public protocol SessionActivityProbing: Sendable {
     func snapshot() -> ProcessActivitySnapshot
-    func activity(for sessionID: String, provider: SessionProviderKind, snapshot: ProcessActivitySnapshot) -> (SessionActivity, String)
+    func activity(for sessionID: String, provider: SessionProviderKind, cwd: String?, updatedAt: Date?, snapshot: ProcessActivitySnapshot) -> (SessionActivity, String)
 }
 
 public extension SessionActivityProbing {
     func activity(for sessionID: String, provider: SessionProviderKind) -> (SessionActivity, String) {
         activity(for: sessionID, provider: provider, snapshot: snapshot())
     }
+
+    func activity(for sessionID: String, provider: SessionProviderKind, snapshot: ProcessActivitySnapshot) -> (SessionActivity, String) {
+        activity(for: sessionID, provider: provider, cwd: nil, updatedAt: nil, snapshot: snapshot)
+    }
+}
+
+enum SessionActivityEvidence {
+    static let scanUnavailable = "process scan unavailable"
+    static let providerNotRunning = "provider process not running"
+    static let sessionIDNotExposed = "provider process running; session ID not exposed"
+    static let exactSessionID = "running process contains exact session ID"
+    static let noClaudeProcessInDirectory = "provider process running; no claude process in session directory"
+    static let idleWithoutProcess = "provider process running; no process in session directory and idle 24h+"
+
+    static let all = [scanUnavailable, providerNotRunning, sessionIDNotExposed, exactSessionID, noClaudeProcessInDirectory, idleWithoutProcess]
 }
 
 public struct ProcessActivityProbe: SessionActivityProbing {
     private let runner: any ProcessRunning
     private let metrics: SessionDiscoveryMetrics
 
-    public init(runner: any ProcessRunning = LocalProcessRunner(), metrics: SessionDiscoveryMetrics = SessionDiscoveryMetrics()) { self.runner = runner; self.metrics = metrics }
+    /// A session whose provider app is running but exposes no session ID counts as idle only after this long.
+    public static let idleSessionInterval: TimeInterval = 86_400
+
+    private let now: @Sendable () -> Date
+
+    public init(runner: any ProcessRunning = LocalProcessRunner(), metrics: SessionDiscoveryMetrics = SessionDiscoveryMetrics(), now: @escaping @Sendable () -> Date = Date.init) {
+        self.runner = runner
+        self.metrics = metrics
+        self.now = now
+    }
 
     public func snapshot() -> ProcessActivitySnapshot {
         metrics.recordProcessScan()
         guard let result = try? runner.run("/bin/ps", arguments: ["-axo", "pid=,command="], currentDirectory: nil), result.succeeded else {
             return ProcessActivitySnapshot(processes: [], isAvailable: false)
         }
-        return ProcessActivitySnapshot(processes: result.stdout.split(whereSeparator: \.isNewline).map(String.init), isAvailable: true)
+        return ProcessActivitySnapshot(processes: result.stdout.split(whereSeparator: \.isNewline).map(String.init), isAvailable: true, processCwds: processCwds())
     }
 
-    public func activity(for sessionID: String, provider: SessionProviderKind, snapshot: ProcessActivitySnapshot) -> (SessionActivity, String) {
+    public func activity(for sessionID: String, provider: SessionProviderKind, cwd: String?, updatedAt: Date?, snapshot: ProcessActivitySnapshot) -> (SessionActivity, String) {
         guard snapshot.isAvailable else {
-            return (.unknown, "process scan unavailable")
+            return (.unknown, SessionActivityEvidence.scanUnavailable)
         }
         let hasSessionEvidence = provider == .claude ? snapshot.claudeArgumentUnion.contains(sessionID) : containsSessionID(sessionID, in: snapshot)
         if hasSessionEvidence {
-            return (.active, "running process contains exact session ID")
+            return (.active, SessionActivityEvidence.exactSessionID)
         }
-        return snapshot.providerAppRunning.contains(provider) ? (.unknown, "provider process running; session ID not exposed") : (.inactive, "provider process not running")
+        guard snapshot.providerAppRunning.contains(provider) else { return (.inactive, SessionActivityEvidence.providerNotRunning) }
+        if let cwd, let idle = idleEvidence(provider: provider, cwd: cwd, updatedAt: updatedAt, snapshot: snapshot) {
+            return (.inactive, idle)
+        }
+        return (.unknown, SessionActivityEvidence.sessionIDNotExposed)
+    }
+
+    /// Resolves "provider running, session ID not exposed" to inactive only on positive cwd evidence; any gap stays unknown.
+    private func idleEvidence(provider: SessionProviderKind, cwd: String, updatedAt: Date?, snapshot: ProcessActivitySnapshot) -> String? {
+        guard let processCwds = snapshot.processCwds else { return nil }
+        let sessionPath = resolvedPath(cwd)
+        if provider == .claude {
+            // A claude CLI process keeps the directory it was launched in, which is the session's recorded project.
+            for pid in snapshot.claudePIDs {
+                guard let pid, let processCwd = processCwds[pid] else { return nil }
+                if resolvedPath(processCwd) == sessionPath { return nil }
+            }
+            return SessionActivityEvidence.noClaudeProcessInDirectory
+        }
+        guard let updatedAt, now().timeIntervalSince(updatedAt) >= Self.idleSessionInterval else { return nil }
+        let busy = processCwds.values.contains { processCwd in
+            let path = resolvedPath(processCwd)
+            return path == sessionPath || path.hasPrefix(sessionPath.hasSuffix("/") ? sessionPath : sessionPath + "/")
+        }
+        return busy ? nil : SessionActivityEvidence.idleWithoutProcess
+    }
+
+    public func workingDirectories() -> [String]? {
+        processCwds().map { Array($0.values) }
+    }
+
+    private func processCwds() -> [Int: String]? {
+        guard let result = try? runner.run("/usr/sbin/lsof", arguments: ["-a", "-d", "cwd", "-Fpn", "-w"], currentDirectory: nil), result.succeeded else { return nil }
+        var cwds: [Int: String] = [:]
+        var pid: Int?
+        for line in result.stdout.split(whereSeparator: \.isNewline) {
+            switch line.first {
+            case "p": pid = Int(line.dropFirst())
+            case "n": if let pid { cwds[pid] = String(line.dropFirst()) }
+            default: break
+            }
+        }
+        return cwds
+    }
+
+    private func resolvedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     fileprivate func hasUnresolvedClaudeProcess(snapshot: ProcessActivitySnapshot, knownSessionIDs: Set<String>) -> Bool {
@@ -245,13 +324,29 @@ public struct ProcessActivityProbe: SessionActivityProbing {
     }
 
     fileprivate static func exactArguments(_ line: String) -> Set<String> {
-        Set(line.split(whereSeparator: \.isWhitespace).dropFirst(2).map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"'(),[]")) })
+        var arguments = Set<String>()
+        for token in line.split(whereSeparator: \.isWhitespace).dropFirst(2) {
+            let argument = token.trimmingCharacters(in: CharacterSet(charactersIn: "\"'(),[]"))
+            arguments.insert(argument)
+            // `--resume=<id>` carries the session ID after the equals sign.
+            if argument.hasPrefix("-"), let value = argument.split(separator: "=", maxSplits: 1).dropFirst().first {
+                arguments.insert(String(value))
+            }
+        }
+        return arguments
     }
 
     fileprivate static func isClaudeProcess(_ line: String) -> Bool {
-        guard let executable = line.split(whereSeparator: \.isWhitespace).dropFirst().first else { return false }
-        let token = executable.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
-        return URL(fileURLWithPath: token).lastPathComponent == "claude"
+        let fields = line.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+        guard fields.count == 2 else { return false }
+        let command = fields[1]
+        let firstToken = command.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        // The executable path may contain spaces (e.g. "Application Support"), so also read up to the first option.
+        let beforeOptions = command.components(separatedBy: " -").first ?? ""
+        return [firstToken, beforeOptions].contains { candidate in
+            let token = candidate.trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
+            return !token.isEmpty && URL(fileURLWithPath: token).lastPathComponent == "claude"
+        }
     }
 }
 
@@ -341,7 +436,7 @@ public struct CodexSessionProvider: SessionProvider {
     }
 
     private func makeRecord(id: String, title: String, updatedAt: Date?, cwd: String, branch: String?, source: String, processSnapshot: ProcessActivitySnapshot) -> SessionRecord {
-        let state = activityProbe.activity(for: id, provider: .codex, snapshot: processSnapshot)
+        let state = activityProbe.activity(for: id, provider: .codex, cwd: cwd, updatedAt: updatedAt, snapshot: processSnapshot)
         return SessionRecord(id: "codex-\(id)", provider: .codex, title: title, updatedAt: updatedAt, cwd: cwd, branch: branch, url: URL(string: "codex://threads/\(id)"), activity: state.0, evidence: "\(source); \(state.1)")
     }
 
@@ -418,7 +513,7 @@ public struct ChatGPTSessionProvider: SessionProvider {
     }
 
     private func makeRecord(_ metadata: ChatGPTSessionMetadata, processSnapshot: ProcessActivitySnapshot) -> SessionRecord {
-        let state = activityProbe.activity(for: metadata.id, provider: .chatGPT, snapshot: processSnapshot)
+        let state = activityProbe.activity(for: metadata.id, provider: .chatGPT, cwd: metadata.cwd, updatedAt: metadata.updatedAt, snapshot: processSnapshot)
         var evidence = "\(metadata.source); explicit cwd/id"
         if let branch = metadata.branch, !branch.isEmpty { evidence += "; git_branch=\(branch)" }
         evidence += "; \(state.1)"
@@ -613,7 +708,7 @@ public struct ClaudeSessionProvider: SessionProvider {
         notes.append("Claude: projects fallback bounded; files=\(inspected), bytes=\(bytesRead), history-missing sessions only")
 
         let sessions = records.values.map { metadata -> SessionRecord in
-            let state = activityProbe.activity(for: metadata.id, provider: .claude, snapshot: processSnapshot)
+            let state = activityProbe.activity(for: metadata.id, provider: .claude, cwd: metadata.cwd, updatedAt: metadata.updatedAt, snapshot: processSnapshot)
             var evidence = metadata.source
             if let branch = metadata.branch, !branch.isEmpty { evidence += "; explicit gitBranch=\(branch)" }
             return SessionRecord(id: "claude-\(metadata.id)", provider: .claude, title: metadata.title, updatedAt: metadata.updatedAt, cwd: metadata.cwd, branch: metadata.branch, url: nil, activity: state.0, evidence: evidence + "; " + state.1)
@@ -697,6 +792,10 @@ public final class SessionService: @unchecked Sendable, SessionDiscovering {
         SessionCleanupSafetyCache(providers: providers, processProbe: processProbe, metrics: metrics)
     }
 
+    public func processWorkingDirectories() -> [String]? {
+        processProbe.workingDirectories()
+    }
+
     private func rawThreadID(_ session: SessionRecord) -> String {
         let prefix = providerPrefix(session.provider)
         return session.id.hasPrefix(prefix) ? String(session.id.dropFirst(prefix.count)) : session.id
@@ -731,7 +830,7 @@ public final class SessionCleanupSafetyCache: SessionCleanupSafetyChecking, @unc
         let sourceStamps = fingerprints
         var result: [SessionRecord] = []
         for session in allMetadata {
-            let activity = processProbe.activity(for: rawID(session), provider: session.provider, snapshot: processSnapshot)
+            let activity = processProbe.activity(for: rawID(session), provider: session.provider, cwd: session.cwd, updatedAt: session.updatedAt, snapshot: processSnapshot)
             result.append(SessionRecord(id: session.id, provider: session.provider, title: session.title, updatedAt: session.updatedAt, cwd: session.cwd, branch: session.branch, url: session.url, activity: activity.0, evidence: metadataEvidence(session) + "; " + activity.1))
         }
         // A source change during inspection invalidates this snapshot; the next attempt refreshes it.
@@ -777,7 +876,7 @@ public final class SessionCleanupSafetyCache: SessionCleanupSafetyChecking, @unc
     }
 
     private func metadataEvidence(_ session: SessionRecord) -> String {
-        session.evidence.components(separatedBy: "; ").filter { $0 != "process scan unavailable" && $0 != "provider process not running" && $0 != "provider process running; session ID not exposed" && $0 != "running process contains exact session ID" }.joined(separator: "; ")
+        session.evidence.components(separatedBy: "; ").filter { !SessionActivityEvidence.all.contains($0) }.joined(separator: "; ")
     }
 
     private func withActivity(_ session: SessionRecord, _ activity: SessionActivity, _ evidence: String) -> SessionRecord {

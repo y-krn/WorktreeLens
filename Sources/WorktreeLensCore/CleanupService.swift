@@ -31,8 +31,30 @@ public final class CleanupService: @unchecked Sendable {
         guard let match = locateWorktree(snapshot, path: path) else {
             return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [CleanupPreviewItem(id: path, target: path, allowed: false, reason: .missingBranch)])
         }
-        let decision = decide(worktree: match.worktree, branch: match.branch)
-        return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [item(id: path, target: path, decision: decision, detail: match.branch.mergeStatus, expectedSHA: match.worktree.head)])
+        return CleanupPreview(operation: .removeWorktree, repositoryPath: snapshot.path, items: [keepBranchItem(worktree: match.worktree, branch: match.branch, snapshot: snapshot, processDirectories: sessions.processWorkingDirectories())])
+    }
+
+    /// Every linked worktree that can go without losing commits; branches stay, so merge status is irrelevant.
+    public func previewCleanWorktrees(snapshot: RepositorySnapshot) -> CleanupPreview {
+        let processDirectories = sessions.processWorkingDirectories()
+        let items = snapshot.branches.flatMap { branch in
+            branch.worktrees.map { keepBranchItem(worktree: $0, branch: branch, snapshot: snapshot, processDirectories: processDirectories) }
+        }
+        return CleanupPreview(operation: .removeCleanWorktrees, repositoryPath: snapshot.path, items: items)
+    }
+
+    private func keepBranchItem(worktree: WorktreeInfo, branch: BranchInfo, snapshot: RepositorySnapshot, processDirectories: [String]?) -> CleanupPreviewItem {
+        // Preview only reports processes it can see; execution fails closed when the scan is unavailable.
+        let decision: CleanupDecision
+        if isSamePath(worktree.path, snapshot.path) {
+            decision = CleanupDecision(allowed: false, reason: .mainWorktree)
+        } else if let processDirectories, hasProcess(in: worktree.path, directories: processDirectories) {
+            decision = CleanupDecision(allowed: false, reason: .processRunning)
+        } else {
+            decision = decide(worktree: worktree, requireMerged: false)
+        }
+        let kept = worktree.isDetached ? "detached HEAD must stay reachable" : "branch \(branch.name) kept"
+        return item(id: worktree.path, target: worktree.path, decision: decision, detail: worktreeDetail(worktree: worktree, mergeStatus: kept), expectedSHA: worktree.head)
     }
 
     public func previewDeleteBranch(snapshot: RepositorySnapshot, name: String) -> CleanupPreview {
@@ -111,15 +133,15 @@ public final class CleanupService: @unchecked Sendable {
             return CleanupExecutionResult(completedTargetIDs: completed, removedWorktreePaths: removedWorktrees, deletedLocalBranches: deletedBranches, requiresFullRefresh: requiresFullRefresh)
         }
 
-        let needsSessionSafety = preview.operation == .removeWorktree || preview.operation == .removeStaleWorktrees
+        let needsSessionSafety = preview.operation == .removeWorktree || preview.operation == .removeStaleWorktrees || preview.operation == .removeCleanWorktrees
         let sessionCache = needsSessionSafety ? makeSessionSafetyCache() : nil
         if needsSessionSafety && sessionCache == nil { return CleanupExecutionResult() }
         let context = needsSessionSafety ? try? git.cleanupContext(repositoryPath: preview.repositoryPath) : nil
         if needsSessionSafety && context == nil { return CleanupExecutionResult() }
         for target in preview.allowedItems {
             switch preview.operation {
-            case .removeWorktree:
-                if executeRemoveWorktree(repositoryPath: preview.repositoryPath, path: target.id, expectedSHA: target.expectedSHA, sessionCache: sessionCache, context: context) {
+            case .removeWorktree, .removeCleanWorktrees:
+                if executeRemoveWorktreeKeepingBranch(path: target.id, expectedSHA: target.expectedSHA, sessionCache: sessionCache, context: context) {
                     completed.append(target.id)
                     removedWorktrees.append(target.id)
                 }
@@ -232,8 +254,41 @@ public final class CleanupService: @unchecked Sendable {
         guard let freshSessions = sessionCache?.freshSessionsForRemoval(),
               let freshWorktree = try? git.cleanupWorktreeState(repositoryPath: canonicalPath ?? repositoryPath, path: path, sessions: freshSessions, context: context),
               freshWorktree.head == expectedSHA,
-              decide(worktree: freshWorktree, branch: branch).allowed else { return false }
+              decide(worktree: freshWorktree, branch: branch).allowed,
+              noProcessRunning(in: path) else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
+    }
+
+    /// Removes only the checkout. Commits stay reachable through the branch (or, for detached HEADs, another ref).
+    private func executeRemoveWorktreeKeepingBranch(path: String, expectedSHA: String?, sessionCache: SessionCleanupSafetyChecking?, context: CleanupRepositoryContext?) -> Bool {
+        guard let context, let expectedSHA, !isSamePath(path, context.path),
+              let sessions = sessionCache?.freshSessionsForRemoval(),
+              let worktree = try? git.cleanupWorktreeState(repositoryPath: context.path, path: path, sessions: sessions, context: context),
+              worktree.head == expectedSHA,
+              decide(worktree: worktree, requireMerged: false).allowed,
+              noProcessRunning(in: path) else { return false }
+        if worktree.isDetached || worktree.branch == nil {
+            guard git.isReachableFromRefs(repositoryPath: context.path, sha: expectedSHA) else { return false }
+        }
+        return (try? git.removeWorktree(repositoryPath: context.path, path: path)) != nil
+    }
+
+    /// Final guard: a process working inside the checkout (agent, shell, dev server) means it is still in use.
+    private func noProcessRunning(in path: String) -> Bool {
+        guard let directories = sessions.processWorkingDirectories() else { return false }
+        return !hasProcess(in: path, directories: directories)
+    }
+
+    private func hasProcess(in path: String, directories: [String]) -> Bool {
+        let root = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+        return directories.contains { directory in
+            let candidate = URL(fileURLWithPath: directory).resolvingSymlinksInPath().standardizedFileURL.path
+            return candidate == root || candidate.hasPrefix(root + "/")
+        }
+    }
+
+    private func isSamePath(_ lhs: String, _ rhs: String) -> Bool {
+        URL(fileURLWithPath: lhs).standardizedFileURL.path == URL(fileURLWithPath: rhs).standardizedFileURL.path
     }
 
     private func executeDeleteBranch(repositoryPath: String, name: String, expectedSHA: String?) -> Bool {
@@ -276,7 +331,8 @@ public final class CleanupService: @unchecked Sendable {
         guard let freshSessions = sessionCache?.freshSessionsForRemoval(),
               let freshMatch = try? git.cleanupWorktree(repositoryPath: repositoryPath, path: path, sessions: freshSessions, includeCleanupUIData: true),
               freshMatch.worktree.head == expectedSHA,
-              decide(worktree: freshMatch.worktree, branch: branch, requireMerged: true, now: Date(), staleDays: staleDays).allowed else { return false }
+              decide(worktree: freshMatch.worktree, branch: branch, requireMerged: true, now: Date(), staleDays: staleDays).allowed,
+              noProcessRunning(in: path) else { return false }
         return (try? git.removeWorktree(repositoryPath: repositoryPath, path: path)) != nil
     }
 
