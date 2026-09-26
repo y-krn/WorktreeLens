@@ -9,10 +9,11 @@ final class CoreTests: XCTestCase {
         }
     }
 
-    /// Real subprocesses, except an empty process table so host agents cannot affect the test.
-    private struct NoProcessesRunner: ProcessRunning {
+    // Stubs `/bin/ps` so host processes (e.g. a running `claude`) cannot trip the cleanup fail-closed guard; other executables run for real.
+    private struct NoAgentProcessRunner: ProcessRunning {
         func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
-            if executable == "/bin/ps" || executable.hasSuffix("/lsof") { return ProcessResult(status: 0) }
+            if executable == "/bin/ps" { return ProcessResult(status: 0, stdout: "1 /sbin/launchd\n") }
+            if executable.hasSuffix("/lsof") { return ProcessResult(status: 0) }
             return try LocalProcessRunner().run(executable, arguments: arguments, currentDirectory: currentDirectory, timeout: timeout)
         }
     }
@@ -340,7 +341,7 @@ final class CoreTests: XCTestCase {
         let badRoot = home.appendingPathComponent("Library/Application Support/com.openai.chat")
         try FileManager.default.createDirectory(at: badRoot.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("not a directory".utf8).write(to: badRoot)
-        let cache = try XCTUnwrap(SessionService(home: home.path, runner: StaticRunner(output: "")).makeCleanupSafetyCache())
+        let cache = try XCTUnwrap(SessionService(home: home.path, runner: NoAgentProcessRunner()).makeCleanupSafetyCache())
         XCTAssertNil(cache.cachedMetadata())
         XCTAssertNil(cache.freshSessionsForRemoval())
     }
@@ -706,7 +707,7 @@ final class CoreTests: XCTestCase {
 
         let gitRecorder = RecordingRunner()
         let git = GitService(runner: gitRecorder)
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")))
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()))
         let snapshot = try git.snapshot(repositoryPath: repository.path)
         let detached = try XCTUnwrap(snapshot.branches.first(where: \.isDetachedGroup))
         let first = try XCTUnwrap(detached.worktrees.first { URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().path == firstPath.resolvingSymlinksInPath().path })
@@ -742,7 +743,7 @@ final class CoreTests: XCTestCase {
             BranchInfo(id: "branch-(index)", name: "branch-(index)", sha: "sha-(index)", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: false, lastCommitAt: nil, worktrees: [])
         }
         let snapshot = RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: branches)
-        let cleanup = CleanupService(git: GitService(runner: CountingRunner(counter: counter)), sessions: SessionService(home: "/tmp/no-session-home", runner: StaticRunner(output: "")))
+        let cleanup = CleanupService(git: GitService(runner: CountingRunner(counter: counter)), sessions: SessionService(home: "/tmp/no-session-home", runner: NoAgentProcessRunner()))
 
         let preview = cleanup.previewMergedBranches(snapshot: snapshot)
 
@@ -781,7 +782,7 @@ final class CoreTests: XCTestCase {
         let feature = try XCTUnwrap(snapshot.branches.first { $0.name == "feature" })
         XCTAssertEqual(snapshot.defaultBranch, "main")
         XCTAssertFalse(feature.isMerged)
-        let cleanup = CleanupService(git: service, sessions: SessionService(home: repository.appendingPathComponent("no-session-home").path, runner: StaticRunner(output: "")))
+        let cleanup = CleanupService(git: service, sessions: SessionService(home: repository.appendingPathComponent("no-session-home").path, runner: NoAgentProcessRunner()))
         let preview = cleanup.previewDeleteBranch(snapshot: snapshot, name: "feature")
         XCTAssertEqual(preview.items.first?.reason, .unmergedBranch)
         XCTAssertFalse(preview.items.first?.allowed ?? true)
@@ -855,7 +856,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(branches["delta"]?.defaultBehind, 0)
         XCTAssertTrue(branches["gone"]?.remoteGone == true)
 
-        let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: root.appendingPathComponent("no-session-home").path, runner: StaticRunner(output: "")))
+        let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: root.appendingPathComponent("no-session-home").path, runner: NoAgentProcessRunner()))
         let remoteGonePreview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         XCTAssertEqual(remoteGonePreview.items.map(\.target), ["gone"])
         XCTAssertTrue(remoteGonePreview.items.first?.allowed == true)
@@ -979,8 +980,8 @@ final class CoreTests: XCTestCase {
         let github = GitHubService(runner: verifiedGitHubRunner(number: 125, sha: fixture.featureSHA), executable: "gh")
         let git = GitService()
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
-        let enriched = await RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github).enrichGitHub(local: local)
-        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github).previewDeleteBranch(snapshot: enriched, name: "feature")
+        let enriched = await RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github).enrichGitHub(local: local)
+        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github).previewDeleteBranch(snapshot: enriched, name: "feature")
         XCTAssertTrue(preview.items[0].allowed)
 
         _ = try runGit(["-C", fixture.repository.path, "switch", "feature"])
@@ -988,7 +989,7 @@ final class CoreTests: XCTestCase {
         _ = try runGit(["-C", fixture.repository.path, "add", "."])
         _ = try runGit(["-C", fixture.repository.path, "commit", "-m", "later"])
 
-        XCTAssertTrue(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github).execute(preview).isEmpty)
+        XCTAssertTrue(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github).execute(preview).isEmpty)
         XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
     }
 
@@ -1005,7 +1006,7 @@ final class CoreTests: XCTestCase {
         let remoteGoneBranch = branch.withMergeEvidence(.githubVerified(prNumber: 126, mergedAt: mergedAt), github: status)
             .withRemoteGone(true)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [remoteGoneBranch])
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         XCTAssertTrue(preview.items[0].allowed)
         let beforeCleanup = gitRecorder.arguments.count
@@ -1027,7 +1028,7 @@ final class CoreTests: XCTestCase {
         let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
         let remoteGoneBranch = branch.withMergeEvidence(.githubVerified(prNumber: 131, mergedAt: mergedAt), github: status).withRemoteGone(true)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [remoteGoneBranch])
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
 
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         let group = try XCTUnwrap(preview.groups.first)
@@ -1064,7 +1065,7 @@ final class CoreTests: XCTestCase {
         let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
         let enrichedBranch = branch.withMergeEvidence(.githubVerified(prNumber: 137, mergedAt: mergedAt), github: status)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [enrichedBranch])
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
 
         let preview = cleanup.previewMergedBranches(snapshot: snapshot)
         let group = try XCTUnwrap(preview.groups.first)
@@ -1095,7 +1096,7 @@ final class CoreTests: XCTestCase {
         let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
         XCTAssertTrue(branch.isMerged)
         XCTAssertFalse(branch.remoteGone)
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")))
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()))
 
         let preview = cleanup.previewMergedBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch]))
         XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
@@ -1165,7 +1166,7 @@ final class CoreTests: XCTestCase {
             return branch.withMergeEvidence(.githubVerified(prNumber: number, mergedAt: Date(timeIntervalSince1970: 1)))
         }
         XCTAssertEqual(branches.count, 10)
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: GitHubService(runner: ghRecorder, executable: "gh"))
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: GitHubService(runner: ghRecorder, executable: "gh"))
         let preview = cleanup.previewMergedBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: branches))
 
         XCTAssertEqual(cleanup.execute(preview).count, 10)
@@ -1266,7 +1267,7 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(try runner.run("/usr/bin/sqlite3", arguments: [statePath.path, stateSQL], currentDirectory: nil).succeeded)
         XCTAssertTrue(try runner.run("/usr/bin/sqlite3", arguments: [catalogPath.path, catalogSQL], currentDirectory: nil).succeeded)
         try Data("[]".utf8).write(to: chatRoot.appendingPathComponent("sessions.json"))
-        let service = SessionService(home: home.path, runner: NoProcessesRunner())
+        let service = SessionService(home: home.path, runner: NoAgentProcessRunner())
 
         func elapsed(_ body: () -> Void) -> Double {
             let start = ProcessInfo.processInfo.systemUptime
@@ -1306,7 +1307,7 @@ final class CoreTests: XCTestCase {
         let branches = local.branches.filter { $0.name == "feature" || $0.name.hasPrefix("feature-") }
         XCTAssertEqual(branches.count, 10)
         XCTAssertTrue(branches.allSatisfy { $0.mergeEvidence == .gitAncestor })
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")))
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()))
         let preview = cleanup.previewMergedBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: branches))
 
         XCTAssertEqual(cleanup.execute(preview).count, 10)
@@ -1333,7 +1334,7 @@ final class CoreTests: XCTestCase {
             let planned = originalBranch.withMergeEvidence(.githubVerified(prNumber: 138, mergedAt: Date(timeIntervalSince1970: 1)))
             let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [planned])
             let gh = GitHubService(runner: StubRecordingRunner { _ in ProcessResult(status: 0, stdout: response) }, executable: "gh")
-            let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: gh)
+            let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: gh)
             let preview = cleanup.previewMergedBranches(snapshot: snapshot)
 
             XCTAssertTrue(cleanup.execute(preview).isEmpty, label)
@@ -1351,7 +1352,7 @@ final class CoreTests: XCTestCase {
             let attachedPath = fixture.root.appendingPathComponent("late-worktree")
             _ = try runGit(["-C", fixture.repository.path, "worktree", "add", attachedPath.path, "feature"])
             let exactPR = "{\"number\":138,\"state\":\"MERGED\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRefOid\":\"\(fixture.featureSHA)\",\"mergedAt\":\"2026-01-01T00:00:00Z\"}"
-            let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: GitHubService(runner: StubRecordingRunner { _ in ProcessResult(status: 0, stdout: exactPR) }, executable: "gh"))
+            let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: GitHubService(runner: StubRecordingRunner { _ in ProcessResult(status: 0, stdout: exactPR) }, executable: "gh"))
 
             XCTAssertTrue(cleanup.execute(preview).isEmpty)
             XCTAssertTrue(FileManager.default.fileExists(atPath: attachedPath.path))
@@ -1371,7 +1372,7 @@ final class CoreTests: XCTestCase {
             let planned = branch.withMergeEvidence(.githubVerified(prNumber: 138, mergedAt: Date(timeIntervalSince1970: 1)))
             let preview = CleanupService().previewMergedBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [planned]))
             _ = try runGit(["-C", fixture.repository.path, "remote", "set-head", "origin", "feature"])
-            let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: GitHubService(runner: StubRecordingRunner { _ in XCTFail("default drift must block before gh verification"); return ProcessResult(status: 1) }, executable: "gh"))
+            let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: GitHubService(runner: StubRecordingRunner { _ in XCTFail("default drift must block before gh verification"); return ProcessResult(status: 1) }, executable: "gh"))
 
             XCTAssertTrue(cleanup.execute(preview).isEmpty)
             XCTAssertTrue((try GitService().snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
@@ -1397,7 +1398,7 @@ final class CoreTests: XCTestCase {
         let preview = CleanupService().previewRemoveWorktree(snapshot: snapshot, path: attachedPath)
         XCTAssertTrue(preview.items[0].allowed, "blocked: \(String(describing: preview.items[0].reason))")
         let beforeCleanup = recorder.arguments.count
-        XCTAssertEqual(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: ""))).execute(preview).removedWorktreePaths, [attachedPath])
+        XCTAssertEqual(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner())).execute(preview).removedWorktreePaths, [attachedPath])
         XCTAssertFalse(FileManager.default.fileExists(atPath: attachedPath))
         let count = recorder.arguments.count - beforeCleanup
         XCTAssertLessThan(count, 20)
@@ -1432,7 +1433,7 @@ final class CoreTests: XCTestCase {
         let preview = CleanupService().previewMergedBranches(snapshot: RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: [branch]))
         XCTAssertEqual(preview.groups.count, 1)
         let runner = RemovingRemoteTrackingRefRunner(repositoryPath: fixture.repository.path)
-        let cleanup = CleanupService(git: GitService(runner: runner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")))
+        let cleanup = CleanupService(git: GitService(runner: runner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()))
 
         XCTAssertTrue(cleanup.execute(preview).isEmpty)
         XCTAssertTrue(runner.removed, "fixture must change default ref source after context acquisition")
@@ -1450,7 +1451,7 @@ final class CoreTests: XCTestCase {
         _ = try runGit(["-C", fixture.repository.path, "switch", "feature"])
         _ = try runGit(["-C", fixture.repository.path, "commit", "--allow-empty", "-m", "advance feature"])
         _ = try runGit(["-C", fixture.repository.path, "switch", "main"])
-        let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: GitHubService(runner: StubRecordingRunner { _ in XCTFail("local SHA drift must block before gh verification"); return ProcessResult(status: 1) }, executable: "gh"))
+        let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: GitHubService(runner: StubRecordingRunner { _ in XCTFail("local SHA drift must block before gh verification"); return ProcessResult(status: 1) }, executable: "gh"))
 
         XCTAssertTrue(cleanup.execute(preview).isEmpty)
         XCTAssertTrue((try GitService().snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
@@ -1469,7 +1470,7 @@ final class CoreTests: XCTestCase {
         let gitRecorder = RecordingRunner()
         let exactPR = "{\"number\":138,\"state\":\"MERGED\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRefOid\":\"\(fixture.featureSHA)\",\"mergedAt\":\"2026-01-01T00:00:00Z\"}"
         let ghRecorder = StubRecordingRunner { _ in ProcessResult(status: 0, stdout: exactPR) }
-        let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: GitHubService(runner: ghRecorder, executable: "gh"))
+        let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: GitHubService(runner: ghRecorder, executable: "gh"))
 
         XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(ghRecorder.currentDirectories.compactMap { $0 }, [canonicalPath])
@@ -1493,7 +1494,7 @@ final class CoreTests: XCTestCase {
         let gitRecorder = RecordingRunner()
         let exactPR = "{\"number\":138,\"state\":\"MERGED\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRefOid\":\"\(fixture.featureSHA)\",\"mergedAt\":\"2026-01-01T00:00:00Z\"}"
         let ghRecorder = StubRecordingRunner { _ in ProcessResult(status: 0, stdout: exactPR) }
-        let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: GitHubService(runner: ghRecorder, executable: "gh"))
+        let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: GitHubService(runner: ghRecorder, executable: "gh"))
 
         XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(ghRecorder.currentDirectories.compactMap { $0 }, [canonicalPath, canonicalPath])
@@ -1516,7 +1517,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(branch.mergeEvidence, .gitAncestor)
         let preview = CleanupService().previewMergedBranches(snapshot: RepositorySnapshot(path: registeredPath.path, defaultBranch: "main", branches: [branch]))
         let gitRecorder = RecordingRunner()
-        let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")))
+        let cleanup = CleanupService(git: GitService(runner: gitRecorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()))
 
         XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertLessThanOrEqual(gitRecorder.arguments.count, 20, "one-worktree Git-ancestor grouped cleanup process budget")
@@ -1557,7 +1558,7 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(branch.mergeEvidence, .gitAncestor)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withRemoteGone(true)])
         let recorder = RecordingRunner()
-        let cleanup = CleanupService(git: GitService(runner: recorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")))
+        let cleanup = CleanupService(git: GitService(runner: recorder), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()))
 
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
@@ -1588,7 +1589,7 @@ final class CoreTests: XCTestCase {
             feature.withMergeEvidence(.githubVerified(prNumber: 140, mergedAt: mergedAt), github: status).withRemoteGone(true),
             unmerged.withRemoteGone(true)
         ]
-        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
             .previewRemoteGoneBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: branches))
 
         XCTAssertEqual(preview.groups.count, 2)
@@ -1625,7 +1626,7 @@ final class CoreTests: XCTestCase {
         let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
         let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withMergeEvidence(.githubVerified(prNumber: 132, mergedAt: mergedAt), github: status).withRemoteGone(true)])
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         try Data("dirty\n".utf8).write(to: worktreePath.appendingPathComponent("dirty.txt"))
 
@@ -1646,7 +1647,7 @@ final class CoreTests: XCTestCase {
         let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
         let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withMergeEvidence(.githubVerified(prNumber: 133, mergedAt: mergedAt), github: status).withRemoteGone(true)])
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         try Data("changed\n".utf8).write(to: worktreePath.appendingPathComponent("changed.txt"))
         _ = try runGit(["-C", worktreePath.path, "add", "."])
@@ -1670,9 +1671,9 @@ final class CoreTests: XCTestCase {
         let status = goodGitHub.status(repositoryPath: fixture.repository.path, branch: "feature")
         let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withMergeEvidence(.githubVerified(prNumber: 134, mergedAt: mergedAt), github: status).withRemoteGone(true)])
-        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: goodGitHub).previewRemoteGoneBranches(snapshot: snapshot)
+        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: goodGitHub).previewRemoteGoneBranches(snapshot: snapshot)
 
-        XCTAssertTrue(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: failedGitHub).execute(preview).isEmpty)
+        XCTAssertTrue(CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: failedGitHub).execute(preview).isEmpty)
         XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
         XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
     }
@@ -1691,7 +1692,7 @@ final class CoreTests: XCTestCase {
         let remoteGoneBranch = branch.withMergeEvidence(.githubVerified(prNumber: 135, mergedAt: mergedAt), github: status).withRemoteGone(true)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [remoteGoneBranch])
         let failingRunner = FailingWorktreeRemovalRunner()
-        let cleanup = CleanupService(git: GitService(runner: failingRunner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: GitService(runner: failingRunner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
 
         XCTAssertTrue(cleanup.execute(preview).isEmpty)
@@ -1716,7 +1717,7 @@ final class CoreTests: XCTestCase {
         let mergedAt = try XCTUnwrap(status.pullRequests.first?.mergedAt)
         let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch.withMergeEvidence(.githubVerified(prNumber: 136, mergedAt: mergedAt), github: status).withRemoteGone(true)])
         let runner = AddingWorktreeAfterRemovalRunner(repositoryPath: fixture.repository.path, replacementPath: replacementPath.path)
-        let cleanup = CleanupService(git: GitService(runner: runner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: GitService(runner: runner), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
 
         let preview = cleanup.previewRemoteGoneBranches(snapshot: snapshot)
         let plannedPath = try XCTUnwrap(preview.groups.first?.steps.first(where: { $0.step == .removeWorktree })?.target)
@@ -1746,9 +1747,9 @@ final class CoreTests: XCTestCase {
         let recorder = RecordingRunner()
         let git = GitService(runner: recorder)
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
-        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let enriched = await scanner.enrichGitHub(local: local)
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let actualPath = try XCTUnwrap(enriched.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
         let preview = cleanup.previewRemoveWorktree(snapshot: enriched, path: actualPath)
         XCTAssertTrue(preview.items[0].allowed)
@@ -1768,9 +1769,9 @@ final class CoreTests: XCTestCase {
         let github = GitHubService(runner: verifiedGitHubRunner(number: 128, sha: fixture.featureSHA), executable: "gh")
         let git = GitService()
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
-        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let enriched = await scanner.enrichGitHub(local: local)
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let actualPath = try XCTUnwrap(enriched.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
         let preview = cleanup.previewStaleWorktrees(snapshot: enriched, staleDays: 0)
         XCTAssertTrue(preview.items.contains { $0.target == actualPath && $0.allowed })
@@ -1785,9 +1786,9 @@ final class CoreTests: XCTestCase {
         let github = GitHubService(runner: verifiedGitHubRunner(number: 129, sha: fixture.featureSHA), executable: "gh")
         let git = GitService()
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
-        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let enriched = await scanner.enrichGitHub(local: local)
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let actualPath = try XCTUnwrap(enriched.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
         let actualURL = URL(fileURLWithPath: actualPath)
         let preview = cleanup.previewRemoveWorktree(snapshot: enriched, path: actualPath)
@@ -1885,14 +1886,14 @@ final class CoreTests: XCTestCase {
         let failedGitHub = GitHubService(runner: RoutingRunner { _ in throw ProcessRunnerError.failed("offline") }, executable: "gh")
         let git = GitService()
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
-        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: goodGitHub)
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: goodGitHub)
         let enriched = await scanner.enrichGitHub(local: local)
         let actualPath = try XCTUnwrap(enriched.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
-        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: goodGitHub).previewRemoveWorktree(snapshot: enriched, path: actualPath)
+        let preview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: goodGitHub).previewRemoveWorktree(snapshot: enriched, path: actualPath)
         XCTAssertTrue(preview.items[0].allowed)
 
         // Removing only the checkout keeps the branch, so merge verification (and GitHub) is not consulted.
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: failedGitHub)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: failedGitHub)
         XCTAssertEqual(cleanup.execute(preview).removedWorktreePaths, [actualPath])
         let after = try git.snapshot(repositoryPath: fixture.repository.path)
         XCTAssertFalse(after.branches.flatMap(\.worktrees).contains { $0.path == actualPath })
@@ -1906,7 +1907,7 @@ final class CoreTests: XCTestCase {
         let git = GitService(runner: recorder)
         let github = GitHubService(runner: verifiedGitHubRunner(number: prNumber, sha: fixture.featureSHA), executable: "gh")
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
-        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let enriched = await scanner.enrichGitHub(local: local)
         let branch = try XCTUnwrap(enriched.branches.first { $0.name == "feature" })
         XCTAssertFalse(branch.mergeEvidence == .gitAncestor)
@@ -1916,7 +1917,7 @@ final class CoreTests: XCTestCase {
             XCTFail("expected GitHub verified evidence")
         }
 
-        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: "")), github: github)
+        let cleanup = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let preview = cleanup.previewDeleteBranch(snapshot: enriched, name: "feature")
         XCTAssertTrue(preview.items[0].allowed)
         XCTAssertEqual(preview.items[0].expectedSHA, fixture.featureSHA)
