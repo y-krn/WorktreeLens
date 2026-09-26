@@ -168,10 +168,26 @@ public final class SessionSourceFingerprintCache: @unchecked Sendable {
 public struct ProcessActivitySnapshot: Sendable {
     fileprivate let processes: [String]
     fileprivate let isAvailable: Bool
+    /// Lowercased process lines joined by newlines, so each session needs one search instead of one per line.
+    fileprivate let loweredProcessBytes: [UInt8]
+    /// Exact arguments of each `claude` process line.
+    fileprivate let claudeArguments: [Set<String>]
+    fileprivate let claudeArgumentUnion: Set<String>
+    fileprivate let providerAppRunning: Set<SessionProviderKind>
 
     fileprivate init(processes: [String], isAvailable: Bool) {
         self.processes = processes
         self.isAvailable = isAvailable
+        let lowered = processes.map { $0.lowercased() }
+        loweredProcessBytes = Array(lowered.joined(separator: "\n").utf8)
+        claudeArguments = processes.filter(ProcessActivityProbe.isClaudeProcess).map(ProcessActivityProbe.exactArguments)
+        claudeArgumentUnion = claudeArguments.reduce(into: Set<String>()) { $0.formUnion($1) }
+        var running = Set<SessionProviderKind>()
+        for (kind, appName) in [(SessionProviderKind.codex, "codex"), (.chatGPT, "chatgpt")] where lowered.contains(where: { $0.contains("/\(appName).app/") || $0.contains("\(appName) desktop") }) {
+            running.insert(kind)
+        }
+        if !claudeArguments.isEmpty { running.insert(.claude) }
+        providerAppRunning = running
     }
 }
 
@@ -204,48 +220,35 @@ public struct ProcessActivityProbe: SessionActivityProbing {
         guard snapshot.isAvailable else {
             return (.unknown, "process scan unavailable")
         }
-        let hasSessionEvidence = snapshot.processes.contains { line in
-            if provider == .claude { return isClaudeProcess(line) && containsExactArgument(sessionID, in: line) }
-            return containsSessionID(sessionID, in: line)
-        }
+        let hasSessionEvidence = provider == .claude ? snapshot.claudeArgumentUnion.contains(sessionID) : containsSessionID(sessionID, in: snapshot)
         if hasSessionEvidence {
             return (.active, "running process contains exact session ID")
         }
-        let appName: String
-        switch provider {
-        case .codex: appName = "Codex"
-        case .chatGPT: appName = "ChatGPT"
-        case .claude: appName = "Claude"
-        }
-        let appRunning = snapshot.processes.contains { line in
-            let lower = line.lowercased()
-            if provider == .claude {
-                return isClaudeProcess(line)
-            }
-            return lower.contains("/\(appName.lowercased()).app/") || lower.contains("\(appName.lowercased()) desktop")
-        }
-        return appRunning ? (.unknown, "provider process running; session ID not exposed") : (.inactive, "provider process not running")
+        return snapshot.providerAppRunning.contains(provider) ? (.unknown, "provider process running; session ID not exposed") : (.inactive, "provider process not running")
     }
 
     fileprivate func hasUnresolvedClaudeProcess(snapshot: ProcessActivitySnapshot, knownSessionIDs: Set<String>) -> Bool {
         guard snapshot.isAvailable else { return true }
-        return snapshot.processes.contains { line in
-            guard isClaudeProcess(line) else { return false }
-            return !knownSessionIDs.contains { containsExactArgument($0, in: line) }
+        return snapshot.claudeArguments.contains { knownSessionIDs.isDisjoint(with: $0) }
+    }
+
+    private func containsSessionID(_ token: String, in snapshot: ProcessActivitySnapshot) -> Bool {
+        guard !token.isEmpty else { return false }
+        // Lowercasing matches the case-insensitive search for ASCII IDs; a newline-free token cannot span lines.
+        if token.allSatisfy({ $0.isASCII && !$0.isNewline }) {
+            let needle = Array(token.lowercased().utf8)
+            return snapshot.loweredProcessBytes.withUnsafeBufferPointer { haystack in
+                needle.withUnsafeBufferPointer { memmem(haystack.baseAddress, haystack.count, $0.baseAddress, $0.count) != nil }
+            }
         }
+        return snapshot.processes.contains { $0.range(of: token, options: [.caseInsensitive, .diacriticInsensitive]) != nil }
     }
 
-    private func containsSessionID(_ token: String, in line: String) -> Bool {
-        line.range(of: token, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    fileprivate static func exactArguments(_ line: String) -> Set<String> {
+        Set(line.split(whereSeparator: \.isWhitespace).dropFirst(2).map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "\"'(),[]")) })
     }
 
-    private func containsExactArgument(_ token: String, in line: String) -> Bool {
-        line.split(whereSeparator: \.isWhitespace).dropFirst(2).contains { argument in
-            argument.trimmingCharacters(in: CharacterSet(charactersIn: "\"'(),[]")) == token
-        }
-    }
-
-    private func isClaudeProcess(_ line: String) -> Bool {
+    fileprivate static func isClaudeProcess(_ line: String) -> Bool {
         guard let executable = line.split(whereSeparator: \.isWhitespace).dropFirst().first else { return false }
         let token = executable.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
         return URL(fileURLWithPath: token).lastPathComponent == "claude"

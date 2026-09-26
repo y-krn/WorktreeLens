@@ -146,6 +146,27 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(unknown.activity(for: "thread-123", provider: .codex, snapshot: unknownSnapshot).0, .unknown)
     }
 
+    func testSessionActivityMatchingAcrossManyProcessLines() {
+        let output = [
+            "1 /usr/bin/other-process",
+            "2 /usr/local/bin/codex --thread THREAD-ABC",
+            "3 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            "4 /usr/local/bin/claude --resume claude-a",
+            "5 /usr/bin/tail thread-",
+            "6 split-id"
+        ].joined(separator: "\n") + "\n"
+        let probe = ProcessActivityProbe(runner: StaticRunner(output: output))
+        let snapshot = probe.snapshot()
+        XCTAssertEqual(probe.activity(for: "thread-abc", provider: .codex, snapshot: snapshot).0, .active, "session ID match is case-insensitive")
+        XCTAssertEqual(probe.activity(for: "other", provider: .codex, snapshot: snapshot).0, .active, "session ID matches as a substring")
+        XCTAssertEqual(probe.activity(for: "thread-\nsplit", provider: .codex, snapshot: snapshot).0, .inactive, "match must not span process lines")
+        XCTAssertEqual(probe.activity(for: "missing", provider: .codex, snapshot: snapshot).0, .inactive)
+        XCTAssertEqual(probe.activity(for: "missing", provider: .chatGPT, snapshot: snapshot).0, .unknown)
+        XCTAssertEqual(probe.activity(for: "claude-a", provider: .claude, snapshot: snapshot).0, .active)
+        XCTAssertEqual(probe.activity(for: "claude-b", provider: .claude, snapshot: snapshot).0, .unknown)
+        XCTAssertEqual(probe.activity(for: "THREAD-ABC", provider: .claude, snapshot: snapshot).0, .unknown, "Claude requires an exact argument on a claude process")
+    }
+
     func testSessionActivitySnapshotIsReusableAcrossSessions() {
         final class Counter: @unchecked Sendable {
             var value = 0
