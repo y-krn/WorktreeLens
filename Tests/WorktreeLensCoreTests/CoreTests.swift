@@ -1886,6 +1886,36 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(try git.snapshot(repositoryPath: fixture.repository.path).branches.contains { $0.name == "done" }, "branch is kept")
     }
 
+    func testMergedWorktreesIncludesGitHubVerifiedSquashMergesAfterFreshVerification() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let featurePath = fixture.root.appendingPathComponent("feature-wt")
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", featurePath.path, "feature"])
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let snapshot = RepositorySnapshot(path: local.path, defaultBranch: local.defaultBranch, branches: local.branches.map { branch in
+            branch.name == "feature" ? branch.withMergeEvidence(.githubVerified(prNumber: 140, mergedAt: Date(timeIntervalSince1970: 1))) : branch
+        })
+        func cleanup(_ github: RoutingRunner) -> CleanupService {
+            CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: GitHubService(runner: github, executable: "gh"))
+        }
+        let verified = cleanup(verifiedGitHubRunner(number: 140, sha: fixture.featureSHA))
+        let preview = verified.previewMergedWorktrees(snapshot: snapshot)
+        XCTAssertEqual(preview.allowedItems.map { URL(fileURLWithPath: $0.target).lastPathComponent }, ["feature-wt"], "squash-merged branch is a candidate despite being ahead of main")
+
+        let offline = cleanup(RoutingRunner { _ in throw ProcessRunnerError.failed("offline") })
+        XCTAssertTrue(offline.execute(preview).isEmpty, "GitHub unavailable fails closed")
+        XCTAssertTrue(cleanup(verifiedGitHubRunner(number: 140, sha: "0000000000000000000000000000000000000000")).execute(preview).isEmpty, "PR head must match the checkout")
+        XCTAssertTrue(cleanup(verifiedGitHubRunner(number: 141, sha: fixture.featureSHA)).execute(preview).isEmpty, "PR number must match the preview evidence")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: featurePath.path))
+
+        XCTAssertEqual(verified.execute(preview).removedWorktreePaths.map { URL(fileURLWithPath: $0).lastPathComponent }, ["feature-wt"])
+        XCTAssertEqual(try git.snapshot(repositoryPath: fixture.repository.path).branches.first { $0.name == "feature" }?.sha, fixture.featureSHA, "branch is kept")
+
+        let unverified = cleanup(verifiedGitHubRunner(number: 140, sha: fixture.featureSHA)).previewMergedWorktrees(snapshot: local)
+        XCTAssertTrue(unverified.items.isEmpty, "unmerged branches without GitHub evidence are not candidates")
+    }
+
     func testWorktreeWithRunningProcessIsNotRemoved() throws {
         let fixture = try makeFeatureRepository()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

@@ -330,8 +330,10 @@ public struct CleanupPreviewItem: Identifiable, Sendable {
     public let detail: String?
     public let expectedSHA: String?
     public let step: CleanupPlanStep?
+    /// Merge evidence captured at preview time; execution re-verifies it before acting.
+    public let mergeEvidence: MergeEvidence?
 
-    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil, detail: String? = nil, expectedSHA: String? = nil, step: CleanupPlanStep? = nil) {
+    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil, detail: String? = nil, expectedSHA: String? = nil, step: CleanupPlanStep? = nil, mergeEvidence: MergeEvidence? = nil) {
         self.id = id
         self.target = target
         self.allowed = allowed
@@ -339,6 +341,7 @@ public struct CleanupPreviewItem: Identifiable, Sendable {
         self.detail = detail
         self.expectedSHA = expectedSHA
         self.step = step
+        self.mergeEvidence = mergeEvidence
     }
 }
 

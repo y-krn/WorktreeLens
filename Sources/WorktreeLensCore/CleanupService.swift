@@ -43,19 +43,28 @@ public final class CleanupService: @unchecked Sendable {
         return CleanupPreview(operation: .removeCleanWorktrees, repositoryPath: snapshot.path, items: items)
     }
 
-    /// Candidates for automatic cleanup: checkouts whose HEAD has nothing beyond the default branch.
-    /// The snapshot's ahead count is only a hint; execution re-checks ancestry against a fresh default ref.
+    /// Candidates for automatic cleanup: checkouts whose HEAD has nothing beyond the default branch, or whose
+    /// branch head is exactly a GitHub-verified merged PR head (squash merges). Snapshot data is only a hint;
+    /// execution re-checks ancestry or the PR against fresh state.
     public func previewMergedWorktrees(snapshot: RepositorySnapshot) -> CleanupPreview {
         let processDirectories = sessions.processWorkingDirectories()
-        let items = snapshot.branches.flatMap { branch in
-            branch.worktrees.filter { $0.defaultAhead == 0 && !isSamePath($0.path, snapshot.path) && !branch.isDefaultBranch }.map {
-                keepBranchItem(worktree: $0, branch: branch, snapshot: snapshot, processDirectories: processDirectories)
+        let items = snapshot.branches.flatMap { branch -> [CleanupPreviewItem] in
+            guard !branch.isDefaultBranch else { return [] }
+            return branch.worktrees.compactMap { worktree -> CleanupPreviewItem? in
+                guard !isSamePath(worktree.path, snapshot.path) else { return nil }
+                var evidence: MergeEvidence?
+                if case .githubVerified = branch.mergeEvidence, !branch.isDetachedGroup, worktree.branch == branch.name, worktree.head == branch.sha {
+                    evidence = branch.mergeEvidence
+                } else if worktree.defaultAhead != 0 {
+                    return nil
+                }
+                return keepBranchItem(worktree: worktree, branch: branch, snapshot: snapshot, processDirectories: processDirectories, mergeEvidence: evidence)
             }
         }
         return CleanupPreview(operation: .removeMergedWorktrees, repositoryPath: snapshot.path, items: items)
     }
 
-    private func keepBranchItem(worktree: WorktreeInfo, branch: BranchInfo, snapshot: RepositorySnapshot, processDirectories: [String]?) -> CleanupPreviewItem {
+    private func keepBranchItem(worktree: WorktreeInfo, branch: BranchInfo, snapshot: RepositorySnapshot, processDirectories: [String]?, mergeEvidence: MergeEvidence? = nil) -> CleanupPreviewItem {
         // Preview only reports processes it can see; execution fails closed when the scan is unavailable.
         let decision: CleanupDecision
         if isSamePath(worktree.path, snapshot.path) {
@@ -66,7 +75,7 @@ public final class CleanupService: @unchecked Sendable {
             decision = decide(worktree: worktree, requireMerged: false)
         }
         let kept = worktree.isDetached ? "detached HEAD must stay reachable" : "branch \(branch.name) kept"
-        return item(id: worktree.path, target: worktree.path, decision: decision, detail: worktreeDetail(worktree: worktree, mergeStatus: kept), expectedSHA: worktree.head)
+        return CleanupPreviewItem(id: worktree.path, target: worktree.path, allowed: decision.allowed, reason: decision.reason, detail: worktreeDetail(worktree: worktree, mergeStatus: kept), expectedSHA: worktree.head, mergeEvidence: mergeEvidence)
     }
 
     public func previewDeleteBranch(snapshot: RepositorySnapshot, name: String) -> CleanupPreview {
@@ -153,7 +162,7 @@ public final class CleanupService: @unchecked Sendable {
         for target in preview.allowedItems {
             switch preview.operation {
             case .removeWorktree, .removeCleanWorktrees, .removeMergedWorktrees:
-                if executeRemoveWorktreeKeepingBranch(path: target.id, expectedSHA: target.expectedSHA, sessionCache: sessionCache, context: context, requireContainedInDefault: preview.operation == .removeMergedWorktrees) {
+                if executeRemoveWorktreeKeepingBranch(path: target.id, expectedSHA: target.expectedSHA, sessionCache: sessionCache, context: context, requireContainedInDefault: preview.operation == .removeMergedWorktrees, mergeEvidence: target.mergeEvidence) {
                     completed.append(target.id)
                     removedWorktrees.append(target.id)
                 }
@@ -272,7 +281,7 @@ public final class CleanupService: @unchecked Sendable {
     }
 
     /// Removes only the checkout. Commits stay reachable through the branch (or, for detached HEADs, another ref).
-    private func executeRemoveWorktreeKeepingBranch(path: String, expectedSHA: String?, sessionCache: SessionCleanupSafetyChecking?, context: CleanupRepositoryContext?, requireContainedInDefault: Bool = false) -> Bool {
+    private func executeRemoveWorktreeKeepingBranch(path: String, expectedSHA: String?, sessionCache: SessionCleanupSafetyChecking?, context: CleanupRepositoryContext?, requireContainedInDefault: Bool = false, mergeEvidence: MergeEvidence? = nil) -> Bool {
         guard let context, let expectedSHA, !isSamePath(path, context.path),
               let sessions = sessionCache?.freshSessionsForRemoval(),
               let worktree = try? git.cleanupWorktreeState(repositoryPath: context.path, path: path, sessions: sessions, context: context),
@@ -280,9 +289,15 @@ public final class CleanupService: @unchecked Sendable {
               decide(worktree: worktree, requireMerged: false).allowed,
               noProcessRunning(in: path) else { return false }
         if requireContainedInDefault {
-            guard let fresh = git.revalidatedCleanupContext(context), let defaultRef = fresh.defaultRef,
-                  worktree.branch != fresh.defaultBranch,
-                  git.isGitAncestor(repositoryPath: context.path, branch: expectedSHA, defaultRef: defaultRef) else { return false }
+            guard let fresh = git.revalidatedCleanupContext(context), let defaultBranch = fresh.defaultBranch, let defaultRef = fresh.defaultRef,
+                  worktree.branch != defaultBranch else { return false }
+            if !git.isGitAncestor(repositoryPath: context.path, branch: expectedSHA, defaultRef: defaultRef) {
+                // Squash merges: the checkout must be exactly the head of the same merged PR into the default branch.
+                guard case .githubVerified(let prNumber, _) = mergeEvidence, let branchName = worktree.branch else { return false }
+                let status = github.cleanupStatus(repositoryPath: context.path, pullRequestNumber: prNumber)
+                guard let verified = status.verifiedMergedPullRequest(defaultBranch: defaultBranch, branchName: branchName, localSHA: expectedSHA),
+                      verified.number == prNumber else { return false }
+            }
         } else if worktree.isDetached || worktree.branch == nil {
             guard git.isReachableFromRefs(repositoryPath: context.path, sha: expectedSHA) else { return false }
         }
