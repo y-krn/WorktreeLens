@@ -636,6 +636,18 @@ final class CoreTests: XCTestCase {
             XCTAssertEqual(counter.processScans, 1, "one process snapshot per fresh cleanup check")
         }
 
+        // A Claude process with a known working directory is located; the per-worktree process guard covers it.
+        for processLine in ["123 claude\n", "123 claude --resume unknown-id\n"] {
+            let home = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-located-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: home) }
+            let cache = try XCTUnwrap(SessionService(home: home.path, runner: ProcessTableRunner(ps: processLine, lsof: "p123\nfcwd\nn/tmp/other-wt\n")).makeCleanupSafetyCache())
+            XCTAssertNotNil(cache.freshSessionsForRemoval(), "located Claude process does not block all cleanup: \(processLine)")
+        }
+        let mixed = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-mixed-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: mixed) }
+        let mixedCache = try XCTUnwrap(SessionService(home: mixed.path, runner: ProcessTableRunner(ps: "123 claude\n124 claude\n", lsof: "p123\nfcwd\nn/tmp/other-wt\n")).makeCleanupSafetyCache())
+        XCTAssertNil(mixedCache.freshSessionsForRemoval(), "any Claude process without a readable cwd still fails closed")
+
         let knownHome = FileManager.default.temporaryDirectory.appendingPathComponent("worktree-lens-claude-known-\(UUID().uuidString)")
         let history = knownHome.appendingPathComponent(".claude/history.jsonl")
         try FileManager.default.createDirectory(at: history.deletingLastPathComponent(), withIntermediateDirectories: true)

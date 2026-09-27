@@ -306,9 +306,15 @@ public struct ProcessActivityProbe: SessionActivityProbing {
         URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
 
+    /// A Claude process is resolved when its session is known or its working directory is readable;
+    /// cleanup then blocks only the worktree that process runs in. Anything else blocks all removals.
     fileprivate func hasUnresolvedClaudeProcess(snapshot: ProcessActivitySnapshot, knownSessionIDs: Set<String>) -> Bool {
         guard snapshot.isAvailable else { return true }
-        return snapshot.claudeArguments.contains { knownSessionIDs.isDisjoint(with: $0) }
+        return zip(snapshot.claudeArguments, snapshot.claudePIDs).contains { arguments, pid in
+            guard knownSessionIDs.isDisjoint(with: arguments) else { return false }
+            guard let pid, snapshot.processCwds?[pid] != nil else { return true }
+            return false
+        }
     }
 
     private func containsSessionID(_ token: String, in snapshot: ProcessActivitySnapshot) -> Bool {
