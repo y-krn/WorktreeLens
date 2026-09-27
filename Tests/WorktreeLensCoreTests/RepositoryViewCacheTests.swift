@@ -545,8 +545,11 @@ final class RepositoryViewCacheTests: XCTestCase {
     }
 
     private func makeModel(paths: [String], scanner: any RepositoryScanning, detailLoader: (any GitHubDetailLoading)? = nil, git: GitService = GitService(), cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil) -> ApplicationModel {
-        let suite = "RepositoryViewCacheTests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
+        // An absolute suite path keeps the plist out of ~/Library/Preferences; removePersistentDomain alone leaves the file behind.
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RepositoryViewCacheTests-\(UUID().uuidString)")
+        try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let defaults = UserDefaults(suiteName: directory.appendingPathComponent("defaults").path)!
         let store = RepositoryStore(defaults: defaults)
         paths.forEach(store.add)
         return ApplicationModel(loadRepositories: false, repositoryStore: store, git: git, detailLoader: detailLoader, scanner: scanner, cleanupExecutor: cleanupExecutor)
