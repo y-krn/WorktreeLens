@@ -151,6 +151,10 @@ public final class CleanupService: @unchecked Sendable {
                     }
                 }
             }
+            // Merged cleanup also drops metadata of worktrees whose directories are already gone.
+            if preview.operation == .deleteMergedBranches, (try? git.pruneWorktrees(repositoryPath: preview.repositoryPath)) == true {
+                requiresFullRefresh = true
+            }
             return CleanupExecutionResult(completedTargetIDs: completed, removedWorktreePaths: removedWorktrees, deletedLocalBranches: deletedBranches, requiresFullRefresh: requiresFullRefresh)
         }
 

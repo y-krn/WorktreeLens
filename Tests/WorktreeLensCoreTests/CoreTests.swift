@@ -1089,6 +1089,22 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue((try runGit(["-C", fixture.repository.path, "show-ref", "--verify", "refs/remotes/origin/feature"])).contains(fixture.featureSHA))
     }
 
+    func testMergedCleanupPrunesMetadataOfMissingWorktrees() throws {
+        let fixture = try makeFeatureRepository()
+        let missingPath = fixture.root.appendingPathComponent("missing-worktree")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", "--detach", missingPath.path])
+        try FileManager.default.removeItem(at: missingPath)
+        let cleanup = CleanupService(git: GitService(), sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()))
+
+        let preview = cleanup.previewMergedBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: []))
+        let result = cleanup.execute(preview)
+
+        XCTAssertTrue(result.requiresFullRefresh)
+        XCTAssertFalse(try runGit(["-C", fixture.repository.path, "worktree", "list", "--porcelain"]).contains(missingPath.lastPathComponent))
+        XCTAssertFalse(cleanup.execute(preview).requiresFullRefresh, "nothing left to prune")
+    }
+
     func testMergedGitAncestorAttachedWorktreeIsRemovedWhenRemoteRemains() throws {
         let fixture = try makeFeatureRepository()
         let remotePath = fixture.root.appendingPathComponent("remote.git")

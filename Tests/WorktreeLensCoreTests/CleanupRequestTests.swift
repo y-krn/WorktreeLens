@@ -4,47 +4,61 @@ import WorktreeLensCore
 
 @MainActor
 final class CleanupRequestTests: XCTestCase {
-    func testRemoteGoneMenuRequestImmediatelyShowsPreparingAndPresentsPreview() async throws {
+    func testCleanUpRequestImmediatelyShowsPreparingAndPresentsPreview() async throws {
         let model = ApplicationModel(loadRepositories: false)
         let snapshot = RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [])
         model.selectedPath = snapshot.path
         model.snapshot = snapshot
 
-        model.requestDeleteRemoteGoneBranches()
+        model.requestDeleteMergedBranches()
 
         XCTAssertTrue(model.isCleanupPreviewLoading)
         XCTAssertEqual(model.statusMessage, "Preparing cleanup…")
         try await waitForPreview(model)
         XCTAssertNotNil(model.cleanupPreview)
-        XCTAssertEqual(model.statusMessage, "No remote-gone branches found")
+        XCTAssertEqual(model.statusMessage, "Nothing to clean up")
     }
 
-    func testRemoteGoneRequestDuringExecutionShowsVisibleFeedback() {
+    func testCleanUpRequestDuringExecutionShowsVisibleFeedback() {
         let model = ApplicationModel(loadRepositories: false)
         let snapshot = RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [])
         model.selectedPath = snapshot.path
         model.snapshot = snapshot
         model.cleanupExecutionState = .running
 
-        model.requestDeleteRemoteGoneBranches()
+        model.requestDeleteMergedBranches()
 
         XCTAssertNil(model.cleanupPreview)
         XCTAssertEqual(model.statusMessage, "Cleanup already running")
     }
 
-    func testRemoteGoneRequestRecoversCompletedStateWithoutPreview() async throws {
+    func testCleanUpRequestRecoversCompletedStateWithoutPreview() async throws {
         let model = ApplicationModel(loadRepositories: false)
         let snapshot = RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [])
         model.selectedPath = snapshot.path
         model.snapshot = snapshot
         model.cleanupExecutionState = .completed(0)
 
-        model.requestDeleteRemoteGoneBranches()
+        model.requestDeleteMergedBranches()
 
         XCTAssertTrue(model.isCleanupPreviewLoading)
         try await waitForPreview(model)
         XCTAssertNotNil(model.cleanupPreview)
         XCTAssertEqual(model.cleanupExecutionState, .idle)
+    }
+
+    func testCleanUpPreviewHidesBranchesThatAreNeverCandidates() {
+        func group(_ name: String, allowed: Bool, reason: CleanupBlockReason?) -> CleanupPreviewGroup {
+            CleanupPreviewGroup(branchName: name, expectedSHA: "sha", steps: [CleanupPreviewItem(id: "\(name):branch", target: name, allowed: allowed, reason: reason, step: .deleteBranch)])
+        }
+        let preview = CleanupPreview(operation: .deleteMergedBranches, repositoryPath: "/tmp/repository", items: [], groups: [
+            group("main", allowed: false, reason: .defaultBranch),
+            group("wip", allowed: false, reason: .unmergedBranch),
+            group("dirty", allowed: false, reason: .dirtyWorktree),
+            group("merged", allowed: true, reason: nil)
+        ])
+
+        XCTAssertEqual(preview.displayedGroups.map(\.branchName), ["dirty", "merged"])
     }
 
     private func waitForPreview(_ model: ApplicationModel) async throws {
