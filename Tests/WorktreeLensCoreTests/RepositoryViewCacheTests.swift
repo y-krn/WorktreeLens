@@ -204,11 +204,11 @@ final class RepositoryViewCacheTests: XCTestCase {
         let refreshed = localResult(path: "/tmp/cleanup-A", branch: "after-cleanup")
         let other = localResult(path: "/tmp/cleanup-B", branch: "other")
         let scanner = CountingScanner(results: [first.snapshot.path: [first, refreshed], other.snapshot.path: [other]])
-        let model = makeModel(paths: [first.snapshot.path, other.snapshot.path], scanner: scanner, git: GitService(runner: SuccessfulRunner()))
+        let model = makeModel(paths: [first.snapshot.path, other.snapshot.path], scanner: scanner, cleanupExecutor: { _ in CleanupExecutionResult(requiresFullRefresh: true) })
 
         model.selectRepository(path: first.snapshot.path)
         await waitForRefresh(model)
-        let preview = model.cleanup.previewPrune(snapshot: first.snapshot)
+        let preview = CleanupPreview(operation: .deleteMergedBranches, repositoryPath: first.snapshot.path, items: [])
         model.cleanupPreview = preview
         model.executeCleanup(preview)
         await waitForRefresh(model, branchID: "after-cleanup")
@@ -559,12 +559,6 @@ final class RepositoryViewCacheTests: XCTestCase {
         }.sink { _ in finished.fulfill() }
         await fulfillment(of: [finished], timeout: 2)
         withExtendedLifetime(cancellable) {}
-    }
-}
-
-private struct SuccessfulRunner: ProcessRunning {
-    func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
-        ProcessResult(status: 0)
     }
 }
 

@@ -275,7 +275,6 @@ public enum CleanupBlockReason: Equatable, Sendable {
     case unknownSessionActivity
     case lockedWorktree
     case missingBranch
-    case notStale
     case noDefaultBranch
     case detachedWorktree
     case defaultBranch
@@ -293,7 +292,6 @@ public enum CleanupBlockReason: Equatable, Sendable {
         case .unknownSessionActivity: return "Session activity unknown"
         case .lockedWorktree: return "Locked worktree"
         case .missingBranch: return "Branch missing"
-        case .notStale: return "Not stale"
         case .noDefaultBranch: return "Default branch unknown"
         case .detachedWorktree: return "Detached worktree"
         case .defaultBranch: return "Default branch cannot be deleted"
@@ -309,12 +307,7 @@ public enum CleanupBlockReason: Equatable, Sendable {
 public enum CleanupOperation: String, Sendable {
     case removeWorktree = "Remove worktree"
     case deleteBranch = "Delete branch"
-    case prune = "Prune worktree metadata"
     case deleteMergedBranches = "Clean up merged branches and worktrees"
-    case removeStaleWorktrees = "Remove stale worktrees"
-    case deleteRemoteGoneBranches = "Clean up merged remote-gone branches"
-    case removeCleanWorktrees = "Remove clean worktrees (keep branches)"
-    case removeMergedWorktrees = "Remove worktrees merged into default branch (keep branches)"
 }
 
 public enum CleanupPlanStep: String, Sendable {
@@ -330,10 +323,8 @@ public struct CleanupPreviewItem: Identifiable, Sendable {
     public let detail: String?
     public let expectedSHA: String?
     public let step: CleanupPlanStep?
-    /// Merge evidence captured at preview time; execution re-verifies it before acting.
-    public let mergeEvidence: MergeEvidence?
 
-    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil, detail: String? = nil, expectedSHA: String? = nil, step: CleanupPlanStep? = nil, mergeEvidence: MergeEvidence? = nil) {
+    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil, detail: String? = nil, expectedSHA: String? = nil, step: CleanupPlanStep? = nil) {
         self.id = id
         self.target = target
         self.allowed = allowed
@@ -341,7 +332,6 @@ public struct CleanupPreviewItem: Identifiable, Sendable {
         self.detail = detail
         self.expectedSHA = expectedSHA
         self.step = step
-        self.mergeEvidence = mergeEvidence
     }
 }
 
@@ -371,14 +361,12 @@ public struct CleanupPreview: Identifiable, Sendable {
     public let repositoryPath: String
     public let items: [CleanupPreviewItem]
     public let groups: [CleanupPreviewGroup]
-    public let staleDays: Int?
 
-    public init(operation: CleanupOperation, repositoryPath: String, items: [CleanupPreviewItem], staleDays: Int? = nil, groups: [CleanupPreviewGroup] = []) {
+    public init(operation: CleanupOperation, repositoryPath: String, items: [CleanupPreviewItem], groups: [CleanupPreviewGroup] = []) {
         self.operation = operation
         self.repositoryPath = repositoryPath
         self.items = items
         self.groups = groups
-        self.staleDays = staleDays
     }
 
     public var allowedItems: [CleanupPreviewItem] { items.filter(\.allowed) }
