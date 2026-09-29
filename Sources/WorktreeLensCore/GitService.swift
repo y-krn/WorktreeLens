@@ -75,8 +75,10 @@ public final class GitService: @unchecked Sendable {
         _ = try run(["-C", repositoryPath, "worktree", "remove", path])
     }
 
-    public func pruneWorktrees(repositoryPath: String) throws {
-        _ = try run(["-C", repositoryPath, "worktree", "prune"])
+    /// Returns whether any stale metadata was removed; `--verbose` reports each removal on stderr.
+    @discardableResult
+    public func pruneWorktrees(repositoryPath: String) throws -> Bool {
+        !(try run(["-C", repositoryPath, "worktree", "prune", "--verbose"]).stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     public func deleteBranch(repositoryPath: String, branch: String) throws {

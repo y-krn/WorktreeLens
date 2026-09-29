@@ -55,11 +55,6 @@ final class ApplicationModel: ObservableObject {
     @Published var isCleanupPreviewLoading = false
     @Published var scanPhase: String?
     @Published var canCancelGitHub = false
-    @Published var staleDays = 7
-    @Published var autoRemoveMergedWorktrees = false {
-        didSet { repositoryStore.autoRemoveMergedWorktrees = autoRemoveMergedWorktrees }
-    }
-    @Published private(set) var isAutoCleanupRunning = false
 
     let repositoryStore: RepositoryStore
     let git: GitService
@@ -87,7 +82,6 @@ final class ApplicationModel: ObservableObject {
         self.cleanupExecutor = cleanupExecutor
         self.scanner = injectedScanner ?? RepositoryScanService(git: git, sessions: sessions, github: github)
         registeredPaths = repositoryStore.paths
-        autoRemoveMergedWorktrees = repositoryStore.autoRemoveMergedWorktrees
         selectedPath = nil
         if loadRepositories, let path = registeredPaths.first { selectRepository(path: path) }
     }
@@ -189,7 +183,6 @@ final class ApplicationModel: ObservableObject {
                     self.statusMessage = Task.isCancelled ? "GitHub loading cancelled" : nil
                     self.saveCurrentView()
                     self.loadGitHubDetailForCurrentSelection()
-                    self.autoRemoveMergedWorktreesIfEnabled(snapshot: enriched)
                 }
             } catch {
                 await MainActor.run {
@@ -353,41 +346,16 @@ final class ApplicationModel: ObservableObject {
         requestPreview { cleanup.previewRemoveWorktree(snapshot: snapshot, path: worktree.path) }
     }
 
-    func requestRemoveCleanWorktrees() {
-        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
-        let cleanup = self.cleanup
-        requestPreview { cleanup.previewCleanWorktrees(snapshot: snapshot) }
-    }
-
     func requestDeleteSelectedBranch() {
         guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path, let branch = selectedBranch() else { return }
         let cleanup = self.cleanup
         requestPreview { cleanup.previewDeleteBranch(snapshot: snapshot, name: branch.name) }
     }
 
-    func requestPrune() {
-        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
-        let cleanup = self.cleanup
-        requestPreview { cleanup.previewPrune(snapshot: snapshot) }
-    }
-
     func requestDeleteMergedBranches() {
         guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let cleanup = self.cleanup
         requestPreview { cleanup.previewMergedBranches(snapshot: snapshot) }
-    }
-
-    func requestRemoveStaleWorktrees() {
-        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
-        let days = staleDays
-        let cleanup = self.cleanup
-        requestPreview { cleanup.previewStaleWorktrees(snapshot: snapshot, staleDays: days) }
-    }
-
-    func requestDeleteRemoteGoneBranches() {
-        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
-        let cleanup = self.cleanup
-        requestPreview { cleanup.previewRemoteGoneBranches(snapshot: snapshot) }
     }
 
     func executeCleanup(_ preview: CleanupPreview) {
@@ -416,26 +384,6 @@ final class ApplicationModel: ObservableObject {
             await MainActor.run {
                 guard self.cleanupPreview?.id == preview.id else { return }
                 self.publishCleanupResult(result, repositoryPath: repositoryPath)
-            }
-        }
-    }
-
-    /// Runs after a refresh without a preview sheet; the same final guards as manual cleanup apply per worktree.
-    func autoRemoveMergedWorktreesIfEnabled(snapshot: RepositorySnapshot) {
-        guard autoRemoveMergedWorktrees, !isAutoCleanupRunning, cleanupExecutionState == .idle, cleanupPreview == nil, !isCleanupPreviewLoading else { return }
-        let cleanup = self.cleanup
-        let preview = cleanup.previewMergedWorktrees(snapshot: snapshot)
-        guard !preview.allowedItems.isEmpty else { return }
-        let repositoryPath = URL(fileURLWithPath: preview.repositoryPath).standardizedFileURL.path
-        let cleanupExecutor = self.cleanupExecutor
-        isAutoCleanupRunning = true
-        Task.detached(priority: .utility) {
-            let result = cleanupExecutor?(preview) ?? cleanup.execute(preview)
-            await MainActor.run {
-                self.isAutoCleanupRunning = false
-                guard !result.removedWorktreePaths.isEmpty else { return }
-                self.applyCleanupResult(result, repositoryPath: repositoryPath)
-                self.statusMessage = "Auto-removed \(result.removedWorktreePaths.count) merged worktree(s)"
             }
         }
     }
@@ -545,8 +493,8 @@ final class ApplicationModel: ObservableObject {
                 self.isCleanupPreviewLoading = false
                 self.cleanupExecutionState = .idle
                 self.cleanupPreview = preview
-                if preview.operation == .deleteRemoteGoneBranches, preview.groups.isEmpty {
-                    self.statusMessage = "No remote-gone branches found"
+                if preview.operation == .deleteMergedBranches, preview.displayedGroups.isEmpty {
+                    self.statusMessage = "Nothing to clean up"
                 } else {
                     self.statusMessage = nil
                 }
@@ -555,7 +503,7 @@ final class ApplicationModel: ObservableObject {
     }
 
     private func canRequestCleanup() -> Bool {
-        if cleanupExecutionState == .running || isAutoCleanupRunning {
+        if cleanupExecutionState == .running {
             statusMessage = "Cleanup already running"
             return false
         }
@@ -655,7 +603,8 @@ struct ContentView: View {
                 if model.isLoading || model.isCleanupPreviewLoading { ProgressView().controlSize(.small) }
                 if model.canCancelGitHub { Button("Cancel GitHub") { model.cancelGitHub() } }
                 Button { model.refreshSelected() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
-                Menu { cleanupMenu } label: { Label("Cleanup", systemImage: "trash") }
+                Button { model.requestDeleteMergedBranches() } label: { Label("Clean Up…", systemImage: "trash") }
+                    .help("Remove merged branches and their worktrees")
             }
             .padding()
             Divider()
@@ -671,12 +620,26 @@ struct ContentView: View {
                                         }
                                     } label: {
                                         WorktreeRow(worktree: worktree)
+                                            .contextMenu {
+                                                Button("Remove Worktree…") {
+                                                    model.selectWorktree(id: worktree.id)
+                                                    model.requestCleanupAfterMenuDismissal { model.requestRemoveSelectedWorktree() }
+                                                }
+                                            }
                                     }
                                     .tag(RepositorySelection.worktree(worktree.id))
                                 }
                             } label: {
                                 BranchRow(branch: branch)
                                     .contentShape(Rectangle())
+                                    .contextMenu {
+                                        if !branch.isDetachedGroup {
+                                            Button("Delete Branch…") {
+                                                model.selectBranch(id: branch.id)
+                                                model.requestCleanupAfterMenuDismissal { model.requestDeleteSelectedBranch() }
+                                            }
+                                        }
+                                    }
                                     .tag(RepositorySelection.branch(branch.id))
                                     .onTapGesture { model.selectBranch(id: branch.id) }
                             }
@@ -702,24 +665,6 @@ struct ContentView: View {
             if let statusMessage = model.statusMessage {
                 Text(statusMessage).font(.caption).foregroundStyle(.secondary).padding(.bottom, 8)
             }
-        }
-    }
-
-    private var cleanupMenu: some View {
-        Group {
-            Button("Remove Selected Worktree…") { model.requestCleanupAfterMenuDismissal { model.requestRemoveSelectedWorktree() } }
-                .disabled(model.selectedWorktree() == nil)
-            Button("Delete Selected Branch…") { model.requestCleanupAfterMenuDismissal { model.requestDeleteSelectedBranch() } }
-                .disabled(model.selectedBranch() == nil)
-            Divider()
-            Button("Remove Clean Worktrees (Keep Branches)…") { model.requestCleanupAfterMenuDismissal { model.requestRemoveCleanWorktrees() } }
-            Button("Prune Worktree Metadata…") { model.requestCleanupAfterMenuDismissal { model.requestPrune() } }
-            Button("Clean Up Merged Branches…") { model.requestCleanupAfterMenuDismissal { model.requestDeleteMergedBranches() } }
-            Button("Delete Stale Worktrees (\(model.staleDays)d)…") { model.requestCleanupAfterMenuDismissal { model.requestRemoveStaleWorktrees() } }
-            Button("Clean Up Merged Remote-gone Branches…") { model.requestCleanupAfterMenuDismissal { model.requestDeleteRemoteGoneBranches() } }
-            Divider()
-            Toggle("Auto-remove Merged Worktrees on Refresh", isOn: $model.autoRemoveMergedWorktrees)
-            Stepper("Stale threshold: \(model.staleDays) days", value: $model.staleDays, in: 1...365)
         }
     }
 
@@ -906,18 +851,18 @@ struct CleanupConfirmationView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Confirm cleanup").font(.system(.title2, design: .rounded).weight(.bold))
             Text(preview.operation.rawValue).foregroundStyle(.secondary)
-            if preview.operation == .deleteRemoteGoneBranches, preview.groups.isEmpty {
-                Text("No remote-gone branches found")
+            if preview.operation == .deleteMergedBranches, preview.displayedGroups.isEmpty {
+                Text("Nothing to clean up")
                     .font(.headline)
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 7) {
-                    if preview.groups.isEmpty {
+                    if !preview.isGrouped {
                         ForEach(preview.items) { item in
                             cleanupItem(item)
                         }
                     } else {
-                        ForEach(preview.groups) { group in
+                        ForEach(preview.displayedGroups) { group in
                             VStack(alignment: .leading, spacing: 5) {
                                 Text(group.branchName).font(.headline)
                                 ForEach(group.steps) { item in
@@ -980,11 +925,11 @@ struct CleanupConfirmationView: View {
     }
 
     private var allowedCount: Int {
-        preview.groups.isEmpty ? preview.allowedItems.count : preview.groups.filter(\.allowed).count
+        preview.isGrouped ? preview.displayedGroups.filter(\.allowed).count : preview.allowedItems.count
     }
 
     private var totalCount: Int {
-        preview.groups.isEmpty ? preview.items.count : preview.groups.count
+        preview.isGrouped ? preview.displayedGroups.count : preview.items.count
     }
 
     @ViewBuilder
@@ -1000,6 +945,19 @@ struct CleanupConfirmationView: View {
             }
         }
     }
+}
+
+extension CleanupPreview {
+    /// Merged cleanup plans every branch; unmerged and default branches are never candidates, so they stay out of view.
+    var displayedGroups: [CleanupPreviewGroup] {
+        guard operation == .deleteMergedBranches else { return groups }
+        return groups.filter { group in
+            let reason = group.steps.last?.reason
+            return reason != .unmergedBranch && reason != .defaultBranch
+        }
+    }
+
+    var isGrouped: Bool { operation == .deleteMergedBranches || !groups.isEmpty }
 }
 
 struct Badge: View {
