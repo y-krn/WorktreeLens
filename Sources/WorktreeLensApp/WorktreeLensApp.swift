@@ -621,6 +621,9 @@ struct ContentView: View {
                                     } label: {
                                         WorktreeRow(worktree: worktree)
                                             .contextMenu {
+                                                Button("Copy Worktree Path") {
+                                                    WorktreePathClipboard.copy(worktree, to: SystemClipboardWriter())
+                                                }
                                                 Button("Remove Worktree…") {
                                                     model.selectWorktree(id: worktree.id)
                                                     model.requestCleanupAfterMenuDismissal { model.requestRemoveSelectedWorktree() }
