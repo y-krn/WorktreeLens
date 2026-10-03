@@ -168,10 +168,11 @@ private struct WireRuns: Decodable, Sendable {
 /// Display evidence only. Destructive cleanup must still perform its independent final verification.
 public struct GitHubDisplayService: Sendable {
     private let api: GitHubAPIClient
+    private let stateStore: GitHubStateStore
     private let clock: any GitHubClock
     private let limits: GitHubDisplayLimits
     public init(api: GitHubAPIClient, clock: any GitHubClock = SystemGitHubClock(), limits: GitHubDisplayLimits = GitHubDisplayLimits()) {
-        self.api = api; self.clock = clock; self.limits = limits
+        self.api = api; self.stateStore = api.stateStore; self.clock = clock; self.limits = limits
     }
     private static let prFields = """
     id number title state isDraft baseRefName headRefName headRefOid mergedAt url
@@ -198,6 +199,7 @@ public struct GitHubDisplayService: Sendable {
     private struct Budget {
         var requests = 0; var items = 0; var cost = 0
         let deadline: Date
+        let requestContext: GitHubRequestContext?
     }
     private func available(_ budget: Budget) async -> Bool {
         let now = await clock.now()
@@ -222,21 +224,36 @@ public struct GitHubDisplayService: Sendable {
         guard await available(budget) else { throw ProcessRunnerError.failed("GitHub retrieval budget exhausted.") }
         budget.requests += 1
         let deadline = budget.deadline
+        let requestContext = budget.requestContext
         let result: GitHubGraphQLResult<GraphData> = try await bounded(deadline: deadline) {
-            try await api.graphQL(query: "query { \(fields) rateLimit { cost } }", variables: [String: String](), deadline: deadline)
+            try await api.graphQL(query: "query { \(fields) rateLimit { cost } }", variables: [String: String](),
+                                  deadline: deadline, context: requestContext)
         }
         budget.cost += result.data?.cost ?? limits.maxCost
         return result
     }
     public func summaries(targets: [GitHubBranchTarget], timeout: TimeInterval = 10) async -> [String: GitHubStatus] {
-        var budget = Budget(deadline: (await clock.now()).addingTimeInterval(timeout))
+        let context = try? await api.requestContext()
+        var budget = Budget(deadline: (await clock.now()).addingTimeInterval(timeout), requestContext: context)
         return await summaries(targets: targets, budget: &budget)
     }
+    public func cachedStatuses(targets: [GitHubBranchTarget]) async -> [String: GitHubStatus] {
+        guard let context = try? await api.requestContext() else { return [:] }
+        var result: [String: GitHubStatus] = [:]
+        for target in targets {
+            if let status = await stateStore.cachedStatus(accountIdentifier: context.accountIdentifier, target: target) {
+                result[target.branchID] = status
+            }
+        }
+        return result
+    }
     private func summaries(targets: [GitHubBranchTarget], budget: inout Budget) async -> [String: GitHubStatus] {
+        let accountIdentifier = budget.requestContext?.accountIdentifier
         var result: [String: GitHubStatus] = [:]
         let size = max(1, min(limits.batchSize, 20))
         for start in stride(from: 0, to: targets.count, by: size) {
             let batch = Array(targets[start..<min(start + size, targets.count)])
+            var repositoryIDs: [Int: String] = [:]
             var pending = batch.indices.map { ($0, Optional<String>.none) }
             var found: [Int: [WirePR]] = [:]
             var errors: [Int: String] = [:]
@@ -263,6 +280,7 @@ public struct GitHubDisplayService: Sendable {
                               !repo.isFork || batch[index].explicitBase else {
                             errors[index] = "GitHub repository or PR connection unresolved."; continue
                         }
+                        repositoryIDs[index] = repo.id
                         budget.items += page.availableNodes.count
                         found[index, default: []] += page.availableNodes.compactMap { $0 }.filter { accepted($0, target: batch[index], repo: repo) }
                         if page.availableNodes.compactMap({ $0 }).contains(where: { $0.headRefName == batch[index].branch && ($0.headRepository == nil || $0.baseRepository == nil) }) {
@@ -281,6 +299,7 @@ public struct GitHubDisplayService: Sendable {
                               (!repo.isFork || batch[item.0].explicitBase), pr.number == item.1, accepted(pr, target: batch[item.0], repo: repo) else {
                             errors[item.0] = "Known GitHub PR identity unresolved."; continue
                         }
+                        repositoryIDs[item.0] = repo.id
                         budget.items += 1; found[item.0, default: []].append(pr)
                         // A closed, unmerged PR can be replaced without changing the branch SHA.
                         let needsDiscovery = pr.headRefOid != batch[item.0].sha || (pr.state == "CLOSED" && pr.mergedAt == nil)
@@ -301,16 +320,29 @@ public struct GitHubDisplayService: Sendable {
                 let prs = Array(Dictionary(found[index, default: []].map { ($0.id, $0.model) }, uniquingKeysWith: { _, latest in latest }).values).sorted { $0.number < $1.number }
                 if budget.items > limits.maxItems || budget.cost > limits.maxCost || deadlineReached { incomplete.insert(index) }
                 let phase: GitHubFetchState.Phase = incomplete.contains(index) ? .incomplete : errors[index] == nil ? .loaded : prs.isEmpty ? .failed : .incomplete
-                let fetch = GitHubFetchState(phase: phase, fetchedAt: await clock.now(), error: errors[index] ?? (phase == .incomplete ? "GitHub retrieval incomplete." : nil))
-                result[batch[index].branchID] = GitHubStatus(issues: [], pullRequests: prs, actions: [], error: fetch.error,
+                let attemptedAt = await clock.now()
+                let fetch = GitHubFetchState(phase: phase, fetchedAt: phase == .loaded ? attemptedAt : nil,
+                                             lastAttemptAt: attemptedAt,
+                                             error: errors[index] ?? (phase == .incomplete ? "GitHub retrieval incomplete." : nil))
+                let status = GitHubStatus(issues: [], pullRequests: prs, actions: [], error: fetch.error,
                     isLoaded: false, mergeEvidenceLoaded: fetch.isComplete, pullRequestFetch: fetch, localSHA: batch[index].sha)
+                if let accountIdentifier {
+                    result[batch[index].branchID] = await stateStore.recordStatus(accountIdentifier: accountIdentifier,
+                        target: batch[index], repositoryID: repositoryIDs[index],
+                        sessionRevision: budget.requestContext?.revision, status: status)
+                } else {
+                    result[batch[index].branchID] = status
+                }
             }
         }
         return result
     }
 
     public func details(target: GitHubBranchTarget, summary: GitHubStatus, timeout: TimeInterval = 10) async -> GitHubStatus {
-        var budget = Budget(deadline: (await clock.now()).addingTimeInterval(timeout))
+        let context = try? await api.requestContext()
+        let accountIdentifier = context?.accountIdentifier
+        var budget = Budget(deadline: (await clock.now()).addingTimeInterval(timeout), requestContext: context)
+        var resolvedRepositoryID: String?
         var prs = summary.pullRequests
         var prFetch = summary.pullRequestFetch
         if prFetch.phase == .notRequested {
@@ -340,11 +372,15 @@ public struct GitHubDisplayService: Sendable {
                     guard let repo = response.data?.repositories["i\(offset)"], let pr = repo.pullRequest,
                           pr.number == item.0, accepted(pr, target: target, repo: repo) else {
                         issueError = "GitHub PR details unavailable."; issuesIncomplete = true
-                        prFetch = GitHubFetchState(phase: .incomplete, fetchedAt: await clock.now(), error: issueError)
+                        prFetch = GitHubFetchState(phase: .incomplete, fetchedAt: prFetch.fetchedAt,
+                                                   lastAttemptAt: await clock.now(), stale: prFetch.fetchedAt != nil, error: issueError)
                         continue
                     }
+                    resolvedRepositoryID = repo.id
                     if let index = prs.firstIndex(where: { $0.number == pr.number }) { prs[index] = pr.model }
-                    prFetch = GitHubFetchState(phase: prFetch.phase, fetchedAt: await clock.now(), error: prFetch.error)
+                    let fetchedAt = prFetch.phase == .loaded ? await clock.now() : prFetch.fetchedAt
+                    prFetch = GitHubFetchState(phase: prFetch.phase, fetchedAt: fetchedAt,
+                                               lastAttemptAt: await clock.now(), stale: prFetch.stale, error: prFetch.error)
                     guard let page = pr.closingIssuesReferences else {
                         issueError = "GitHub linked issues unavailable."; issuesIncomplete = true; continue
                     }
@@ -358,6 +394,7 @@ public struct GitHubDisplayService: Sendable {
                 if checkPending {
                     if let repo = response.data?.repositories["ci"], repo.nameWithOwner.lowercased() == target.base.fullName.lowercased(),
                        let commit = repo.object, commit.oid == target.sha {
+                        resolvedRepositoryID = repo.id
                         if let page = commit.statusCheckRollup?.contexts {
                             checks += page.availableNodes.compactMap { $0?.model(sha: commit.oid) }; budget.items += page.availableNodes.count
                             checkPending = page.pageInfo.hasNextPage
@@ -377,16 +414,21 @@ public struct GitHubDisplayService: Sendable {
         }
         if budget.items > limits.maxItems || budget.cost > limits.maxCost { issuesIncomplete = true; checksIncomplete = true }
         let now = await clock.now()
-        issueFetch = GitHubFetchState(phase: !prFetch.isComplete || issuesIncomplete || !issuePending.isEmpty ? .incomplete : .loaded, fetchedAt: now, error: issueError)
-        checkFetch = GitHubFetchState(phase: checksIncomplete || checkPending ? .incomplete : checkError != nil ? (checks.isEmpty ? .failed : .incomplete) : .loaded, fetchedAt: now, error: checkError)
+        let issuePhase: GitHubFetchState.Phase = !prFetch.isComplete || issuesIncomplete || !issuePending.isEmpty ? .incomplete : .loaded
+        let checkPhase: GitHubFetchState.Phase = checksIncomplete || checkPending ? .incomplete : checkError != nil ? (checks.isEmpty ? .failed : .incomplete) : .loaded
+        issueFetch = GitHubFetchState(phase: issuePhase, fetchedAt: issuePhase == .loaded ? now : nil, lastAttemptAt: now, error: issueError)
+        checkFetch = GitHubFetchState(phase: checkPhase, fetchedAt: checkPhase == .loaded ? now : nil, lastAttemptAt: now, error: checkError)
         var page = 1; var count = 0; var total = Int.max; var actionError: String?
         let actionPageSize = max(1, min(100, limits.maxItems - budget.items))
         while count < total, await available(budget) {
             do {
                 budget.requests += 1
                 let deadline = budget.deadline
+                let requestContext = budget.requestContext
                 let path = "/repos/\(target.base.fullName)/actions/runs?head_sha=\(target.sha.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")&per_page=\(actionPageSize)&page=\(page)"
-                let runs: WireRuns = try await bounded(deadline: deadline) { try await api.get(path: path, deadline: deadline) }
+                let runs: WireRuns = try await bounded(deadline: deadline) {
+                    try await api.get(path: path, deadline: deadline, context: requestContext)
+                }
                 total = runs.total_count; count += runs.workflow_runs.count; budget.items += runs.workflow_runs.count
                 actions += runs.workflow_runs.map { run in
                     GitHubActionRun(id: "\(run.repository.full_name):\(run.id):\(run.run_attempt)", name: run.name ?? "Workflow", status: run.status,
@@ -404,10 +446,16 @@ public struct GitHubDisplayService: Sendable {
         let latest = Dictionary(grouping: actions, by: { "\($0.repositoryName ?? ""):\($0.runID ?? 0)" }).values.compactMap {
             $0.max { ($0.attempt ?? 0) < ($1.attempt ?? 0) }
         }.sorted { ($0.runID ?? 0) > ($1.runID ?? 0) }
-        actionFetch = GitHubFetchState(phase: budget.items > limits.maxItems ? .incomplete : actionError != nil ? (actions.isEmpty ? .failed : .incomplete) : count < total ? .incomplete : .loaded,
-                                      fetchedAt: await clock.now(), error: actionError)
-        return GitHubStatus(issues: Array(Dictionary(issues.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest }).values).sorted { $0.id < $1.id }, pullRequests: prs, actions: latest,
+        let actionPhase: GitHubFetchState.Phase = budget.items > limits.maxItems ? .incomplete : actionError != nil ? (actions.isEmpty ? .failed : .incomplete) : count < total ? .incomplete : .loaded
+        let actionAttemptedAt = await clock.now()
+        actionFetch = GitHubFetchState(phase: actionPhase, fetchedAt: actionPhase == .loaded ? actionAttemptedAt : nil,
+                                      lastAttemptAt: actionAttemptedAt, error: actionError)
+        let status = GitHubStatus(issues: Array(Dictionary(issues.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest }).values).sorted { $0.id < $1.id }, pullRequests: prs, actions: latest,
                             error: prFetch.error, isLoaded: true, mergeEvidenceLoaded: prFetch.isComplete, checks: Array(Dictionary(checks.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest }).values).sorted { $0.id < $1.id },
                             pullRequestFetch: prFetch, issueFetch: issueFetch, checkFetch: checkFetch, actionFetch: actionFetch, localSHA: target.sha)
+        guard let accountIdentifier else { return status }
+        return await stateStore.recordStatus(accountIdentifier: accountIdentifier, target: target,
+                                              repositoryID: resolvedRepositoryID,
+                                              sessionRevision: budget.requestContext?.revision, status: status)
     }
 }

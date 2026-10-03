@@ -217,6 +217,17 @@ public struct GitHubStatus: Hashable, Sendable {
             pullRequest.headRefOid == localSHA
         }
     }
+
+    public func markingRefresh() -> GitHubStatus {
+        func refreshing(_ state: GitHubFetchState) -> GitHubFetchState {
+            guard state.fetchedAt != nil else { return state }
+            return GitHubFetchState(phase: .refreshing, fetchedAt: state.fetchedAt, stale: true)
+        }
+        return GitHubStatus(issues: issues, pullRequests: pullRequests, actions: actions, error: nil, isLoaded: false,
+                            mergeEvidenceLoaded: false, checks: checks,
+                            pullRequestFetch: refreshing(pullRequestFetch), issueFetch: refreshing(issueFetch),
+                            checkFetch: refreshing(checkFetch), actionFetch: refreshing(actionFetch), localSHA: localSHA)
+    }
 }
 
 public struct GitHubIssue: Identifiable, Hashable, Sendable {
@@ -274,13 +285,17 @@ public struct GitHubPullRequest: Identifiable, Hashable, Sendable {
 }
 
 public struct GitHubFetchState: Hashable, Sendable {
-    public enum Phase: String, Sendable { case notRequested, loaded, incomplete, failed }
+    public enum Phase: String, Sendable { case notRequested, refreshing, loaded, incomplete, failed }
     public let phase: Phase
+    /// Time of the last successful fetch or validation of the displayed data.
     public let fetchedAt: Date?
+    /// Time of the latest request attempt, including failed or partial requests.
+    public let lastAttemptAt: Date?
+    public let stale: Bool
     public let error: String?
     public static let notRequested = GitHubFetchState(phase: .notRequested)
-    public init(phase: Phase, fetchedAt: Date? = nil, error: String? = nil) {
-        self.phase = phase; self.fetchedAt = fetchedAt; self.error = error
+    public init(phase: Phase, fetchedAt: Date? = nil, lastAttemptAt: Date? = nil, stale: Bool = false, error: String? = nil) {
+        self.phase = phase; self.fetchedAt = fetchedAt; self.lastAttemptAt = lastAttemptAt; self.stale = stale; self.error = error
     }
     public var isComplete: Bool { phase == .loaded }
 }

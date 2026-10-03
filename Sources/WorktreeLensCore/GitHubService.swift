@@ -37,6 +37,15 @@ public final class GitHubService: @unchecked Sendable {
         }
     }
 
+    public func cachedStatusesAsync(repositoryPath: String, branches: [BranchInfo]) async -> [String: GitHubStatus] {
+        do {
+            let targets = try resolver.targets(path: repositoryPath, branches: branches)
+            return await display.cachedStatuses(targets: targets)
+        } catch {
+            return [:]
+        }
+    }
+
     public func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval = GitHubService.requestTimeout) async -> GitHubStatus {
         do {
             try Task.checkCancellation()
