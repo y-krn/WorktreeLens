@@ -20,5 +20,7 @@ jobs:
         run: swift --version
       - name: Build
         run: swift build
+      - name: Native app build
+        run: xcodebuild -project WorktreeLens.xcodeproj -scheme WorktreeLens -configuration Debug -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO build
       - name: Test
         run: swift test

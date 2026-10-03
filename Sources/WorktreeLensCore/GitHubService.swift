@@ -54,12 +54,22 @@ public final class GitHubService: @unchecked Sendable {
     }
 
     public func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval = GitHubService.requestTimeout) async -> GitHubStatus {
+        await statusAsync(repositoryPath: repositoryPath, branchInfo: branchInfo, timeout: timeout, refreshSummary: false)
+    }
+
+    public func refreshStatusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval = GitHubService.requestTimeout) async -> GitHubStatus {
+        await statusAsync(repositoryPath: repositoryPath, branchInfo: branchInfo, timeout: timeout, refreshSummary: true)
+    }
+
+    private func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval,
+                             refreshSummary: Bool) async -> GitHubStatus {
         do {
             try Task.checkCancellation()
             guard let target = try resolver.targets(path: repositoryPath, branches: [branchInfo]).first else {
                 return GitHubStatus(issues: [], pullRequests: branchInfo.github.pullRequests, actions: [], error: "GitHub repository unresolved.", isLoaded: false)
             }
-            return await display.details(target: target, summary: branchInfo.github, timeout: timeout)
+            return await display.details(target: target, summary: branchInfo.github, timeout: timeout,
+                                         refreshSummary: refreshSummary)
         } catch {
             return GitHubStatus(issues: [], pullRequests: branchInfo.github.pullRequests, actions: [], error: error.localizedDescription, isLoaded: false)
         }

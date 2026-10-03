@@ -28,6 +28,7 @@ struct WorktreeLensApp: App {
             ContentView(model: model)
                 .frame(minWidth: 1_240, minHeight: 760)
                 .tint(Color(red: 0.10, green: 0.54, blue: 0.56))
+                .task { await authentication.restoreAccount() }
                 .onAppear {
                     model.setApplicationActive(NSApp.isActive)
                     model.setGitHubMonitoringEnabled(authentication.account != nil)
@@ -63,11 +64,16 @@ enum CleanupExecutionState: Equatable {
 protocol GitHubDetailLoading: Sendable {
     func statusAsync(repositoryPath: String, branch: String, timeout: TimeInterval) async -> GitHubStatus
     func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus
+    func refreshStatusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus
 }
 
 extension GitHubDetailLoading {
     func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus {
         await statusAsync(repositoryPath: repositoryPath, branch: branchInfo.name, timeout: timeout)
+    }
+
+    func refreshStatusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus {
+        await statusAsync(repositoryPath: repositoryPath, branchInfo: branchInfo, timeout: timeout)
     }
 }
 
@@ -528,8 +534,8 @@ final class ApplicationModel: ObservableObject {
         snapshot = RepositorySnapshot(path: currentSnapshot.path, defaultBranch: currentSnapshot.defaultBranch,
                                       branches: refreshingBranches, refreshedAt: currentSnapshot.refreshedAt)
         saveCurrentView()
-        let status = await detailLoader.statusAsync(repositoryPath: target.path, branchInfo: requestBranch,
-                                                    timeout: GitHubService.requestTimeout)
+        let status = await detailLoader.refreshStatusAsync(repositoryPath: target.path, branchInfo: requestBranch,
+                                                           timeout: GitHubService.requestTimeout)
         guard status.localSHA == nil || status.localSHA == target.sha else { return nil }
         guard githubDetailToken == token, selectedPath == target.path, selectedBranchID == target.branchID,
               let latest = snapshot, latest.path == target.path,

@@ -412,7 +412,8 @@ public struct GitHubDisplayService: Sendable {
         return result
     }
 
-    public func details(target: GitHubBranchTarget, summary: GitHubStatus, timeout: TimeInterval = 10) async -> GitHubStatus {
+    public func details(target: GitHubBranchTarget, summary: GitHubStatus, timeout: TimeInterval = 10,
+                        refreshSummary: Bool = false) async -> GitHubStatus {
         let startedAt = await clock.now()
         let context = try? await api.requestContext()
         let accountIdentifier = context?.accountIdentifier
@@ -420,7 +421,7 @@ public struct GitHubDisplayService: Sendable {
         var resolvedRepositoryID: String?
         var prs = summary.pullRequests
         var prFetch = summary.pullRequestFetch
-        if prFetch.phase == .notRequested {
+        if refreshSummary || prFetch.phase == .notRequested {
             let loaded = await summaries(targets: [target], budget: &budget)
             if let status = loaded[target.branchID] { prs = status.pullRequests; prFetch = status.pullRequestFetch }
         }
