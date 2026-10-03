@@ -13,7 +13,7 @@ if [[ "${WORKTREELENS_ALLOW_DEVICE_REGISTRATION:-0}" == "1" ]]; then
     provisioning_args+=(-allowProvisioningDeviceRegistration)
 fi
 xcodebuild "${provisioning_args[@]}" -project "$repo_root/WorktreeLens.xcodeproj" -scheme WorktreeLens \
-    -configuration Debug -destination 'generic/platform=macOS' \
+    -configuration Debug -destination "platform=macOS,arch=$(uname -m)" \
     -derivedDataPath "$verification_dir" \
     DEVELOPMENT_TEAM="$WORKTREELENS_SIGNING_TEAM" CODE_SIGN_IDENTITY='Apple Development' \
     OTHER_SWIFT_FLAGS='$(inherited) -DKEYCHAIN_VERIFICATION' build > "$verification_dir/build.log" 2>&1 || {
