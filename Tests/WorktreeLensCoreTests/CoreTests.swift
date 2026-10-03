@@ -1149,7 +1149,8 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(preview.groups.first?.steps.map(\.step), [.deleteBranch])
         XCTAssertEqual(cleanup.execute(preview).deletedLocalBranches, ["feature"])
         XCTAssertEqual(sessionDiscovery.count, 0)
-        XCTAssertEqual(executionRecorder.arguments.count, 6)
+        XCTAssertEqual(executionRecorder.arguments.count, 7, "branch-only cleanup includes one metadata prune")
+        XCTAssertEqual(executionRecorder.arguments.filter { $0.suffix(3).elementsEqual(["worktree", "prune", "--verbose"]) }.count, 1)
         XCTAssertEqual(executionRecorder.arguments.filter { $0.contains("for-each-ref") }.count, 1)
         XCTAssertFalse(executionRecorder.arguments.contains { $0.contains("merge-base") })
         XCTAssertEqual(executionRecorder.arguments.filter { $0.contains("update-ref") && $0.contains("-d") }.count, 1)
@@ -1190,7 +1191,8 @@ final class CoreTests: XCTestCase {
 
         XCTAssertEqual(cleanup.execute(preview).count, 10)
         let gitArguments = gitRecorder.arguments
-        XCTAssertEqual(gitArguments.count, 43)
+        XCTAssertEqual(gitArguments.count, 44, "ten branch deletions share one metadata prune")
+        XCTAssertEqual(gitArguments.filter { $0.suffix(3).elementsEqual(["worktree", "prune", "--verbose"]) }.count, 1)
         XCTAssertEqual(ghRecorder.arguments.count, 10)
         XCTAssertFalse(gitArguments.contains { $0.contains("merge-base") })
         XCTAssertEqual(gitArguments.filter { $0.contains("update-ref") && $0.contains("-d") }.count, 10)
@@ -1330,7 +1332,8 @@ final class CoreTests: XCTestCase {
         let preview = cleanup.previewMergedBranches(snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: branches))
 
         XCTAssertEqual(cleanup.execute(preview).count, 10)
-        XCTAssertEqual(gitRecorder.arguments.count, 53)
+        XCTAssertEqual(gitRecorder.arguments.count, 54, "ten branch deletions share one metadata prune")
+        XCTAssertEqual(gitRecorder.arguments.filter { $0.suffix(3).elementsEqual(["worktree", "prune", "--verbose"]) }.count, 1)
         XCTAssertEqual(gitRecorder.arguments.filter { $0.contains("merge-base") }.count, 10)
         XCTAssertEqual(gitRecorder.arguments.filter { $0.contains("branch") && $0.contains("-d") }.count, 10)
         XCTAssertEqual(gitRecorder.arguments.filter { $0.contains("branch") && $0.contains("-D") }.count, 0)
@@ -1441,6 +1444,7 @@ final class CoreTests: XCTestCase {
         _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "main"])
         _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "feature"])
         _ = try runGit(["-C", fixture.repository.path, "fetch", "origin"])
+        _ = try runGit(["-C", fixture.repository.path, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"])
         _ = try runGit(["-C", fixture.repository.path, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"])
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
 
