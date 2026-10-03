@@ -184,16 +184,27 @@ public struct GitHubStatus: Hashable, Sendable {
     public let error: String?
     public let isLoaded: Bool
     public let mergeEvidenceLoaded: Bool
+    public let checks: [GitHubCheck]
+    public let pullRequestFetch: GitHubFetchState
+    public let issueFetch: GitHubFetchState
+    public let checkFetch: GitHubFetchState
+    public let actionFetch: GitHubFetchState
+    public let localSHA: String?
 
     public static let unavailable = GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil, isLoaded: false, mergeEvidenceLoaded: false)
 
-    public init(issues: [GitHubIssue], pullRequests: [GitHubPullRequest], actions: [GitHubActionRun], error: String?, isLoaded: Bool = true, mergeEvidenceLoaded: Bool? = nil) {
+    public init(issues: [GitHubIssue], pullRequests: [GitHubPullRequest], actions: [GitHubActionRun], error: String?, isLoaded: Bool = true, mergeEvidenceLoaded: Bool? = nil, checks: [GitHubCheck] = [],
+                pullRequestFetch: GitHubFetchState = .notRequested, issueFetch: GitHubFetchState = .notRequested,
+                checkFetch: GitHubFetchState = .notRequested, actionFetch: GitHubFetchState = .notRequested, localSHA: String? = nil) {
         self.issues = issues
         self.pullRequests = pullRequests
         self.actions = actions
         self.error = error
         self.isLoaded = isLoaded
         self.mergeEvidenceLoaded = mergeEvidenceLoaded ?? isLoaded
+        self.checks = checks
+        self.pullRequestFetch = pullRequestFetch; self.issueFetch = issueFetch
+        self.checkFetch = checkFetch; self.actionFetch = actionFetch; self.localSHA = localSHA
     }
 
     public func verifiedMergedPullRequest(defaultBranch: String, branchName: String, localSHA: String) -> GitHubPullRequest? {
@@ -214,6 +225,13 @@ public struct GitHubIssue: Identifiable, Hashable, Sendable {
     public let title: String
     public let state: String
     public let url: URL?
+    public let repositoryID: String?
+    public let repositoryName: String?
+
+    public init(id: String, number: Int, title: String, state: String, url: URL?, repositoryID: String? = nil, repositoryName: String? = nil) {
+        self.id = id; self.number = number; self.title = title; self.state = state; self.url = url
+        self.repositoryID = repositoryID; self.repositoryName = repositoryName
+    }
 }
 
 public struct GitHubPullRequest: Identifiable, Hashable, Sendable {
@@ -228,7 +246,17 @@ public struct GitHubPullRequest: Identifiable, Hashable, Sendable {
     public let mergedAt: Date?
     public let url: URL?
 
-    public init(id: String, number: Int, title: String, state: String, isDraft: Bool, baseRefName: String?, headRefName: String?, headRefOid: String?, mergedAt: Date?, url: URL?) {
+    public let baseRepositoryID: String?
+    public let headRepositoryID: String?
+    public let baseRepositoryName: String?
+    public let headRepositoryName: String?
+    public let mergeStateStatus: String?
+    public let mergeable: String?
+    public let testMergeSHA: String?
+
+    public init(id: String, number: Int, title: String, state: String, isDraft: Bool, baseRefName: String?, headRefName: String?, headRefOid: String?, mergedAt: Date?, url: URL?, baseRepositoryID: String? = nil, headRepositoryID: String? = nil,
+                baseRepositoryName: String? = nil, headRepositoryName: String? = nil, mergeStateStatus: String? = nil,
+                mergeable: String? = nil, testMergeSHA: String? = nil) {
         self.id = id
         self.number = number
         self.title = title
@@ -239,7 +267,30 @@ public struct GitHubPullRequest: Identifiable, Hashable, Sendable {
         self.headRefOid = headRefOid
         self.mergedAt = mergedAt
         self.url = url
+        self.baseRepositoryID = baseRepositoryID; self.headRepositoryID = headRepositoryID
+        self.baseRepositoryName = baseRepositoryName; self.headRepositoryName = headRepositoryName
+        self.mergeStateStatus = mergeStateStatus; self.mergeable = mergeable; self.testMergeSHA = testMergeSHA
     }
+}
+
+public struct GitHubFetchState: Hashable, Sendable {
+    public enum Phase: String, Sendable { case notRequested, loaded, incomplete, failed }
+    public let phase: Phase
+    public let fetchedAt: Date?
+    public let error: String?
+    public static let notRequested = GitHubFetchState(phase: .notRequested)
+    public init(phase: Phase, fetchedAt: Date? = nil, error: String? = nil) {
+        self.phase = phase; self.fetchedAt = fetchedAt; self.error = error
+    }
+    public var isComplete: Bool { phase == .loaded }
+}
+
+public struct GitHubCheck: Identifiable, Hashable, Sendable {
+    public let id: String
+    public let name: String
+    public let kind: String
+    public let result: String
+    public let sha: String
 }
 
 public struct GitHubActionRun: Identifiable, Hashable, Sendable {
@@ -248,6 +299,19 @@ public struct GitHubActionRun: Identifiable, Hashable, Sendable {
     public let status: String
     public let conclusion: String?
     public let url: URL?
+    public let headSHA: String?
+    public let event: String?
+    public let runID: Int?
+    public let attempt: Int?
+    public let repositoryName: String?
+    public let isCurrent: Bool
+
+    public init(id: String, name: String, status: String, conclusion: String?, url: URL?, headSHA: String? = nil,
+                event: String? = nil, runID: Int? = nil, attempt: Int? = nil, repositoryName: String? = nil, isCurrent: Bool = false) {
+        self.id = id; self.name = name; self.status = status; self.conclusion = conclusion; self.url = url
+        self.headSHA = headSHA; self.event = event; self.runID = runID; self.attempt = attempt
+        self.repositoryName = repositoryName; self.isCurrent = isCurrent
+    }
 }
 
 public struct RepositorySnapshot: Identifiable, Hashable, Sendable {

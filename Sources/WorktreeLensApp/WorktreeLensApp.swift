@@ -7,10 +7,13 @@ import Security
 
 @main
 struct WorktreeLensApp: App {
-    @StateObject private var model = ApplicationModel()
-    @StateObject private var authentication = GitHubAuthenticationModel()
+    @StateObject private var model: ApplicationModel
+    @StateObject private var authentication: GitHubAuthenticationModel
 
     init() {
+        let authentication = GitHubAuthenticationModel()
+        _authentication = StateObject(wrappedValue: authentication)
+        _model = StateObject(wrappedValue: ApplicationModel(github: GitHubService(api: GitHubAPIClient(authentication: authentication))))
         #if KEYCHAIN_VERIFICATION
         if CommandLine.arguments.contains("--verify-github-keychain") {
             do { try verifyGitHubKeychain(); exit(0) }
@@ -45,6 +48,13 @@ enum CleanupExecutionState: Equatable {
 
 protocol GitHubDetailLoading: Sendable {
     func statusAsync(repositoryPath: String, branch: String, timeout: TimeInterval) async -> GitHubStatus
+    func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus
+}
+
+extension GitHubDetailLoading {
+    func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus {
+        await statusAsync(repositoryPath: repositoryPath, branch: branchInfo.name, timeout: timeout)
+    }
 }
 
 extension GitHubService: GitHubDetailLoading {}
@@ -85,7 +95,7 @@ final class ApplicationModel: ObservableObject {
     private var refreshTask: Task<Void, Never>?
     private var refreshTaskPath: String?
     private var githubDetailToken = UUID()
-    private var githubDetailTask: Task<Void, Never>?
+    private(set) var githubDetailTask: Task<Void, Never>?
     private var githubDetailTaskPath: String?
     private var cleanupPreviewToken = UUID()
 
@@ -159,6 +169,7 @@ final class ApplicationModel: ObservableObject {
         scanPhase = "Scanning sessions…"
         canCancelGitHub = false
         let scanner = self.scanner
+        let previousBranches = self.snapshot?.path == path ? self.snapshot?.branches ?? [] : []
         refreshTask = Task.detached(priority: .userInitiated) {
             do {
                 let discovery = scanner.scanSessions()
@@ -183,22 +194,32 @@ final class ApplicationModel: ObservableObject {
                     return true
                 }
                 guard canLoadGitHub else { return }
-                let enriched = await scanner.enrichGitHub(local: local) { completed, total in
+                let hintBranches = local.snapshot.branches.map { branch in
+                    guard let prior = previousBranches.first(where: { $0.id == branch.id }), !prior.github.pullRequests.isEmpty else { return branch }
+                    return branch.withGitHubStatus(GitHubStatus(issues: [], pullRequests: prior.github.pullRequests, actions: [], error: nil,
+                                                               isLoaded: false, mergeEvidenceLoaded: false))
+                }
+                let enrichmentLocal = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: local.snapshot.path,
+                    defaultBranch: local.snapshot.defaultBranch, branches: hintBranches, refreshedAt: local.snapshot.refreshedAt), sessionNotes: local.sessionNotes)
+                let enriched = await scanner.enrichGitHub(local: enrichmentLocal) { completed, total in
                     Task { @MainActor in
                         guard self.refreshToken == token else { return }
                         self.scanPhase = "Loading GitHub \(completed)/\(total)…"
                     }
                 }
+                let cancelled = Task.isCancelled
                 await MainActor.run {
                     guard self.refreshToken == token, self.selectedPath == path else { return }
-                    self.snapshot = enriched
-                    self.selection = self.normalizedSelection(self.selection, in: enriched)
+                    if !cancelled {
+                        self.snapshot = enriched
+                        self.selection = self.normalizedSelection(self.selection, in: enriched)
+                    }
                     self.isLoading = false
                     self.canCancelGitHub = false
                     self.scanPhase = nil
-                    self.statusMessage = Task.isCancelled ? "GitHub loading cancelled" : nil
+                    self.statusMessage = cancelled ? "GitHub loading cancelled" : nil
                     self.saveCurrentView()
-                    self.loadGitHubDetailForCurrentSelection()
+                    if !cancelled { self.loadGitHubDetailForCurrentSelection() }
                 }
             } catch {
                 await MainActor.run {
@@ -255,6 +276,8 @@ final class ApplicationModel: ObservableObject {
     }
 
     private func loadGitHubDetailForCurrentSelection() {
+        githubDetailTask?.cancel()
+        githubDetailToken = UUID()
         guard !isLoading,
               let path = selectedPath,
               let snapshot,
@@ -270,7 +293,7 @@ final class ApplicationModel: ObservableObject {
         let refreshToken = self.refreshToken
         let detailLoader = self.detailLoader
         githubDetailTask = Task.detached(priority: .utility) {
-            let status = await detailLoader.statusAsync(repositoryPath: path, branch: branch.name, timeout: GitHubService.requestTimeout)
+            let status = await detailLoader.statusAsync(repositoryPath: path, branchInfo: branch, timeout: GitHubService.requestTimeout)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard self.githubDetailToken == token,
@@ -279,7 +302,7 @@ final class ApplicationModel: ObservableObject {
                       self.selectedBranchID == branchID,
                       self.snapshot?.path == path else { return }
                 guard let snapshot = self.snapshot,
-                      let index = snapshot.branches.firstIndex(where: { $0.id == branchID }) else { return }
+                      let index = snapshot.branches.firstIndex(where: { $0.id == branchID && $0.sha == branch.sha }) else { return }
                 var branches = snapshot.branches
                 branches[index] = branches[index].withGitHubStatus(status)
                 self.snapshot = RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: branches, refreshedAt: snapshot.refreshedAt)
@@ -840,23 +863,27 @@ struct GitHubDetail: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("GitHub").font(.headline)
             if let error = status.error { Text(error).font(.caption).foregroundStyle(.secondary) }
-            if !status.isLoaded {
-                Text(status.mergeEvidenceLoaded ? "Merge evidence loaded · Branch details load on selection" : "GitHub details unavailable")
+            ForEach([("PR", status.pullRequestFetch), ("Issues", status.issueFetch), ("Checks", status.checkFetch), ("Actions", status.actionFetch)], id: \.0) { name, fetch in
+                Text("\(name) · \(fetch.phase.rawValue)\(fetch.error.map { " · " + $0 } ?? "")")
                     .font(.caption).foregroundStyle(.secondary)
-            } else {
-                Text("Issue \(status.issues.count) · PR \(status.pullRequests.count) · Actions \(status.actions.count)").font(.caption)
-                ForEach(status.pullRequests) { pr in
-                    Text("PR #\(pr.number) · \(pr.state)\(pr.mergedAt == nil ? "" : " · merged")").font(.caption)
-                    if let base = pr.baseRefName, let head = pr.headRefName {
-                        Text("    \(head) → \(base) · SHA \(String((pr.headRefOid ?? "unknown").prefix(12)))").font(.caption2).foregroundStyle(.secondary)
-                    }
-                }
-                ForEach(status.actions) { run in
-                    Text("Action · \(run.name) · \(run.conclusion ?? run.status)").font(.caption)
-                }
-                ForEach(status.issues) { issue in
-                    Text("Issue #\(issue.number) · \(issue.title)").font(.caption)
-                }
+                if let date = fetch.fetchedAt { Text(date, style: .relative).font(.caption2).foregroundStyle(.secondary) }
+            }
+            ForEach(status.pullRequests) { pr in
+                Text("PR #\(pr.number) · \(pr.state) · merge \(pr.mergeStateStatus ?? "unverified") · \(pr.mergeable ?? "UNKNOWN")").font(.caption)
+                Text("\(pr.headRepositoryName ?? "unknown"):\(pr.headRefName ?? "unknown") → \(pr.baseRepositoryName ?? "unknown"):\(pr.baseRefName ?? "unknown") · SHA \(String((pr.headRefOid ?? "unknown").prefix(12)))")
+                    .font(.caption2).foregroundStyle(.secondary)
+                if let sha = pr.testMergeSHA { Text("Test merge SHA \(sha.prefix(12)) · conditions unverified").font(.caption2) }
+            }
+            ForEach(status.checks) { check in
+                Text("\(check.kind) · \(check.name) · \(check.result) · SHA \(check.sha.prefix(12))").font(.caption)
+            }
+            ForEach(status.actions) { run in
+                Text("Action · \(run.name) · \(run.conclusion ?? run.status) · \(run.isCurrent ? "local HEAD" : "history / unverified")")
+                    .font(.caption)
+                Text("SHA \((run.headSHA ?? "unknown").prefix(12)) · \(run.event ?? "unknown") · attempt \(run.attempt ?? 0)").font(.caption2)
+            }
+            ForEach(status.issues) { issue in
+                Text("Issue \(issue.repositoryName ?? "unknown")#\(issue.number) · \(issue.title)").font(.caption)
             }
         }
     }
@@ -1005,7 +1032,7 @@ struct EmptyStateView: View {
 
 
 @MainActor
-final class GitHubAuthenticationModel: ObservableObject {
+final class GitHubAuthenticationModel: ObservableObject, GitHubAuthenticationProviding {
     @Published var clientID: String
     @Published private(set) var account: GitHubAccount?
     @Published private(set) var prompt: GitHubDevicePrompt?
@@ -1023,6 +1050,10 @@ final class GitHubAuthenticationModel: ObservableObject {
         configuredClientID = clientID
         provider = GitHubDeviceFlowProvider(clientID: clientID, http: http)
     }
+
+    func authorization() async throws -> GitHubAuthorization { try await provider.authorization() }
+    func invalidate(_ authorization: GitHubAuthorization) async throws { try await provider.invalidate(authorization) }
+    func isCurrent(_ authorization: GitHubAuthorization) async -> Bool { await provider.isCurrent(authorization) }
 
     func restoreAccount() async {
         do { account = try await provider.state().account }
@@ -1121,7 +1152,7 @@ struct GitHubAuthenticationSettings: View {
                 if model.isBusy { Button("Cancel") { model.cancel() }; ProgressView().controlSize(.small) }
             }
             if let message = model.message { Text(message).font(.caption).textSelection(.enabled) }
-            Text("PR display and Cleanup continue to use GitHub CLI during the migration.")
+            Text("PR display uses the authenticated GitHub API. Cleanup final verification still requires GitHub CLI.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .padding(24).frame(width: 520)

@@ -113,9 +113,9 @@ public actor GitHubHTTPClient {
     /// Reacquires credentials after queue/backoff waits and before every transport attempt.
     /// Refresh uses github.com, so holding the api.github.com queue cannot deadlock refresh.
     public func sendAuthenticated(_ request: URLRequest, retryRead: Bool, authentication: any GitHubAuthenticationProviding,
-                                  revision: UUID) async throws -> (GitHubHTTPResponse, GitHubAuthorization) {
+                                  revision: UUID, deadline: Date? = nil) async throws -> (GitHubHTTPResponse, GitHubAuthorization) {
         guard request.url?.host == "api.github.com" else { throw GitHubAPIError.unsupportedURL }
-        let (response, authorization) = try await perform(request, retryRead: retryRead, deadline: nil,
+        let (response, authorization) = try await perform(request, retryRead: retryRead, deadline: deadline,
                                                          authentication: authentication, revision: revision)
         guard let authorization else { throw GitHubAPIError.invalidResponse }
         return (response, authorization)

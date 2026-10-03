@@ -901,30 +901,21 @@ final class CoreTests: XCTestCase {
     }
 
     func testRefreshBulkFetchesMergeEvidenceOnceForManyBranches() async throws {
-        final class Counter: @unchecked Sendable {
-            var arguments: [[String]] = []
-        }
-
-        let counter = Counter()
         let featurePR = "[{\"number\":201,\"title\":\"old feature\",\"state\":\"MERGED\",\"isDraft\":false,\"baseRefName\":\"main\",\"headRefName\":\"feature-99\",\"headRefOid\":\"sha-99\",\"mergedAt\":\"2026-01-01T00:00:00Z\",\"url\":\"https://github.com/example/repo/pull/201\"}]"
-        let runner = RoutingRunner { arguments in
-            counter.arguments.append(arguments)
-            if arguments.starts(with: ["pr", "list"]) { return ProcessResult(status: 0, stdout: featurePR) }
-            XCTFail("unexpected GitHub command: \(arguments.joined(separator: " "))")
-            return ProcessResult(status: 1)
-        }
         let branches = [
             BranchInfo(id: "main", name: "main", sha: "main-sha", upstream: nil, ahead: 0, behind: 0, isMerged: true, remoteGone: false, lastCommitAt: nil, isDefaultBranch: true, worktrees: [])
         ] + (0..<100).map { index in
             BranchInfo(id: "feature-\(index)", name: "feature-\(index)", sha: "sha-\(index)", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])
         }
         let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: branches), sessionNotes: [])
-        let scanner = RepositoryScanService(github: GitHubService(runner: runner, executable: "gh"))
+        let (apiGitHub, transport) = scannerDisplayFixture(pr: Data(featurePR.utf8))
+        let scanner = RepositoryScanService(github: apiGitHub)
 
         let enriched = await scanner.enrichGitHub(local: local)
 
-        XCTAssertEqual(counter.arguments.filter { $0.starts(with: ["pr", "list"]) }.count, 1)
-        XCTAssertTrue(counter.arguments.allSatisfy { !$0.starts(with: ["pr", "view"]) && !$0.starts(with: ["run", "list"]) })
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 11, "101 branches use batches of at most 10; no all-history request")
+        XCTAssertTrue(requests.allSatisfy { $0.url?.path == "/graphql" }, "no per-PR Issue or Actions fanout")
         let verified = try XCTUnwrap(enriched.branches.first { $0.name == "feature-99" })
         XCTAssertTrue(verified.isMerged)
         XCTAssertTrue(verified.github.mergeEvidenceLoaded)
@@ -952,11 +943,9 @@ final class CoreTests: XCTestCase {
     func testBulkMergeEvidenceRequiresExactBaseHeadAndSHA() async throws {
         let branch = BranchInfo(id: "feature", name: "feature", sha: "local-sha", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])
         let pullRequest = "[{\"number\":202,\"title\":\"feature\",\"state\":\"MERGED\",\"isDraft\":false,\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"headRefOid\":\"different-sha\",\"mergedAt\":\"2026-01-01T00:00:00Z\",\"url\":\"https://github.com/example/repo/pull/202\"}]"
-        let runner = RoutingRunner { arguments in
-            ProcessResult(status: 0, stdout: arguments.starts(with: ["pr", "list"]) ? pullRequest : "[]")
-        }
         let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [branch]), sessionNotes: [])
-        let scanner = RepositoryScanService(github: GitHubService(runner: runner, executable: "gh"))
+        let (apiGitHub, _) = scannerDisplayFixture(pr: Data(pullRequest.utf8))
+        let scanner = RepositoryScanService(github: apiGitHub)
 
         let enriched = await scanner.enrichGitHub(local: local)
 
@@ -980,7 +969,7 @@ final class CoreTests: XCTestCase {
     func testGitHubVerifiedPreviewBlocksWhenBranchSHAChangesBeforeExecute() async throws {
         let fixture = try makeFeatureRepository()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 125, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 125, sha: fixture.featureSHA)
         let git = GitService()
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
         let enriched = await RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github).enrichGitHub(local: local)
@@ -999,7 +988,7 @@ final class CoreTests: XCTestCase {
     func testMergedCleanupGitHubVerifiedBranchIsAllowed() async throws {
         let fixture = try makeFeatureRepository()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 126, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 126, sha: fixture.featureSHA)
         let gitRecorder = RecordingRunner()
         let git = GitService(runner: gitRecorder)
         let local = try git.snapshot(repositoryPath: fixture.repository.path)
@@ -1022,7 +1011,7 @@ final class CoreTests: XCTestCase {
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 131, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 131, sha: fixture.featureSHA)
         let gitRecorder = RecordingRunner()
         let git = GitService(runner: gitRecorder)
         let local = try git.snapshot(repositoryPath: fixture.repository.path)
@@ -1059,7 +1048,7 @@ final class CoreTests: XCTestCase {
         _ = try runGit(["-C", fixture.repository.path, "remote", "set-head", "origin", "main"])
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
 
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 137, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 137, sha: fixture.featureSHA)
         let git = GitService()
         let local = try git.snapshot(repositoryPath: fixture.repository.path)
         let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
@@ -1134,7 +1123,7 @@ final class CoreTests: XCTestCase {
         _ = try runGit(["-C", fixture.repository.path, "push", "-u", "origin", "feature"])
         _ = try runGit(["-C", fixture.repository.path, "remote", "set-head", "origin", "main"])
 
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 138, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 138, sha: fixture.featureSHA)
         let git = GitService()
         let branch = try XCTUnwrap((try git.snapshot(repositoryPath: fixture.repository.path)).branches.first { $0.name == "feature" })
         let status = github.status(repositoryPath: fixture.repository.path, branch: "feature")
@@ -1594,7 +1583,7 @@ final class CoreTests: XCTestCase {
         let fixture = try makeFeatureRepository()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let git = GitService()
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 140, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 140, sha: fixture.featureSHA)
         let mainSHA = try runGit(["-C", fixture.repository.path, "rev-parse", "main"]).trimmingCharacters(in: .whitespacesAndNewlines)
         _ = try runGit(["-C", fixture.repository.path, "switch", "-c", "unmerged", mainSHA])
         FileManager.default.createFile(atPath: fixture.repository.appendingPathComponent("unmerged.txt").path, contents: Data("unmerged\n".utf8))
@@ -1642,7 +1631,7 @@ final class CoreTests: XCTestCase {
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 132, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 132, sha: fixture.featureSHA)
         let git = GitService()
         let local = try git.snapshot(repositoryPath: fixture.repository.path)
         let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
@@ -1663,7 +1652,7 @@ final class CoreTests: XCTestCase {
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 133, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 133, sha: fixture.featureSHA)
         let git = GitService()
         let local = try git.snapshot(repositoryPath: fixture.repository.path)
         let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
@@ -1686,7 +1675,7 @@ final class CoreTests: XCTestCase {
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
-        let goodGitHub = GitHubService(runner: verifiedGitHubRunner(number: 134, sha: fixture.featureSHA), executable: "gh")
+        let goodGitHub = try verifiedGitHubService(number: 134, sha: fixture.featureSHA)
         let failedGitHub = GitHubService(runner: RoutingRunner { _ in throw ProcessRunnerError.failed("offline") }, executable: "gh")
         let git = GitService()
         let local = try git.snapshot(repositoryPath: fixture.repository.path)
@@ -1706,7 +1695,7 @@ final class CoreTests: XCTestCase {
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 135, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 135, sha: fixture.featureSHA)
         let readWriteGit = GitService()
         let local = try readWriteGit.snapshot(repositoryPath: fixture.repository.path)
         let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
@@ -1732,7 +1721,7 @@ final class CoreTests: XCTestCase {
         let replacementPath = fixture.root.appendingPathComponent("replacement-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 136, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 136, sha: fixture.featureSHA)
         let readWriteGit = GitService()
         let local = try readWriteGit.snapshot(repositoryPath: fixture.repository.path)
         let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
@@ -1766,7 +1755,7 @@ final class CoreTests: XCTestCase {
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 127, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 127, sha: fixture.featureSHA)
         let recorder = RecordingRunner()
         let git = GitService(runner: recorder)
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
@@ -1789,7 +1778,7 @@ final class CoreTests: XCTestCase {
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
-        let github = GitHubService(runner: verifiedGitHubRunner(number: 129, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: 129, sha: fixture.featureSHA)
         let git = GitService()
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
         let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
@@ -1890,7 +1879,7 @@ final class CoreTests: XCTestCase {
         let worktreePath = fixture.root.appendingPathComponent("attached-feature")
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
-        let goodGitHub = GitHubService(runner: verifiedGitHubRunner(number: 130, sha: fixture.featureSHA), executable: "gh")
+        let goodGitHub = try verifiedGitHubService(number: 130, sha: fixture.featureSHA)
         let failedGitHub = GitHubService(runner: RoutingRunner { _ in throw ProcessRunnerError.failed("offline") }, executable: "gh")
         let git = GitService()
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
@@ -1913,7 +1902,7 @@ final class CoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         let recorder = RecordingRunner()
         let git = GitService(runner: recorder)
-        let github = GitHubService(runner: verifiedGitHubRunner(number: prNumber, sha: fixture.featureSHA), executable: "gh")
+        let github = try verifiedGitHubService(number: prNumber, sha: fixture.featureSHA)
         let local = RepositoryLocalScanResult(snapshot: try git.snapshot(repositoryPath: fixture.repository.path), sessionNotes: [])
         let scanner = RepositoryScanService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()), github: github)
         let enriched = await scanner.enrichGitHub(local: local)
@@ -1936,6 +1925,11 @@ final class CoreTests: XCTestCase {
         XCTAssertTrue(recorder.arguments.contains { $0.suffix(4).elementsEqual(["update-ref", "-d", "refs/heads/feature", fixture.featureSHA]) })
         XCTAssertFalse(recorder.arguments.flatMap { $0 }.contains("-D"))
         XCTAssertFalse((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+    }
+
+    private func verifiedGitHubService(number: Int, sha: String) throws -> GitHubService {
+        let payload = try JSONSerialization.data(withJSONObject: [displayPR(number: number, sha: sha)])
+        return scannerDisplayFixture(pr: payload, runner: verifiedGitHubRunner(number: number, sha: sha)).0
     }
 
     private func verifiedGitHubRunner(number: Int, sha: String) -> RoutingRunner {
