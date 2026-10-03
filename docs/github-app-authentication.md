@@ -16,7 +16,7 @@ Issue #46 は、GitHub CLI の認証とは独立した GitHub App Device Flow �
 ## 保存と認証ライフサイクル
 
 - Client ID は公開設定として UserDefaults の `githubAppClientID` に保存します。
-- アクセストークン、refresh token、期限と認証主体は macOS Keychain の Generic Password にまとめて保存します。service は `com.ykrn.WorktreeLens.github.com.<clientID>`、account は `active-user` です。同期を無効化し、`kSecAttrAccessibleWhenUnlockedThisDeviceOnly` を指定します。
+- アクセストークン、refresh token、期限と認証主体は macOS Keychain の Generic Password にまとめて保存します。service は `com.ykrn.WorktreeLens.github.com.<clientID>`、account は `active-user` です。`kSecUseDataProtectionKeychain=true` を保存・読取・更新・削除の共通 query に設定し、Data Protection Keychain を使用します。同期を無効化し、`kSecAttrAccessibleWhenUnlockedThisDeviceOnly` を指定します。
 - github.com の単一有効アカウントを扱います。Client ID を変更して認証すると以前の provider をログアウトさせます。
 - アクセストークンの期限の30秒前から更新します。同時の更新要求は一つの共有操作になり、refresh token の競合使用を防ぎます。共有操作の待機者は個別にキャンセル可能で、最後の待機者のキャンセルは実通信をキャンセルします。
 - Sign Out は保存情報を削除し、実行中の認証と更新をキャンセルします。世代チェックにより、遅れて返ったレスポンスによる再保存を防ぎます。GitHub 側の App 承認を取り消す操作ではありません。必要なら GitHub Settings → Applications から承認を取り消します。
@@ -30,7 +30,7 @@ URLSession の async `data(for:)` へ呼出元のキャンセルが伝播しま�
 
 読取 GET はネットワーク障害、5xx、rate limit に対し最大2回再試行します。OAuth POST と GraphQL POST は自動再試行しません。OAuth refresh はサーバーが処理済みか不明な失敗があるため、POST の無条件再実行を避けます。Retry-After と primary rate limit reset の遅い方を守ります。secondary rate limit の待機情報がない場合は60秒から指数的に待機します。最後の失敗後も host の待機期限を保持します。
 
-REST / GraphQL とも Bearer、`Accept: application/vnd.github+json`、`X-GitHub-Api-Version: 2026-03-10` を設定します。HTTP 401 は再認証要求、明示的な403の権限不足は permissionDenied、原因を特定できない403は forbiddenUnknown、404は notFoundOrInaccessible です。404だけで不存在と断定しません。ネットワーク障害と rate limit は独立したエラーです。GraphQL の HTTP 200 は data と errors を保持し、部分成功と全失敗を区別できます。
+REST / GraphQL とも Bearer、`Accept: application/vnd.github+json`、`X-GitHub-Api-Version: 2026-03-10` を設定します。キュー待機、rate limit 待機、各 retry 後の実送信直前に認証を再取得します。アカウント revision が変わった要求は送信しません。通信中に期限が切れたトークンの401は、有効な refresh token を保持し、次の要求で更新します。期限内の401や更新不能な資格情報は再認証要求、明示的な403の権限不足は permissionDenied、原因を特定できない403は forbiddenUnknown、404は notFoundOrInaccessible です。404だけで不存在と断定しません。ネットワーク障害と rate limit は独立したエラーです。GraphQL の HTTP 200 は data と errors を保持し、部分成功と全失敗を区別できます。
 
 秘密情報をログへ出力する処理はありません。資格情報の description / debugDescription は redacted とし、サーバーの OAuth error_description、HTTP 本文、GraphQL message、URLSession 詳細診断をエラー表示へ転記しません。transport を追加する場合も Authorization と OAuth 本文をログへ記録しないでください。
 
@@ -40,8 +40,23 @@ REST / GraphQL とも Bearer、`Accept: application/vnd.github+json`、`X-GitHub
 
 実環境検証には登録済み App の Client ID、Device Flow 有効化、インストールと必要な組織承認が必要です。PR には実環境確認の有無と未確認項目を明記してください。資格情報不足を取得成功や「対象データなし」として扱いません。
 
+## 署名した実アプリでの Keychain 検証
+
+Data Protection Keychain のアクセスには、署名したアプリの app identifier entitlement と、それを承認する provisioning profile が必要です。Xcode の Signing & Capabilities で開発チームを選択してください。`WorktreeLens.entitlements` は `AppIdentifierPrefix` と bundle identifier からアプリ固有のアクセス主体を指定し、署名チームをリポジトリに固定しません。無署名の SwiftPM executable からの Keychain 操作はサポートしません。
+
+```sh
+WORKTREELENS_SIGNING_TEAM=YOUR_TEAM_ID scripts/verify-github-keychain.sh
+```
+
+スクリプトは実アプリ target の署名済み Debug build と entitlements を確認し、ランダムな専用 service の合成資格情報で保存・読取・更新・削除を実行します。保存属性が `WhenUnlockedThisDeviceOnly`、同期無効であることも確認します。検証レコードと一時 build は削除します。検証用コードは `KEYCHAIN_VERIFICATION` を指定した build にだけ含まれ、通常の Debug / Release build には入りません。実 GitHub token と既存の Keychain 項目は操作しません。
+
+Xcode は設定済み開発者アカウントで provisioning profile を準備します。開発端末の登録が必要な場合は失敗します。Apple Developer の端末登録枠を消費するため、登録を承認した場合だけ `WORKTREELENS_ALLOW_DEVICE_REGISTRATION=1` を追加して実行してください。
+
 ## 参照
 
 - [GitHub App Device Flow](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app#using-the-device-flow-to-generate-a-user-access-token)
 - [Device Flow 由来 refresh token の更新](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens#refreshing-a-user-access-token-with-a-refresh-token)
 - [REST API best practices](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)
+
+- [Apple: macOS Keychain の API と backend](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains)
+- [Apple: Keychain のアクセス主体と entitlements](https://developer.apple.com/documentation/security/sharing-access-to-keychain-items-among-a-collection-of-apps)

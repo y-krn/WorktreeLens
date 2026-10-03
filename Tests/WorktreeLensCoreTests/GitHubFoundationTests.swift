@@ -43,6 +43,82 @@ private struct AccountDelayGitHubTransport: GitHubTransport {
     }
 }
 
+private actor ExpiringGitHubTransport: GitHubTransport {
+    let clock: TestGitHubClock
+    let firstStatus: Int?
+    let expireInFlight: Bool
+    private(set) var refreshCount = 0
+    private(set) var bearerTokens: [String] = []
+    init(clock: TestGitHubClock, firstStatus: Int? = nil, expireInFlight: Bool = false) {
+        self.clock = clock; self.firstStatus = firstStatus; self.expireInFlight = expireInFlight
+    }
+    func send(_ request: URLRequest) async throws -> GitHubHTTPResponse {
+        if request.url?.path == "/warmup" {
+            return GitHubHTTPResponse(data: Data("{}".utf8), status: 200,
+                                      headers: ["X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1060"])
+        }
+        if request.url?.path == "/login/oauth/access_token" {
+            refreshCount += 1
+            return GitHubHTTPResponse(data: Data(#"{"access_token":"new-token","refresh_token":"new-refresh","expires_in":28800,"refresh_token_expires_in":15897600}"#.utf8), status: 200)
+        }
+        let bearer = request.value(forHTTPHeaderField: "Authorization") ?? ""
+        bearerTokens.append(bearer)
+        if bearerTokens.count == 1 {
+            if expireInFlight {
+                try await clock.sleep(seconds: 60)
+                return GitHubHTTPResponse(data: Data("{}".utf8), status: 401)
+            }
+            if let firstStatus {
+                if firstStatus == 500 { try await clock.sleep(seconds: 49) }
+                return GitHubHTTPResponse(data: Data("{}".utf8), status: firstStatus,
+                                          headers: firstStatus == 429 ? ["Retry-After": "60"] : [:])
+            }
+        }
+        if bearer == "Bearer old-token", (await clock.now()) >= Date(timeIntervalSince1970: 1050) {
+            return GitHubHTTPResponse(data: Data("{}".utf8), status: 401)
+        }
+        return GitHubHTTPResponse(data: Data(#"{"id":42,"login":"tester"}"#.utf8), status: 200)
+    }
+}
+
+private actor GitHubRequestGate {
+    let started: XCTestExpectation
+    private var continuation: CheckedContinuation<Void, Never>?
+    init(started: XCTestExpectation) { self.started = started }
+    func wait() async {
+        await withCheckedContinuation { continuation = $0; started.fulfill() }
+    }
+    func release() { continuation?.resume(); continuation = nil }
+}
+
+private struct GatedGitHubTransport: GitHubTransport {
+    let clock: TestGitHubClock
+    let base: ExpiringGitHubTransport
+    let gate: GitHubRequestGate
+    func send(_ request: URLRequest) async throws -> GitHubHTTPResponse {
+        if request.url?.path == "/block" {
+            await gate.wait()
+            try await clock.sleep(seconds: 60)
+            return GitHubHTTPResponse(data: Data("{}".utf8), status: 200)
+        }
+        return try await base.send(request)
+    }
+}
+
+private actor SignaledGitHubAuthentication: GitHubAuthenticationProviding {
+    let provider: GitHubDeviceFlowProvider
+    let prepared: XCTestExpectation
+    private var signaled = false
+    init(provider: GitHubDeviceFlowProvider, prepared: XCTestExpectation) { self.provider = provider; self.prepared = prepared }
+    func authorization() async throws -> GitHubAuthorization {
+        let value = try await provider.authorization()
+        if !signaled { signaled = true; prepared.fulfill() }
+        return value
+    }
+    func invalidate(_ authorization: GitHubAuthorization) async throws { try await provider.invalidate(authorization) }
+    func isCurrent(_ authorization: GitHubAuthorization) async -> Bool { await provider.isCurrent(authorization) }
+}
+
 private actor BarrierGitHubClock: GitHubClock {
     private var remaining: Int
     private var waiting: [CheckedContinuation<Date, Never>] = []
@@ -418,6 +494,95 @@ final class GitHubFoundationTests: XCTestCase {
         _ = try await auth.authenticate { _ in }
         XCTAssertEqual(store.load()?.expiresAt, Date(timeIntervalSince1970: 1_005 + 28_800))
         XCTAssertEqual(store.load()?.refreshExpiresAt, Date(timeIntervalSince1970: 1_005 + 15_897_600))
+    }
+
+    private func soonExpiringCredentials() -> GitHubCredentials {
+        GitHubCredentials(accessToken: "old-token", refreshToken: "valid-refresh", expiresAt: Date(timeIntervalSince1970: 1050),
+                          refreshExpiresAt: Date(timeIntervalSince1970: 90000), account: GitHubAccount(id: 42, login: "tester"))
+    }
+
+    func testRateLimitWaitRefreshesBeforeTransportAndPreservesAccount() async throws {
+        let clock = TestGitHubClock(), store = MemoryGitHubStore(soonExpiringCredentials())
+        let transport = ExpiringGitHubTransport(clock: clock)
+        let http = GitHubHTTPClient(transport: transport, clock: clock)
+        let auth = GitHubDeviceFlowProvider(clientID: "test-client", http: http, clock: clock, store: store)
+        let initial = try await auth.state()
+        _ = try await http.send(URLRequest(url: URL(string: "https://api.github.com/warmup")!))
+        let user = try await GitHubAPIClient(authentication: auth, http: http).currentUser()
+        XCTAssertEqual(user.id, 42)
+        let tokens = await transport.bearerTokens
+        let refreshCount = await transport.refreshCount
+        XCTAssertEqual(tokens, ["Bearer new-token"])
+        XCTAssertEqual(refreshCount, 1)
+        XCTAssertEqual(store.load()?.refreshToken, "new-refresh")
+        let final = try await auth.state()
+        XCTAssertEqual(final, initial)
+    }
+
+    func testRateLimitAndServerRetriesReacquireAuthorizationEveryAttempt() async throws {
+        for status in [429, 500] {
+            let clock = TestGitHubClock(), store = MemoryGitHubStore(soonExpiringCredentials())
+            let transport = ExpiringGitHubTransport(clock: clock, firstStatus: status)
+            let http = GitHubHTTPClient(transport: transport, clock: clock)
+            let auth = GitHubDeviceFlowProvider(clientID: "test-client", http: http, clock: clock, store: store)
+            _ = try await GitHubAPIClient(authentication: auth, http: http).currentUser()
+            let tokens = await transport.bearerTokens
+            let refreshCount = await transport.refreshCount
+            XCTAssertEqual(tokens, ["Bearer old-token", "Bearer new-token"])
+            XCTAssertEqual(refreshCount, 1)
+            XCTAssertNotNil(store.load())
+        }
+    }
+
+    func testExpiryDuringIO401RetainsRefreshForNextRequest() async throws {
+        let clock = TestGitHubClock(), store = MemoryGitHubStore(soonExpiringCredentials())
+        let transport = ExpiringGitHubTransport(clock: clock, expireInFlight: true)
+        let http = GitHubHTTPClient(transport: transport, clock: clock)
+        let auth = GitHubDeviceFlowProvider(clientID: "test-client", http: http, clock: clock, store: store)
+        let initial = try await auth.state()
+        let client = GitHubAPIClient(authentication: auth, http: http)
+        do { _ = try await client.currentUser(); XCTFail("Expected first in-flight expiry") }
+        catch { XCTAssertEqual(error as? GitHubAPIError, .unauthorized) }
+        XCTAssertEqual(store.load()?.refreshToken, "valid-refresh")
+        _ = try await client.currentUser()
+        let final = try await auth.state()
+        XCTAssertEqual(final, initial)
+        let refreshCount = await transport.refreshCount
+        XCTAssertEqual(refreshCount, 1)
+    }
+
+    func testQueueWaitRefreshesAndLogoutNeverSendsQueuedCredentials() async throws {
+        for logout in [false, true] {
+            let clock = TestGitHubClock(), store = MemoryGitHubStore(soonExpiringCredentials())
+            let started = expectation(description: "Host request active")
+            let prepared = expectation(description: "Initial authorization captured")
+            let gate = GitHubRequestGate(started: started)
+            let base = ExpiringGitHubTransport(clock: clock)
+            let transport = GatedGitHubTransport(clock: clock, base: base, gate: gate)
+            let http = GitHubHTTPClient(transport: transport, clock: clock)
+            let auth = GitHubDeviceFlowProvider(clientID: "test-client", http: http, clock: clock, store: store)
+            let signaled = SignaledGitHubAuthentication(provider: auth, prepared: prepared)
+            let blocker = Task { try await http.send(URLRequest(url: URL(string: "https://api.github.com/block")!)) }
+            await fulfillment(of: [started], timeout: 2)
+            let request = Task { try await GitHubAPIClient(authentication: signaled, http: http).currentUser() }
+            await fulfillment(of: [prepared], timeout: 2)
+            if logout { try await auth.logout() }
+            await gate.release()
+            _ = try await blocker.value
+            if logout {
+                do { _ = try await request.value; XCTFail("Expected logged-out request to fail") }
+                catch { XCTAssertTrue(error is CancellationError || error as? GitHubAuthError == .reauthenticationRequired) }
+                let tokens = await base.bearerTokens
+                XCTAssertTrue(tokens.isEmpty)
+                XCTAssertNil(store.load())
+            } else {
+                _ = try await request.value
+                let tokens = await base.bearerTokens
+                XCTAssertEqual(tokens, ["Bearer new-token"])
+                let count = await base.refreshCount
+                XCTAssertEqual(count, 1)
+            }
+        }
     }
 
 }

@@ -46,12 +46,12 @@ public struct GitHubAPIClient: Sendable {
         } catch { throw GitHubAPIError.invalidResponse }
     }
     private func send(_ input: URLRequest, retryRead: Bool) async throws -> GitHubHTTPResponse {
-        let authorization = try await authentication.authorization()
+        let initial = try await authentication.authorization()
         var request = input
-        request.setValue("Bearer \(authorization.token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2026-03-10", forHTTPHeaderField: "X-GitHub-Api-Version")
-        let response = try await http.send(request, retryRead: retryRead)
+        let (response, authorization) = try await http.sendAuthenticated(request, retryRead: retryRead,
+                                                                        authentication: authentication, revision: initial.revision)
         try Task.checkCancellation()
         guard await authentication.isCurrent(authorization) else { throw CancellationError() }
         if response.status == 401 { try await authentication.invalidate(authorization) }

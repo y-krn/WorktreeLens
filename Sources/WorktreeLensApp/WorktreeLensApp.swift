@@ -1,11 +1,23 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import WorktreeLensCore
+#if KEYCHAIN_VERIFICATION
+import Security
+#endif
 
 @main
 struct WorktreeLensApp: App {
     @StateObject private var model = ApplicationModel()
     @StateObject private var authentication = GitHubAuthenticationModel()
+
+    init() {
+        #if KEYCHAIN_VERIFICATION
+        if CommandLine.arguments.contains("--verify-github-keychain") {
+            do { try verifyGitHubKeychain(); exit(0) }
+            catch { fputs("Keychain verification failed: \(error.localizedDescription)\n", stderr); exit(1) }
+        }
+        #endif
+    }
 
     var body: some Scene {
         WindowGroup("Worktree Lens") {
@@ -1116,3 +1128,35 @@ struct GitHubAuthenticationSettings: View {
         .task { await model.restoreAccount() }
     }
 }
+
+
+#if KEYCHAIN_VERIFICATION
+/// Compiled only by the signed-app verification build, never by normal Debug/Release builds.
+private func verifyGitHubKeychain() throws {
+    let clientID = "verification-" + UUID().uuidString
+    let store = KeychainGitHubCredentialStore(clientID: clientID)
+    defer { try? store.delete() }
+    guard try store.load() == nil else { throw GitHubAuthError.invalidResponse }
+    func fixture(_ token: String) -> GitHubCredentials {
+        GitHubCredentials(accessToken: token, refreshToken: "synthetic-refresh", expiresAt: nil, refreshExpiresAt: nil,
+                          account: GitHubAccount(id: 0, login: "verification"))
+    }
+    try store.save(fixture("synthetic-first"))
+    guard try store.load()?.accessToken == "synthetic-first" else { throw GitHubAuthError.invalidResponse }
+    try store.save(fixture("synthetic-updated"))
+    guard try store.load()?.accessToken == "synthetic-updated" else { throw GitHubAuthError.invalidResponse }
+    let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "com.ykrn.WorktreeLens.github.com." + clientID,
+        kSecAttrAccount as String: "active-user", kSecAttrSynchronizable as String: false,
+        kSecUseDataProtectionKeychain as String: true, kSecReturnAttributes as String: true]
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    guard status == errSecSuccess else { throw GitHubAuthError.keychain(status) }
+    guard let attributes = result as? [String: Any],
+          attributes[kSecAttrAccessible as String] as? String == kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String,
+          attributes[kSecAttrSynchronizable as String] as? Bool == false else { throw GitHubAuthError.invalidResponse }
+    try store.delete()
+    guard try store.load() == nil else { throw GitHubAuthError.invalidResponse }
+    print("Data Protection Keychain: save/read/update/delete passed; WhenUnlockedThisDeviceOnly; synchronization disabled.")
+}
+#endif

@@ -107,6 +107,22 @@ public actor GitHubHTTPClient {
     }
 
     public func send(_ request: URLRequest, retryRead: Bool = false, deadline: Date? = nil) async throws -> GitHubHTTPResponse {
+        try await perform(request, retryRead: retryRead, deadline: deadline, authentication: nil, revision: nil).0
+    }
+
+    /// Reacquires credentials after queue/backoff waits and before every transport attempt.
+    /// Refresh uses github.com, so holding the api.github.com queue cannot deadlock refresh.
+    public func sendAuthenticated(_ request: URLRequest, retryRead: Bool, authentication: any GitHubAuthenticationProviding,
+                                  revision: UUID) async throws -> (GitHubHTTPResponse, GitHubAuthorization) {
+        guard request.url?.host == "api.github.com" else { throw GitHubAPIError.unsupportedURL }
+        let (response, authorization) = try await perform(request, retryRead: retryRead, deadline: nil,
+                                                         authentication: authentication, revision: revision)
+        guard let authorization else { throw GitHubAPIError.invalidResponse }
+        return (response, authorization)
+    }
+
+    private func perform(_ request: URLRequest, retryRead: Bool, deadline: Date?,
+                         authentication: (any GitHubAuthenticationProviding)?, revision: UUID?) async throws -> (GitHubHTTPResponse, GitHubAuthorization?) {
         guard let url = request.url, url.scheme == "https", let host = url.host,
               ["github.com", "api.github.com"].contains(host), url.user == nil, url.password == nil,
               url.port == nil || url.port == 443 else { throw GitHubAPIError.unsupportedURL }
@@ -133,6 +149,14 @@ public actor GitHubHTTPClient {
                 guard remaining > 0 else { throw GitHubAuthError.expired }
                 outbound.timeoutInterval = min(request.timeoutInterval, remaining)
             }
+            var authorization: GitHubAuthorization?
+            if let authentication {
+                let current = try await authentication.authorization()
+                guard current.revision == revision else { throw CancellationError() }
+                outbound.setValue("Bearer \(current.token)", forHTTPHeaderField: "Authorization")
+                authorization = current
+            }
+            try Task.checkCancellation()
             let response: GitHubHTTPResponse
             do { response = try await transport.send(outbound) }
             catch is CancellationError { throw CancellationError() }
@@ -157,7 +181,7 @@ public actor GitHubHTTPClient {
                 try await clock.sleep(seconds: pow(2, Double(attempt)))
                 continue
             }
-            return response
+            return (response, authorization)
         }
         throw GitHubAPIError.rateLimited
     }

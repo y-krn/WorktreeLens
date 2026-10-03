@@ -33,7 +33,8 @@ public struct KeychainGitHubCredentialStore: GitHubCredentialStore {
     public init(clientID: String) { service = "com.ykrn.WorktreeLens.github.com.\(clientID)" }
     private var query: [String: Any] {
         [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-         kSecAttrAccount as String: "active-user", kSecAttrSynchronizable as String: false]
+         kSecAttrAccount as String: "active-user", kSecAttrSynchronizable as String: false,
+         kSecUseDataProtectionKeychain as String: true]
     }
     public func load() throws -> GitHubCredentials? {
         var attributes = query
@@ -251,7 +252,14 @@ public actor GitHubDeviceFlowProvider: GitHubAuthenticationProviding {
         revision == authorization.revision && credentials?.accessToken == authorization.token
     }
     public func invalidate(_ authorization: GitHubAuthorization) async throws {
-        if isCurrent(authorization) { try await logout() }
+        guard isCurrent(authorization) else { return }
+        let now = await clock.now()
+        guard isCurrent(authorization) else { return }
+        // A token can expire while I/O is in flight. Preserve its usable refresh token;
+        // the next authorization will refresh it instead of forcing Device Flow again.
+        if let credentials, let expiry = credentials.expiresAt, expiry <= now,
+           credentials.refreshToken != nil, credentials.refreshExpiresAt.map({ $0 > now }) ?? true { return }
+        try await logout()
     }
 
     private struct DeviceResponse: Decodable {
