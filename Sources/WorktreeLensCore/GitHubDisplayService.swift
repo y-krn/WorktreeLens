@@ -89,8 +89,10 @@ public struct GitHubDisplayLimits: Sendable {
 
 private struct PageInfo: Decodable, Sendable { let hasNextPage: Bool; let endCursor: String? }
 private struct Connection<Node: Decodable & Sendable>: Decodable, Sendable {
-    let nodes: [Node?]
+    let nodes: [Node?]?
     let pageInfo: PageInfo
+    var availableNodes: [Node?] { nodes ?? [] }
+    var isIncomplete: Bool { nodes == nil || availableNodes.contains { $0 == nil } }
 }
 private struct WireIdentity: Decodable, Sendable { let id: String; let nameWithOwner: String }
 private struct WireIssue: Decodable, Sendable {
@@ -261,12 +263,12 @@ public struct GitHubDisplayService: Sendable {
                               !repo.isFork || batch[index].explicitBase else {
                             errors[index] = "GitHub repository or PR connection unresolved."; continue
                         }
-                        budget.items += page.nodes.count
-                        found[index, default: []] += page.nodes.compactMap { $0 }.filter { accepted($0, target: batch[index], repo: repo) }
-                        if page.nodes.compactMap({ $0 }).contains(where: { $0.headRefName == batch[index].branch && ($0.headRepository == nil || $0.baseRepository == nil) }) {
+                        budget.items += page.availableNodes.count
+                        found[index, default: []] += page.availableNodes.compactMap { $0 }.filter { accepted($0, target: batch[index], repo: repo) }
+                        if page.availableNodes.compactMap({ $0 }).contains(where: { $0.headRefName == batch[index].branch && ($0.headRepository == nil || $0.baseRepository == nil) }) {
                             incomplete.insert(index); errors[index] = "GitHub PR repository identity unavailable."
                         }
-                        if response.hasErrors(at: "b\(offset)") || page.nodes.contains(where: { $0 == nil }) {
+                        if response.hasErrors(at: "b\(offset)") || page.isIncomplete {
                             incomplete.insert(index); errors[index] = "GitHub GraphQL partial response."
                         }
                         if page.pageInfo.hasNextPage {
@@ -280,7 +282,9 @@ public struct GitHubDisplayService: Sendable {
                             errors[item.0] = "Known GitHub PR identity unresolved."; continue
                         }
                         budget.items += 1; found[item.0, default: []].append(pr)
-                        if pr.headRefOid != batch[item.0].sha, !pending.contains(where: { $0.0 == item.0 }) {
+                        // A closed, unmerged PR can be replaced without changing the branch SHA.
+                        let needsDiscovery = pr.headRefOid != batch[item.0].sha || (pr.state == "CLOSED" && pr.mergedAt == nil)
+                        if needsDiscovery, !pending.contains(where: { $0.0 == item.0 }) {
                             pending.append((item.0, nil))
                         }
                         if response.hasErrors(at: "k\(offset)") { incomplete.insert(item.0); errors[item.0] = "GitHub GraphQL partial response." }
@@ -344,8 +348,8 @@ public struct GitHubDisplayService: Sendable {
                     guard let page = pr.closingIssuesReferences else {
                         issueError = "GitHub linked issues unavailable."; issuesIncomplete = true; continue
                     }
-                    issues += page.nodes.compactMap { $0?.model }; budget.items += page.nodes.count
-                    if response.hasErrors(at: "i\(offset)") || page.nodes.contains(where: { $0 == nil }) { issuesIncomplete = true; issueError = "GitHub GraphQL partial response." }
+                    issues += page.availableNodes.compactMap { $0?.model }; budget.items += page.availableNodes.count
+                    if response.hasErrors(at: "i\(offset)") || page.isIncomplete { issuesIncomplete = true; issueError = "GitHub GraphQL partial response." }
                     if page.pageInfo.hasNextPage {
                         if let cursor = page.pageInfo.endCursor, cursor != item.1 { issuePending.append((item.0, cursor)) }
                         else { issuesIncomplete = true }
@@ -355,13 +359,13 @@ public struct GitHubDisplayService: Sendable {
                     if let repo = response.data?.repositories["ci"], repo.nameWithOwner.lowercased() == target.base.fullName.lowercased(),
                        let commit = repo.object, commit.oid == target.sha {
                         if let page = commit.statusCheckRollup?.contexts {
-                            checks += page.nodes.compactMap { $0?.model(sha: commit.oid) }; budget.items += page.nodes.count
+                            checks += page.availableNodes.compactMap { $0?.model(sha: commit.oid) }; budget.items += page.availableNodes.count
                             checkPending = page.pageInfo.hasNextPage
                             if checkPending {
                                 if let cursor = page.pageInfo.endCursor, cursor != checkCursor { checkCursor = cursor }
                                 else { checkPending = false; checksIncomplete = true }
                             }
-                            if page.nodes.contains(where: { $0 == nil }) { checksIncomplete = true }
+                            if page.isIncomplete { checksIncomplete = true }
                         } else { checkPending = false }
                         if response.hasErrors(at: "ci") { checksIncomplete = true; checkError = "GitHub GraphQL partial response." }
                     } else { checkPending = false; checkError = "Local HEAD checks unavailable (unpublished or inaccessible SHA)." }
@@ -374,7 +378,7 @@ public struct GitHubDisplayService: Sendable {
         if budget.items > limits.maxItems || budget.cost > limits.maxCost { issuesIncomplete = true; checksIncomplete = true }
         let now = await clock.now()
         issueFetch = GitHubFetchState(phase: !prFetch.isComplete || issuesIncomplete || !issuePending.isEmpty ? .incomplete : .loaded, fetchedAt: now, error: issueError)
-        checkFetch = GitHubFetchState(phase: checkError != nil ? (checks.isEmpty ? .failed : .incomplete) : checksIncomplete || checkPending ? .incomplete : .loaded, fetchedAt: now, error: checkError)
+        checkFetch = GitHubFetchState(phase: checksIncomplete || checkPending ? .incomplete : checkError != nil ? (checks.isEmpty ? .failed : .incomplete) : .loaded, fetchedAt: now, error: checkError)
         var page = 1; var count = 0; var total = Int.max; var actionError: String?
         let actionPageSize = max(1, min(100, limits.maxItems - budget.items))
         while count < total, await available(budget) {
