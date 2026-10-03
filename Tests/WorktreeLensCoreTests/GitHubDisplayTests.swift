@@ -2,8 +2,12 @@ import XCTest
 @testable import WorktreeLensCore
 
 struct DisplayTestAuthentication: GitHubAuthenticationProviding {
-    let revision = UUID()
-    func authorization() async throws -> GitHubAuthorization { GitHubAuthorization(token: "fixture", revision: revision) }
+    let revision: UUID
+    let accountIdentifier: String?
+    init(accountIdentifier: String? = nil) { self.revision = UUID(); self.accountIdentifier = accountIdentifier }
+    func authorization() async throws -> GitHubAuthorization {
+        GitHubAuthorization(token: "fixture", revision: revision, accountIdentifier: accountIdentifier)
+    }
     func isCurrent(_ authorization: GitHubAuthorization) async -> Bool { authorization.revision == revision }
     func invalidate(_ authorization: GitHubAuthorization) async throws {}
 }
@@ -53,8 +57,10 @@ func displayPR(number: Int = 201, branch: String = "feature", sha: String = "loc
 func displayBranch(_ name: String = "feature", sha: String = "local-sha", upstream: String? = nil) -> BranchInfo {
     BranchInfo(id: name, name: name, sha: sha, upstream: upstream, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])
 }
-func displayAPI(_ transport: any GitHubTransport, clock: any GitHubClock = SystemGitHubClock()) -> GitHubAPIClient {
-    GitHubAPIClient(authentication: DisplayTestAuthentication(), http: GitHubHTTPClient(transport: transport, clock: clock))
+func displayAPI(_ transport: any GitHubTransport, clock: any GitHubClock = SystemGitHubClock(),
+                stateStore: GitHubStateStore = .shared, accountIdentifier: String? = nil) -> GitHubAPIClient {
+    GitHubAPIClient(authentication: DisplayTestAuthentication(accountIdentifier: accountIdentifier),
+                     http: GitHubHTTPClient(transport: transport, clock: clock), stateStore: stateStore)
 }
 func displayTarget(_ name: String = "feature", sha: String = "local-sha", known: [Int] = []) -> GitHubBranchTarget {
     GitHubBranchTarget(branchID: name, branch: name, sha: sha, base: GitHubRepositoryIdentity(fullName: "example/repo")!,
@@ -127,7 +133,227 @@ private actor DisplayCancellationTransport: GitHubTransport {
     }
 }
 
+private struct DisplayValuePayload: Decodable, Equatable, Sendable { let value: Int }
+
+private actor DisplaySharedRequestTransport: GitHubTransport {
+    let started: XCTestExpectation
+    private var continuation: CheckedContinuation<GitHubHTTPResponse, Error>?
+    private var didCancel = false
+    private(set) var requestCount = 0
+    init(started: XCTestExpectation) { self.started = started }
+    func send(_ request: URLRequest) async throws -> GitHubHTTPResponse {
+        requestCount += 1
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { pending in
+                continuation = pending
+                started.fulfill()
+            }
+        } onCancel: {
+            Task { await self.cancel() }
+        }
+    }
+    func release() {
+        continuation?.resume(returning: GitHubHTTPResponse(data: Data(#"{"value":7}"#.utf8), status: 200))
+        continuation = nil
+    }
+    func wasCancelled() -> Bool { didCancel }
+    private func cancel() {
+        didCancel = true
+        continuation?.resume(throwing: CancellationError())
+        continuation = nil
+    }
+}
+
 final class GitHubDisplayTests: XCTestCase {
+    func testRESTETagIsScopedByAccountAnd304KeepsRepresentation() async throws {
+        let transport = DisplayScriptTransport { request, index in
+            if index == 1 {
+                return GitHubHTTPResponse(data: Data(#"{"value":7}"#.utf8), status: 200, headers: ["ETag": "\"v1\""])
+            }
+            if index == 2 {
+                XCTAssertEqual(request.value(forHTTPHeaderField: "If-None-Match"), "\"v1\"")
+                return GitHubHTTPResponse(data: Data(), status: 304)
+            }
+            XCTAssertNil(request.value(forHTTPHeaderField: "If-None-Match"))
+            let value = index == 3 ? 9 : index == 4 ? 10 : 11
+            return GitHubHTTPResponse(data: try JSONSerialization.data(withJSONObject: ["value": value]), status: 200)
+        }
+        let store = GitHubStateStore()
+        let first = GitHubAPIClient(authentication: DisplayTestAuthentication(accountIdentifier: "github.com:42"),
+                                    http: GitHubHTTPClient(transport: transport), stateStore: store)
+        let second = GitHubAPIClient(authentication: DisplayTestAuthentication(accountIdentifier: "github.com:43"),
+                                     http: GitHubHTTPClient(transport: transport), stateStore: store)
+        let firstValue: DisplayValuePayload = try await first.get(path: "/repos/example/repo/actions/runs")
+        let notModifiedValue: DisplayValuePayload = try await first.get(path: "/repos/example/repo/actions/runs")
+        let otherAccountValue: DisplayValuePayload = try await second.get(path: "/repos/example/repo/actions/runs")
+        let otherRepositoryValue: DisplayValuePayload = try await first.get(path: "/repos/other/repo/actions/runs")
+        await store.invalidateAccount(accountIdentifier: "github.com:42")
+        let afterLogoutValue: DisplayValuePayload = try await first.get(path: "/repos/example/repo/actions/runs")
+        XCTAssertEqual(firstValue, DisplayValuePayload(value: 7))
+        XCTAssertEqual(notModifiedValue, DisplayValuePayload(value: 7))
+        XCTAssertEqual(otherAccountValue, DisplayValuePayload(value: 9))
+        XCTAssertEqual(otherRepositoryValue, DisplayValuePayload(value: 10))
+        XCTAssertEqual(afterLogoutValue, DisplayValuePayload(value: 11))
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 5)
+        XCTAssertEqual(requests[1].value(forHTTPHeaderField: "If-None-Match"), "\"v1\"")
+        XCTAssertNil(requests[2].value(forHTTPHeaderField: "If-None-Match"))
+        XCTAssertEqual(requests[3].url?.path, "/repos/other/repo/actions/runs")
+        XCTAssertNil(requests[3].value(forHTTPHeaderField: "If-None-Match"))
+        XCTAssertNil(requests[4].value(forHTTPHeaderField: "If-None-Match"))
+    }
+
+    func testSharedRequestSurvivesOneSubscriberCancellation() async throws {
+        let started = expectation(description: "shared request started")
+        let transport = DisplaySharedRequestTransport(started: started)
+        let store = GitHubStateStore()
+        let request = URLRequest(url: URL(string: "https://api.github.com/repos/example/repo/actions/runs")!)
+        let send: @Sendable () async throws -> GitHubHTTPResponse = {
+            try await store.send(request, accountIdentifier: "github.com:42") { outbound in
+                try await transport.send(outbound)
+            }
+        }
+        let first = Task { try await send() }
+        await fulfillment(of: [started], timeout: 2)
+        let second = Task { try await send() }
+        var waiters = 0
+        for _ in 0..<1_000 {
+            waiters = await store.activeRequestWaiterCount(request, accountIdentifier: "github.com:42")
+            if waiters == 2 { break }
+            await Task.yield()
+        }
+        guard waiters == 2 else {
+            first.cancel(); second.cancel(); await transport.release()
+            XCTFail("Second subscriber did not join the in-flight request")
+            return
+        }
+        first.cancel()
+        do { _ = try await first.value; XCTFail("Cancelled subscriber should not receive a response") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let wasCancelled = await transport.wasCancelled()
+        XCTAssertFalse(wasCancelled)
+        await transport.release()
+        let sharedResponse = try await second.value
+        XCTAssertEqual(sharedResponse.status, 200)
+        let requestCount = await transport.requestCount
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    func testAccountInvalidationFencesLateResponseAndStatusWrite() async throws {
+        let started = expectation(description: "account request started")
+        let transport = DisplaySharedRequestTransport(started: started)
+        let store = GitHubStateStore()
+        let request = URLRequest(url: URL(string: "https://api.github.com/repos/example/repo/actions/runs")!)
+        let revision = UUID()
+        let task = Task {
+            try await store.send(request, accountIdentifier: "github.com:42", sessionRevision: revision) { outbound in
+                try await transport.send(outbound)
+            }
+        }
+        await fulfillment(of: [started], timeout: 2)
+        await store.invalidateAccount(accountIdentifier: "github.com:42")
+        do { _ = try await task.value; XCTFail("Invalidated request must not complete") }
+        catch { XCTAssertTrue(error is CancellationError) }
+
+        let good = GitHubStatus(issues: [], pullRequests: [GitHubPullRequest(id: "PR-201", number: 201, title: "Feature",
+            state: "OPEN", isDraft: false, baseRefName: "main", headRefName: "feature", headRefOid: "local-sha",
+            mergedAt: nil, url: nil)], actions: [], error: nil, localSHA: "local-sha")
+        _ = await store.recordStatus(accountIdentifier: "github.com:42", target: displayTarget(), repositoryID: "BASE",
+                                     sessionRevision: revision, status: good)
+        let cached = await store.cachedStatus(accountIdentifier: "github.com:42", target: displayTarget())
+        XCTAssertNil(cached)
+    }
+
+    func testFailedRefreshKeepsLastGoodDataButSeparatesSHAAndAccount() async throws {
+        let store = GitHubStateStore()
+        let success = DisplayScriptTransport { _, _ in
+            try displayResponse(["b0": displayRepo(["pullRequests": displayPage([displayPR()])])])
+        }
+        let first = GitHubDisplayService(api: displayAPI(success, stateStore: store, accountIdentifier: "github.com:42"))
+        let initialStatuses = await first.summaries(targets: [displayTarget()])
+        let initial = try XCTUnwrap(initialStatuses["feature"])
+        XCTAssertEqual(initial.pullRequests.map(\.number), [201])
+
+        let failed = DisplayScriptTransport { _, _ in throw GitHubAPIError.network }
+        let second = GitHubDisplayService(api: displayAPI(failed, stateStore: store, accountIdentifier: "github.com:42"))
+        let refreshedStatuses = await second.summaries(targets: [displayTarget()])
+        let refreshed = try XCTUnwrap(refreshedStatuses["feature"])
+        XCTAssertEqual(refreshed.pullRequests.map(\.number), [201])
+        XCTAssertEqual(refreshed.pullRequestFetch.phase, .failed)
+        XCTAssertTrue(refreshed.pullRequestFetch.stale)
+        XCTAssertFalse(refreshed.mergeEvidenceLoaded)
+        XCTAssertNotNil(refreshed.error)
+
+        let changedSHAStatuses = await second.summaries(targets: [displayTarget(sha: "new-sha")])
+        let changedSHA = try XCTUnwrap(changedSHAStatuses["feature"])
+        XCTAssertTrue(changedSHA.pullRequests.isEmpty)
+        XCTAssertFalse(changedSHA.pullRequestFetch.stale)
+
+        let target = displayTarget()
+        let differentHead = GitHubBranchTarget(branchID: target.branchID, branch: target.branch, sha: target.sha,
+            base: target.base, head: GitHubRepositoryIdentity(fullName: "fork/repo")!)
+        let differentRepository = GitHubBranchTarget(branchID: target.branchID, branch: target.branch, sha: target.sha,
+            base: GitHubRepositoryIdentity(fullName: "other/repo")!, head: target.head)
+        let differentHeadStatus = await store.cachedStatus(accountIdentifier: "github.com:42", target: differentHead)
+        let differentRepositoryStatus = await store.cachedStatus(accountIdentifier: "github.com:42", target: differentRepository)
+        XCTAssertNil(differentHeadStatus)
+        XCTAssertNil(differentRepositoryStatus)
+
+        let replacement = GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil,
+            pullRequestFetch: GitHubFetchState(phase: .loaded, fetchedAt: Date()))
+        let replaced = await store.recordStatus(accountIdentifier: "github.com:42", target: target,
+            repositoryID: "REPLACED-BASE", status: replacement)
+        XCTAssertTrue(replaced.pullRequests.isEmpty)
+        let remappedStatus = await store.cachedStatus(accountIdentifier: "github.com:42", target: target)
+        XCTAssertTrue(remappedStatus?.pullRequests.isEmpty == true)
+
+        let otherAccount = GitHubDisplayService(api: displayAPI(failed, stateStore: store, accountIdentifier: "github.com:43"))
+        let isolatedStatuses = await otherAccount.summaries(targets: [displayTarget()])
+        let isolated = try XCTUnwrap(isolatedStatuses["feature"])
+        XCTAssertTrue(isolated.pullRequests.isEmpty)
+        XCTAssertFalse(isolated.pullRequestFetch.stale)
+    }
+
+    func testRefreshFailureRetainsEachLastGoodEntityAndFreshness() async throws {
+        let store = GitHubStateStore()
+        let target = displayTarget()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let good = GitHubStatus(issues: [GitHubIssue(id: "ISSUE-7", number: 7, title: "Linked", state: "OPEN", url: nil,
+                                                      repositoryID: "ISSUE-REPO")],
+                                pullRequests: [GitHubPullRequest(id: "PR-201", number: 201, title: "Feature", state: "OPEN",
+                                    isDraft: false, baseRefName: "main", headRefName: "feature", headRefOid: "local-sha",
+                                    mergedAt: nil, url: nil)],
+                                actions: [GitHubActionRun(id: "example/repo:55:2", name: "Build", status: "completed", conclusion: "success",
+                                                          url: nil, headSHA: "local-sha", event: "push", runID: 55, attempt: 2,
+                                                          repositoryName: "example/repo")],
+                                error: nil, isLoaded: true, mergeEvidenceLoaded: true,
+                                checks: [GitHubCheck(id: "CHECK-1", name: "Build", kind: "CheckRun", result: "SUCCESS", sha: "local-sha")],
+                                pullRequestFetch: GitHubFetchState(phase: .loaded, fetchedAt: now),
+                                issueFetch: GitHubFetchState(phase: .loaded, fetchedAt: now),
+                                checkFetch: GitHubFetchState(phase: .loaded, fetchedAt: now),
+                                actionFetch: GitHubFetchState(phase: .loaded, fetchedAt: now), localSHA: "local-sha")
+        _ = await store.recordStatus(accountIdentifier: "github.com:42", target: target, repositoryID: "BASE", status: good)
+        let attempt = Date(timeIntervalSince1970: 1_700_000_100)
+        let failed = GitHubStatus(issues: [], pullRequests: [], actions: [], error: "PR request failed", isLoaded: true,
+                                  mergeEvidenceLoaded: false,
+                                  pullRequestFetch: GitHubFetchState(phase: .failed, lastAttemptAt: attempt, error: "PR request failed"),
+                                  issueFetch: GitHubFetchState(phase: .failed, lastAttemptAt: attempt, error: "Issues failed"),
+                                  checkFetch: GitHubFetchState(phase: .failed, lastAttemptAt: attempt, error: "Checks failed"),
+                                  actionFetch: GitHubFetchState(phase: .failed, lastAttemptAt: attempt, error: "Actions failed"),
+                                  localSHA: "local-sha")
+        let retained = await store.recordStatus(accountIdentifier: "github.com:42", target: target, status: failed)
+        XCTAssertEqual(retained.pullRequests.map(\.id), ["PR-201"])
+        XCTAssertEqual(retained.issues.map(\.repositoryID), ["ISSUE-REPO"])
+        XCTAssertEqual(retained.checks.map(\.id), ["CHECK-1"])
+        XCTAssertEqual(retained.actions.map(\.runID), [55])
+        for state in [retained.pullRequestFetch, retained.issueFetch, retained.checkFetch, retained.actionFetch] {
+            XCTAssertTrue(state.stale)
+            XCTAssertEqual(state.fetchedAt, now)
+            XCTAssertEqual(state.lastAttemptAt, attempt)
+            XCTAssertNotNil(state.error)
+        }
+    }
     func testResolverUsesUpstreamBaseAndTrackingRemoteHeadAndExplicitSelection() throws {
         let config = "remote.origin.url=git@github.com:fork/repo.git\nremote.upstream.url=ssh://git@github.com/example/repo.git\nbranch.feature.remote=origin"
         let target = try XCTUnwrap(GitHubRepositoryResolver(runner: DisplayConfigRunner(config: config)).targets(path: "/fixture", branches: [displayBranch()]).first)

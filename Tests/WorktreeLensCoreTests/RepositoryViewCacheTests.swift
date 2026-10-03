@@ -52,9 +52,9 @@ final class RepositoryViewCacheTests: XCTestCase {
             return (gitScans[path, default: 0], bulkRefreshes[path, default: 0])
         }
 
-        func releaseBlockedBulkRefresh() {
+        func releaseBlockedBulkRefresh(path: String = "/released") {
             lock.lock(); let pending = blockedBulkContinuation; blockedBulkContinuation = nil; lock.unlock()
-            pending?.resume(returning: RepositorySnapshot(path: "/released", defaultBranch: nil, branches: []))
+            pending?.resume(returning: RepositorySnapshot(path: path, defaultBranch: nil, branches: []))
         }
 
         private func recordBulkRefresh(for path: String) -> Int {
@@ -140,6 +140,40 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertEqual(scanner.counts(for: first.snapshot.path).bulk, 2)
     }
 
+    func testRefreshPublishesMatchingGitHubCacheWhileRevalidationRuns() async throws {
+        let started = expectation(description: "GitHub revalidation started")
+        let local = localResult(path: "/tmp/github-cache-refresh", branch: "feature")
+        let scanner = CountingScanner(results: [local.snapshot.path: [local, local]],
+                                      blockedBulkCall: (path: local.snapshot.path, call: 1, expectation: started))
+        let stateStore = GitHubStateStore()
+        let base = GitHubRepositoryIdentity(fullName: "example/repo")!
+        let target = GitHubBranchTarget(branchID: "feature", branch: "feature", sha: "sha", base: base, head: base)
+        let fetchedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let cached = GitHubStatus(issues: [], pullRequests: [GitHubPullRequest(id: "PR-9", number: 9, title: "Feature",
+            state: "OPEN", isDraft: false, baseRefName: "main", headRefName: "feature", headRefOid: "sha",
+            mergedAt: nil, url: nil)], actions: [], error: nil,
+            pullRequestFetch: GitHubFetchState(phase: .loaded, fetchedAt: fetchedAt), localSHA: "sha")
+        _ = await stateStore.recordStatus(accountIdentifier: "github.com:42", target: target,
+                                          repositoryID: "BASE", status: cached)
+        let authentication = DisplayTestAuthentication(accountIdentifier: "github.com:42")
+        let api = GitHubAPIClient(authentication: authentication,
+                                  http: GitHubHTTPClient(transport: DisplayScriptTransport { _, _ in throw GitHubAPIError.network }),
+                                  stateStore: stateStore)
+        let github = GitHubService(api: api,
+            resolver: GitHubRepositoryResolver(runner: DisplayConfigRunner(config: "remote.origin.url=https://github.com/example/repo.git")))
+        let model = makeModel(paths: [local.snapshot.path], scanner: scanner, github: github)
+
+        model.selectRepository(path: local.snapshot.path)
+        await fulfillment(of: [started], timeout: 2)
+        let published = try XCTUnwrap(model.snapshot?.branches.first?.github)
+        XCTAssertEqual(published.pullRequests.map(\.number), [9])
+        XCTAssertEqual(published.pullRequestFetch.phase, .refreshing)
+        XCTAssertTrue(published.pullRequestFetch.stale)
+        XCTAssertEqual(published.pullRequestFetch.fetchedAt, fetchedAt)
+        scanner.releaseBlockedBulkRefresh(path: local.snapshot.path)
+        await waitForRefresh(model)
+    }
+
     func testFirstLoadSwitchedDuringBulkDoesNotLeavePartialCache() async throws {
         let bulkStarted = expectation(description: "A initial bulk refresh blocked")
         let partialA = localResult(path: "/tmp/partial-first-A", branch: "partial")
@@ -199,7 +233,7 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertEqual(scanner.counts(for: completedA.snapshot.path).bulk, 2)
     }
 
-    func testCleanupCompletionRefreshesAndReplacesCachedSnapshot() async throws {
+    func testCleanupCompletionRefreshesLocalSnapshotWithoutGitHubEnrichment() async throws {
         let first = localResult(path: "/tmp/cleanup-A", branch: "before-cleanup")
         let refreshed = localResult(path: "/tmp/cleanup-A", branch: "after-cleanup")
         let other = localResult(path: "/tmp/cleanup-B", branch: "other")
@@ -218,7 +252,7 @@ final class RepositoryViewCacheTests: XCTestCase {
 
         XCTAssertEqual(model.snapshot?.branches.first?.id, "after-cleanup")
         XCTAssertEqual(scanner.counts(for: first.snapshot.path).git, 2)
-        XCTAssertEqual(scanner.counts(for: first.snapshot.path).bulk, 2)
+        XCTAssertEqual(scanner.counts(for: first.snapshot.path).bulk, 1)
     }
 
     func testDeterministicCleanupPatchesSnapshotAndCacheWithoutScanning() async throws {
@@ -549,7 +583,7 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(model.snapshot?.branches.first).github.isLoaded)
     }
 
-    private func makeModel(paths: [String], scanner: any RepositoryScanning, detailLoader: (any GitHubDetailLoading)? = nil, git: GitService = GitService(), cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil) -> ApplicationModel {
+    private func makeModel(paths: [String], scanner: any RepositoryScanning, detailLoader: (any GitHubDetailLoading)? = nil, git: GitService = GitService(), github: GitHubService = GitHubService(), cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil) -> ApplicationModel {
         // An absolute suite path keeps the plist out of ~/Library/Preferences; removePersistentDomain alone leaves the file behind.
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RepositoryViewCacheTests-\(UUID().uuidString)")
         try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -557,7 +591,7 @@ final class RepositoryViewCacheTests: XCTestCase {
         let defaults = UserDefaults(suiteName: directory.appendingPathComponent("defaults").path)!
         let store = RepositoryStore(defaults: defaults)
         paths.forEach(store.add)
-        return ApplicationModel(loadRepositories: false, repositoryStore: store, git: git, detailLoader: detailLoader, scanner: scanner, cleanupExecutor: cleanupExecutor)
+        return ApplicationModel(loadRepositories: false, repositoryStore: store, git: git, github: github, detailLoader: detailLoader, scanner: scanner, cleanupExecutor: cleanupExecutor)
     }
 
     private func localResult(path: String, branch: String, worktree: String? = nil, notes: [String] = [], githubLoaded: Bool = true) -> RepositoryLocalScanResult {

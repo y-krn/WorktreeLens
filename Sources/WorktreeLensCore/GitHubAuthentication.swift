@@ -94,7 +94,10 @@ public struct GitHubAuthState: Equatable, Sendable {
 public struct GitHubAuthorization: Sendable, CustomStringConvertible, CustomDebugStringConvertible {
     public let token: String
     public let revision: UUID
-    public init(token: String, revision: UUID) { self.token = token; self.revision = revision }
+    public let accountIdentifier: String?
+    public init(token: String, revision: UUID, accountIdentifier: String? = nil) {
+        self.token = token; self.revision = revision; self.accountIdentifier = accountIdentifier
+    }
     public var description: String { "GitHubAuthorization(<redacted>)" }
     public var debugDescription: String { description }
 }
@@ -238,14 +241,14 @@ public actor GitHubDeviceFlowProvider: GitHubAuthenticationProviding {
                 guard revision == generation else { throw CancellationError() }
                 refresh = nil
                 try Task.checkCancellation()
-                return GitHubAuthorization(token: updated.accessToken, revision: revision)
+                return GitHubAuthorization(token: updated.accessToken, revision: revision, accountIdentifier: updated.account.identifier)
             } catch {
                 if await operation.isFinished(), revision == generation, refresh === operation { refresh = nil }
                 throw error
             }
         }
         guard self.credentials?.accessToken == credentials.accessToken else { throw CancellationError() }
-        return GitHubAuthorization(token: credentials.accessToken, revision: revision)
+        return GitHubAuthorization(token: credentials.accessToken, revision: revision, accountIdentifier: credentials.account.identifier)
     }
 
     public func isCurrent(_ authorization: GitHubAuthorization) -> Bool {
