@@ -1,16 +1,32 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import WorktreeLensCore
+#if KEYCHAIN_VERIFICATION
+import Security
+#endif
 
 @main
 struct WorktreeLensApp: App {
     @StateObject private var model = ApplicationModel()
+    @StateObject private var authentication = GitHubAuthenticationModel()
+
+    init() {
+        #if KEYCHAIN_VERIFICATION
+        if CommandLine.arguments.contains("--verify-github-keychain") {
+            do { try verifyGitHubKeychain(); exit(0) }
+            catch { fputs("Keychain verification failed: \(error.localizedDescription)\n", stderr); exit(1) }
+        }
+        #endif
+    }
 
     var body: some Scene {
         WindowGroup("Worktree Lens") {
             ContentView(model: model)
                 .frame(minWidth: 1_240, minHeight: 760)
                 .tint(Color(red: 0.10, green: 0.54, blue: 0.56))
+        }
+        Settings {
+            GitHubAuthenticationSettings(model: authentication)
         }
         .commands {
             CommandGroup(after: .newItem) {
@@ -986,3 +1002,161 @@ struct EmptyStateView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
+
+
+@MainActor
+final class GitHubAuthenticationModel: ObservableObject {
+    @Published var clientID: String
+    @Published private(set) var account: GitHubAccount?
+    @Published private(set) var prompt: GitHubDevicePrompt?
+    @Published private(set) var message: String?
+    @Published private(set) var isBusy = false
+    private var provider: GitHubDeviceFlowProvider
+    private let http = GitHubHTTPClient()
+    private var configuredClientID: String
+    private var task: Task<Void, Never>?
+    private var operationID = UUID()
+
+    init() {
+        let clientID = UserDefaults.standard.string(forKey: "githubAppClientID") ?? ""
+        self.clientID = clientID
+        configuredClientID = clientID
+        provider = GitHubDeviceFlowProvider(clientID: clientID, http: http)
+    }
+
+    func restoreAccount() async {
+        do { account = try await provider.state().account }
+        catch { message = error.localizedDescription }
+    }
+
+    func signIn() {
+        guard !isBusy else { return }
+        let id = UUID()
+        operationID = id
+        isBusy = true; message = nil; prompt = nil
+        task = Task {
+            do {
+                let configured = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+                if configured != configuredClientID {
+                    try await provider.logout()
+                    account = nil
+                    provider = GitHubDeviceFlowProvider(clientID: configured, http: http)
+                    configuredClientID = configured
+                    UserDefaults.standard.set(configured, forKey: "githubAppClientID")
+                }
+                let account = try await provider.authenticate { prompt in
+                    await MainActor.run {
+                        guard self.operationID == id else { return }
+                        self.prompt = prompt
+                        NSWorkspace.shared.open(prompt.verificationURL)
+                    }
+                }
+                guard operationID == id else { return }
+                self.account = account
+                message = "Signed in as \(account.login)."
+            } catch is CancellationError {
+                if operationID == id { message = "Sign-in cancelled." }
+            } catch {
+                if operationID == id { message = error.localizedDescription }
+            }
+            if operationID == id { isBusy = false; prompt = nil; task = nil }
+        }
+    }
+
+    func cancel() { task?.cancel() }
+
+    func logout() {
+        task?.cancel()
+        let id = UUID()
+        operationID = id
+        isBusy = true; prompt = nil; message = nil
+        task = Task {
+            do { try await provider.logout(); message = "Signed out." }
+            catch { message = error.localizedDescription }
+            account = nil
+            if operationID == id { isBusy = false; task = nil }
+        }
+    }
+
+    func verifyRead() {
+        guard !isBusy else { return }
+        let id = UUID()
+        operationID = id
+        isBusy = true; message = nil
+        task = Task {
+            do {
+                let user = try await GitHubAPIClient(authentication: provider, http: http).currentUser()
+                if operationID == id { account = user; message = "Authenticated API read succeeded: \(user.login)." }
+            } catch is CancellationError {
+                if operationID == id { message = "API read cancelled." }
+            } catch {
+                if operationID == id { message = error.localizedDescription }
+            }
+            if operationID == id {
+                account = try? await provider.state().account
+                isBusy = false; task = nil
+            }
+        }
+    }
+}
+
+struct GitHubAuthenticationSettings: View {
+    @ObservedObject var model: GitHubAuthenticationModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("GitHub App Authentication").font(.headline)
+            TextField("GitHub App client ID", text: $model.clientID).disabled(model.isBusy)
+            Text("Enable Device Flow and install your GitHub App on the selected repositories before signing in.")
+                .font(.caption).foregroundStyle(.secondary)
+            if let account = model.account { Text("Account: \(account.login)") }
+            if let prompt = model.prompt {
+                Text("Enter code: \(prompt.userCode)").textSelection(.enabled)
+                Link("Open GitHub authorization", destination: prompt.verificationURL)
+                Text("Expires: \(prompt.expiresAt.formatted())").font(.caption)
+            }
+            HStack {
+                Button("Sign In") { model.signIn() }.disabled(model.isBusy || model.clientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Verify API Read") { model.verifyRead() }.disabled(model.isBusy || model.account == nil)
+                Button("Sign Out") { model.logout() }.disabled(model.isBusy || model.account == nil)
+                if model.isBusy { Button("Cancel") { model.cancel() }; ProgressView().controlSize(.small) }
+            }
+            if let message = model.message { Text(message).font(.caption).textSelection(.enabled) }
+            Text("PR display and Cleanup continue to use GitHub CLI during the migration.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(24).frame(width: 520)
+        .task { await model.restoreAccount() }
+    }
+}
+
+
+#if KEYCHAIN_VERIFICATION
+/// Compiled only by the signed-app verification build, never by normal Debug/Release builds.
+private func verifyGitHubKeychain() throws {
+    let clientID = "verification-" + UUID().uuidString
+    let store = KeychainGitHubCredentialStore(clientID: clientID)
+    defer { try? store.delete() }
+    guard try store.load() == nil else { throw GitHubAuthError.invalidResponse }
+    func fixture(_ token: String) -> GitHubCredentials {
+        GitHubCredentials(accessToken: token, refreshToken: "synthetic-refresh", expiresAt: nil, refreshExpiresAt: nil,
+                          account: GitHubAccount(id: 0, login: "verification"))
+    }
+    try store.save(fixture("synthetic-first"))
+    guard try store.load()?.accessToken == "synthetic-first" else { throw GitHubAuthError.invalidResponse }
+    try store.save(fixture("synthetic-updated"))
+    guard try store.load()?.accessToken == "synthetic-updated" else { throw GitHubAuthError.invalidResponse }
+    let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "com.ykrn.WorktreeLens.github.com." + clientID,
+        kSecAttrAccount as String: "active-user", kSecAttrSynchronizable as String: false,
+        kSecUseDataProtectionKeychain as String: true, kSecReturnAttributes as String: true]
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    guard status == errSecSuccess else { throw GitHubAuthError.keychain(status) }
+    guard let attributes = result as? [String: Any],
+          attributes[kSecAttrAccessible as String] as? String == kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String,
+          attributes[kSecAttrSynchronizable as String] as? Bool == false else { throw GitHubAuthError.invalidResponse }
+    try store.delete()
+    guard try store.load() == nil else { throw GitHubAuthError.invalidResponse }
+    print("Data Protection Keychain: save/read/update/delete passed; WhenUnlockedThisDeviceOnly; synchronization disabled.")
+}
+#endif
