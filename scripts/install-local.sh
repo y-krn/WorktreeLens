@@ -14,6 +14,8 @@ BACKUP_PATH=""
 OLD_MOVED=0
 NEW_INSTALLED=0
 COMMITTED=0
+SIGNING_TEAM="${WORKTREELENS_SIGNING_TEAM:-}"
+SIGNING_IDENTITY="${WORKTREELENS_SIGNING_IDENTITY:-Apple Development}"
 
 fail() {
   printf 'install-local: %s\n' "$*" >&2
@@ -49,6 +51,15 @@ trap 'exit 143' TERM
 
 cd -- "$REPO_ROOT"
 
+# Data Protection Keychain entitlements need a development identity and matching profile.
+[[ -n "$SIGNING_TEAM" ]] || fail "set WORKTREELENS_SIGNING_TEAM to your Apple development team ID before running make install"
+[[ -n "$SIGNING_IDENTITY" ]] || fail "WORKTREELENS_SIGNING_IDENTITY must not be empty"
+PROVISIONING_ARGS=(-allowProvisioningUpdates)
+# Registration consumes a developer device slot and must be explicitly enabled.
+if [[ "${WORKTREELENS_ALLOW_DEVICE_REGISTRATION:-0}" == "1" ]]; then
+  PROVISIONING_ARGS+=(-allowProvisioningDeviceRegistration)
+fi
+
 [[ "$(git status --porcelain --untracked-files=all)" == "" ]] || fail "working tree must be clean"
 [[ "$(git branch --show-current)" == "main" ]] || fail "checked-out branch must be main"
 
@@ -57,12 +68,15 @@ git merge-base --is-ancestor HEAD origin/main || fail "local main cannot fast-fo
 git pull --ff-only || fail "git pull --ff-only failed"
 
 DERIVED_DATA="$(mktemp -d "${TMPDIR:-/tmp}/WorktreeLens-DerivedData.XXXXXX")" || fail "could not create temporary DerivedData directory"
-xcodebuild \
+xcodebuild "${PROVISIONING_ARGS[@]}" \
   -project "$REPO_ROOT/WorktreeLens.xcodeproj" \
   -scheme WorktreeLens \
   -configuration Release \
-  -destination 'platform=macOS' \
+  -destination "platform=macOS,arch=$(uname -m)" \
   -derivedDataPath "$DERIVED_DATA" \
+  DEVELOPMENT_TEAM="$SIGNING_TEAM" \
+  CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
+  CODE_SIGN_STYLE=Automatic \
   clean build || fail "native Release build failed"
 
 BUILT_APP="$DERIVED_DATA/Build/Products/Release/$APP_NAME"
@@ -71,6 +85,7 @@ INFO_PLIST="$BUILT_APP/Contents/Info.plist"
 [[ -x "$BUILT_APP/Contents/MacOS/WorktreeLens" ]] || fail "app executable missing or not executable"
 [[ -f "$INFO_PLIST" ]] || fail "app Info.plist missing"
 [[ -f "$BUILT_APP/Contents/Resources/Assets.car" ]] || fail "app Assets.car missing"
+codesign --verify --strict "$BUILT_APP" || fail "built app signature verification failed"
 
 plist_value() {
   /usr/libexec/PlistBuddy -c "Print :$1" "$INFO_PLIST" 2>/dev/null

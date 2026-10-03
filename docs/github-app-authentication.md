@@ -48,7 +48,7 @@ Data Protection Keychain のアクセスには、署名したアプリの app id
 WORKTREELENS_SIGNING_TEAM=YOUR_TEAM_ID scripts/verify-github-keychain.sh
 ```
 
-スクリプトは実アプリ target の署名済み Debug build と entitlements を確認し、ランダムな専用 service の合成資格情報で保存・読取・更新・削除を実行します。保存属性が `WhenUnlockedThisDeviceOnly`、同期無効であることも確認します。検証レコードと一時 build は削除します。検証用コードは `KEYCHAIN_VERIFICATION` を指定した build にだけ含まれ、通常の Debug / Release build には入りません。実 GitHub token と既存の Keychain 項目は操作しません。
+スクリプトは実アプリ target の署名済み Debug build と entitlements を確認し、ランダムな専用 service の合成資格情報で保存・読取・更新・削除を実行します。保存属性が `WhenUnlockedThisDeviceOnly`、同期無効であることも確認します。検証レコードと一時 build は削除します。検証用コードは `KEYCHAIN_VERIFICATION` を指定した build にだけ含まれ、通常の Debug / Release build には入りません。`WORKTREELENS_VERIFICATION_CONFIGURATION=Release` を追加すると、署名した Release build でも同じ実操作を検証できます。実 GitHub token と既存の Keychain 項目は操作しません。
 
 Xcode は設定済み開発者アカウントで provisioning profile を準備します。開発端末の登録が必要な場合は失敗します。Apple Developer の端末登録枠を消費するため、登録を承認した場合だけ `WORKTREELENS_ALLOW_DEVICE_REGISTRATION=1` を追加して実行してください。
 
