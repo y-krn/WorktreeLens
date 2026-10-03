@@ -131,6 +131,7 @@ public final class GitHubService: @unchecked Sendable {
             }
 
             guard let page = base.pullRequests, let nodes = page.nodes else { throw CleanupVerificationError.incomplete }
+            guard !nodes.contains(where: { $0 == nil }) else { throw CleanupVerificationError.incomplete }
             fetched += nodes.count
             let matches = nodes.compactMap { $0 }.filter {
                 $0.baseRefName == defaultBranch && $0.headRefName == branch && $0.headRefOid == localSHA &&

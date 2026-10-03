@@ -62,13 +62,15 @@ func displayTarget(_ name: String = "feature", sha: String = "local-sha", known:
 }
 
 /// Targeted API fixture used by scanner and cleanup safety tests.
-func scannerDisplayFixture(pr: Data) -> (GitHubService, DisplayScriptTransport) {
+func scannerDisplayFixture(pr: Data, cleanupNodes: [Any]? = nil,
+                           beforeCleanupRequest: (@Sendable () throws -> Void)? = nil) -> (GitHubService, DisplayScriptTransport) {
     let transport = DisplayScriptTransport { request, _ in
         XCTAssertEqual(request.url?.path, "/graphql")
         let query = try displayQuery(request)
         let prs = try XCTUnwrap(JSONSerialization.jsonObject(with: pr) as? [[String: Any]])
         var data: [String: Any] = [:]
         if query.contains("base: repository(") {
+            try beforeCleanupRequest?()
             let knownPattern = try NSRegularExpression(pattern: #"pullRequest\(number: ([0-9]+)\)"#)
             let knownMatch = knownPattern.firstMatch(in: query, range: NSRange(query.startIndex..., in: query))
             let requestedNumber = knownMatch.flatMap { Int(query[Range($0.range(at: 1), in: query)!]) }
@@ -86,6 +88,11 @@ func scannerDisplayFixture(pr: Data) -> (GitHubService, DisplayScriptTransport) 
             var base = displayRepo(["isFork": false])
             if requestedNumber != nil { base["pullRequest"] = selected as Any? ?? NSNull() }
             else { base["pullRequests"] = displayPage(candidates) }
+            if requestedNumber == nil, let cleanupNodes,
+               var page = base["pullRequests"] as? [String: Any] {
+                page["nodes"] = cleanupNodes
+                base["pullRequests"] = page
+            }
             let headRepository = selected?["headRepository"] as? [String: Any]
             data["base"] = base
             data["head"] = ["id": headRepository?["id"] as? String ?? "BASE",

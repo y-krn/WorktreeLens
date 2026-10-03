@@ -1011,6 +1011,78 @@ final class CoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath.path))
     }
 
+    func testMergedCleanupGitHubWorktreeBranchSwitchDuringVerificationBlocksGroup() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        _ = try runGit(["-C", fixture.repository.path, "branch", "other", "feature"])
+        let worktreePathString = worktreePath.path
+        let payload = try JSONSerialization.data(withJSONObject: [displayPR(number: 137, sha: fixture.featureSHA)])
+        let (github, transport) = scannerDisplayFixture(pr: payload, beforeCleanupRequest: {
+            guard FileManager.default.fileExists(atPath: worktreePathString) else { return }
+            let result = try LocalProcessRunner().run("/usr/bin/git", arguments: ["-C", worktreePathString, "switch", "other"], currentDirectory: nil)
+            guard result.succeeded else { throw NSError(domain: "CleanupBranchSwitchFixture", code: Int(result.status)) }
+        })
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let mergedAt = Date(timeIntervalSince1970: 1)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main",
+            branches: [branch.withMergeEvidence(.githubVerified(prNumber: 137, mergedAt: mergedAt)).withRemoteGone(true)])
+        let cleanup = CleanupService(git: git,
+            sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()),
+            github: github)
+        let preview = cleanup.previewMergedBranches(snapshot: snapshot)
+
+        let result = await cleanup.executeAsync(preview)
+
+        XCTAssertTrue(result.removedWorktreePaths.isEmpty)
+        XCTAssertTrue(result.deletedLocalBranches.isEmpty)
+        XCTAssertEqual(try runGit(["-C", worktreePath.path, "branch", "--show-current"]).trimmingCharacters(in: .whitespacesAndNewlines), "other")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
+        let branchesAfter = try git.snapshot(repositoryPath: fixture.repository.path).branches
+        XCTAssertTrue(branchesAfter.contains { $0.name == "feature" })
+        XCTAssertTrue(branchesAfter.contains { $0.name == "other" })
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 1)
+    }
+
+    func testMergedCleanupGitHubWorktreeDetachesDuringVerificationBlocksGroup() async throws {
+        let fixture = try makeFeatureRepository()
+        let worktreePath = fixture.root.appendingPathComponent("attached-feature")
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        _ = try runGit(["-C", fixture.repository.path, "worktree", "add", worktreePath.path, "feature"])
+        let worktreePathString = worktreePath.path
+        let sha = fixture.featureSHA
+        let payload = try JSONSerialization.data(withJSONObject: [displayPR(number: 138, sha: sha)])
+        let (github, transport) = scannerDisplayFixture(pr: payload, beforeCleanupRequest: {
+            let result = try LocalProcessRunner().run("/usr/bin/git", arguments: ["-C", worktreePathString, "switch", "--detach", sha], currentDirectory: nil)
+            guard result.succeeded else { throw NSError(domain: "CleanupDetachFixture", code: Int(result.status)) }
+        })
+        let git = GitService()
+        let local = try git.snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+        let mergedAt = Date(timeIntervalSince1970: 1)
+        let snapshot = RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main",
+            branches: [branch.withMergeEvidence(.githubVerified(prNumber: 138, mergedAt: mergedAt)).withRemoteGone(true)])
+        let cleanup = CleanupService(git: git,
+            sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: NoAgentProcessRunner()),
+            github: github)
+        let preview = cleanup.previewMergedBranches(snapshot: snapshot)
+
+        let result = await cleanup.executeAsync(preview)
+
+        XCTAssertTrue(result.removedWorktreePaths.isEmpty)
+        XCTAssertTrue(result.deletedLocalBranches.isEmpty)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktreePath.path))
+        XCTAssertEqual(try runGit(["-C", worktreePath.path, "rev-parse", "HEAD"]).trimmingCharacters(in: .whitespacesAndNewlines), sha)
+        XCTAssertEqual(try runGit(["-C", worktreePath.path, "branch", "--show-current"]).trimmingCharacters(in: .whitespacesAndNewlines), "")
+        XCTAssertTrue((try git.snapshot(repositoryPath: fixture.repository.path)).branches.contains { $0.name == "feature" })
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 1)
+    }
+
     func testMergedGitHubVerifiedAttachedWorktreeIsRemovedWhenRemoteRemains() async throws {
         let fixture = try makeFeatureRepository()
         let remotePath = fixture.root.appendingPathComponent("remote.git")
@@ -1574,6 +1646,21 @@ final class CoreTests: XCTestCase {
             XCTFail("ambiguous cleanup verification must fail closed")
         } catch {
             XCTAssertTrue(error.localizedDescription.contains("Multiple GitHub PRs match"))
+        }
+    }
+
+    func testCleanupGitHubFallbackRejectsNullPRNode() async throws {
+        let sha = String(repeating: "d", count: 40)
+        let match = displayPR(number: 23, branch: "feature", sha: sha)
+        let payload = try JSONSerialization.data(withJSONObject: [match])
+        let (github, _) = scannerDisplayFixture(pr: payload, cleanupNodes: [NSNull(), match])
+
+        do {
+            _ = try await github.verifyCleanupPullRequest(repositoryPath: "/tmp/repository", branch: "feature",
+                localSHA: sha, defaultBranch: "main")
+            XCTFail("incomplete cleanup PR page must fail closed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("incomplete"))
         }
     }
 
