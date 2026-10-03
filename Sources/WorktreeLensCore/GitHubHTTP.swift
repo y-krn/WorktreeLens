@@ -47,7 +47,9 @@ public actor GitHubStateStore {
         var validatedAt: Date
     }
     private struct Flight {
+        let id: UUID
         let task: Task<GitHubHTTPResponse, Error>
+        let accountGeneration: UUID
         let sessionRevision: UUID?
         var waiters: [UUID: CheckedContinuation<GitHubHTTPResponse, Error>]
     }
@@ -94,6 +96,7 @@ public actor GitHubStateStore {
         let issues: [IssueKey]
         let checks: [CheckKey]
         let actions: [ActionKey]
+        let currentActions: Set<ActionKey>
     }
 
     private let clock: any GitHubClock
@@ -106,6 +109,7 @@ public actor GitHubStateStore {
     private var checks: [CheckKey: GitHubCheck] = [:]
     private var actions: [ActionKey: GitHubActionRun] = [:]
     private var activeRevisions: [String: UUID] = [:]
+    private var accountGenerations: [String: UUID] = [:]
 
     public init(clock: any GitHubClock = SystemGitHubClock()) { self.clock = clock }
 
@@ -115,6 +119,7 @@ public actor GitHubStateStore {
                      sessionRevision: UUID? = nil,
                      operation: @escaping @Sendable (URLRequest) async throws -> GitHubHTTPResponse) async throws -> GitHubHTTPResponse {
         guard let key = requestKey(request, accountIdentifier: accountIdentifier) else { throw GitHubAPIError.unsupportedURL }
+        let accountGeneration = generation(for: accountIdentifier)
         if let sessionRevision {
             if activeRevisions[accountIdentifier] != nil, activeRevisions[accountIdentifier] != sessionRevision {
                 cancelFlights(accountIdentifier: accountIdentifier)
@@ -135,10 +140,12 @@ public actor GitHubStateStore {
                     outbound.setValue(etag, forHTTPHeaderField: "If-None-Match")
                 }
                 let task = Task.detached { try await operation(outbound) }
-                flights[key] = Flight(task: task, sessionRevision: sessionRevision, waiters: [waiterID: continuation])
+                let flightID = UUID()
+                flights[key] = Flight(id: flightID, task: task, accountGeneration: accountGeneration,
+                                      sessionRevision: sessionRevision, waiters: [waiterID: continuation])
                 Task.detached { [weak self] in
                     let result = await task.result
-                    await self?.finish(key, result: result)
+                    await self?.finish(key, flightID: flightID, result: result)
                 }
             }
         } onCancel: {
@@ -151,13 +158,21 @@ public actor GitHubStateStore {
         return flights[key]?.waiters.count ?? 0
     }
 
-    private func finish(_ key: RequestKey, result: Result<GitHubHTTPResponse, Error>) async {
-        guard let flight = flights.removeValue(forKey: key) else { return }
+    private func finish(_ key: RequestKey, flightID: UUID, result: Result<GitHubHTTPResponse, Error>) async {
+        guard let initialFlight = flights[key], initialFlight.id == flightID else { return }
         var delivered = result
-        if case .success(let response) = result,
-           flight.sessionRevision == nil || activeRevisions[key.accountIdentifier] == flight.sessionRevision,
-           key.method == "GET" {
+        if case .success(let response) = result, key.method == "GET" {
             let now = await clock.now()
+            guard let currentFlight = flights[key], currentFlight.id == flightID,
+                  currentFlight.accountGeneration == accountGenerations[key.accountIdentifier],
+                  currentFlight.sessionRevision == nil || activeRevisions[key.accountIdentifier] == currentFlight.sessionRevision else {
+                if let staleFlight = flights[key], staleFlight.id == flightID {
+                    flights.removeValue(forKey: key)
+                    staleFlight.task.cancel()
+                    for continuation in staleFlight.waiters.values { continuation.resume(throwing: CancellationError()) }
+                }
+                return
+            }
             if response.status == 304 {
                 if var prior = representations[key] {
                     prior.validatedAt = now
@@ -176,6 +191,7 @@ public actor GitHubStateStore {
                                                          wasNotModified: false, validatedAt: now))
             }
         }
+        guard let flight = flights.removeValue(forKey: key), flight.id == flightID else { return }
         for continuation in flight.waiters.values { continuation.resume(with: delivered) }
     }
 
@@ -230,11 +246,13 @@ public actor GitHubStateStore {
         for (key, item) in zip(issueKeys, merged.issues) { issues[key] = item }
         for (key, item) in zip(checkKeys, merged.checks) { checks[key] = item }
         for (key, item) in zip(actionKeys, merged.actions) { actions[key] = item }
+        let currentActionKeys = Set(zip(actionKeys, merged.actions).compactMap { key, item in item.isCurrent ? key : nil })
         let metadata = GitHubStatus(issues: [], pullRequests: [], actions: [], error: merged.error, isLoaded: merged.isLoaded,
                                     mergeEvidenceLoaded: merged.mergeEvidenceLoaded, checks: [],
                                     pullRequestFetch: merged.pullRequestFetch, issueFetch: merged.issueFetch,
                                     checkFetch: merged.checkFetch, actionFetch: merged.actionFetch, localSHA: merged.localSHA)
-        branches[key] = BranchRecord(metadata: metadata, pullRequests: prKeys, issues: issueKeys, checks: checkKeys, actions: actionKeys)
+        branches[key] = BranchRecord(metadata: metadata, pullRequests: prKeys, issues: issueKeys, checks: checkKeys,
+                                     actions: actionKeys, currentActions: currentActionKeys)
         return merged
     }
 
@@ -251,6 +269,7 @@ public actor GitHubStateStore {
 
     public func invalidateAccount(accountIdentifier: String) {
         representations = representations.filter { $0.key.accountIdentifier != accountIdentifier }
+        accountGenerations[accountIdentifier] = UUID()
         repositoryIDs = repositoryIDs.filter { $0.key.accountIdentifier != accountIdentifier }
         branches = branches.filter { $0.key.repository.accountIdentifier != accountIdentifier }
         pullRequests = pullRequests.filter { $0.key.repository.accountIdentifier != accountIdentifier }
@@ -273,14 +292,27 @@ public actor GitHubStateStore {
     private func alias(_ accountIdentifier: String, _ name: String) -> RepositoryAlias {
         RepositoryAlias(host: "github.com", accountIdentifier: accountIdentifier, name: name.lowercased())
     }
+    private func generation(for accountIdentifier: String) -> UUID {
+        if let generation = accountGenerations[accountIdentifier] { return generation }
+        let generation = UUID()
+        accountGenerations[accountIdentifier] = generation
+        return generation
+    }
     private func branchKey(_ accountIdentifier: String, _ repositoryID: String, _ target: GitHubBranchTarget) -> BranchKey {
         BranchKey(repository: RepositoryScope(host: "github.com", accountIdentifier: accountIdentifier, repositoryID: repositoryID),
                   headRepository: target.head.fullName.lowercased(), branch: target.branch, sha: target.sha)
     }
     private func materialize(_ record: BranchRecord) -> GitHubStatus {
         let metadata = record.metadata
+        let materializedActions = record.actions.compactMap { key -> GitHubActionRun? in
+            guard let action = actions[key] else { return nil }
+            return GitHubActionRun(id: action.id, name: action.name, status: action.status, conclusion: action.conclusion,
+                                   url: action.url, headSHA: action.headSHA, event: action.event, runID: action.runID,
+                                   attempt: action.attempt, repositoryName: action.repositoryName,
+                                   isCurrent: record.currentActions.contains(key))
+        }
         return GitHubStatus(issues: record.issues.compactMap { issues[$0] }, pullRequests: record.pullRequests.compactMap { pullRequests[$0] },
-                            actions: record.actions.compactMap { actions[$0] }, error: metadata.error, isLoaded: metadata.isLoaded,
+                            actions: materializedActions, error: metadata.error, isLoaded: metadata.isLoaded,
                             mergeEvidenceLoaded: metadata.mergeEvidenceLoaded, checks: record.checks.compactMap { checks[$0] },
                             pullRequestFetch: metadata.pullRequestFetch, issueFetch: metadata.issueFetch,
                             checkFetch: metadata.checkFetch, actionFetch: metadata.actionFetch, localSHA: metadata.localSHA)
