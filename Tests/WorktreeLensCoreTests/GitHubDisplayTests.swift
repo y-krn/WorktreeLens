@@ -166,6 +166,48 @@ private actor DisplaySharedRequestTransport: GitHubTransport {
 }
 
 final class GitHubDisplayTests: XCTestCase {
+    func testRefreshMetricsAttributeRequestsAndLatencyPerTarget() async throws {
+        let clock = DisplayManualClock()
+        let base = DisplayScriptTransport { request, index in
+            if index == 1 {
+                return try displayResponse([
+                    "b0": displayRepo(["pullRequests": displayPage([])]),
+                    "b1": displayRepo(["pullRequests": displayPage([])])
+                ])
+            }
+            if request.url?.path == "/graphql" {
+                return try displayResponse(["ci": displayRepo(["object": [
+                    "oid": "local-sha", "statusCheckRollup": ["contexts": displayPage([])]
+                ]])])
+            }
+            return try GitHubHTTPResponse(data: JSONSerialization.data(withJSONObject: ["total_count": 0, "workflow_runs": []]), status: 200)
+        }
+        let metrics = GitHubRefreshMetrics()
+        let service = GitHubDisplayService(api: displayAPI(DisplayAdvancingTransport(clock: clock, base: base), clock: clock),
+                                           clock: clock, metrics: metrics)
+        let firstTarget = displayTarget()
+        let secondTarget = displayTarget("other")
+        let summaries = await service.summaries(targets: [firstTarget, secondTarget])
+        let summary = try XCTUnwrap(summaries[firstTarget.branchID])
+        _ = await service.details(target: firstTarget, summary: summary)
+
+        let recorded = metrics.snapshot()
+        let first = try XCTUnwrap(recorded.first { $0.branchID == firstTarget.branchID })
+        let second = try XCTUnwrap(recorded.first { $0.branchID == secondTarget.branchID })
+        XCTAssertEqual(first.refreshCount, 2)
+        XCTAssertEqual(first.apiRequestCount, 3)
+        XCTAssertEqual(first.lastAPIRequestCount, 2)
+        XCTAssertEqual(first.lastLatency, 2, accuracy: 0.001)
+        XCTAssertEqual(first.totalLatency, 3, accuracy: 0.001)
+        XCTAssertEqual(second.refreshCount, 1)
+        XCTAssertEqual(second.apiRequestCount, 1)
+        XCTAssertEqual(second.lastAPIRequestCount, 1)
+        XCTAssertEqual(second.lastLatency, 1, accuracy: 0.001)
+        XCTAssertEqual(second.totalLatency, 1, accuracy: 0.001)
+        let requests = await base.requests
+        XCTAssertEqual(requests.count, 3)
+    }
+
     func testRESTETagIsScopedByAccountAnd304KeepsRepresentation() async throws {
         let transport = DisplayScriptTransport { request, index in
             if index == 1 {

@@ -5,15 +5,22 @@ public final class GitHubService: @unchecked Sendable {
     private let configuredExecutable: String?
     private let display: GitHubDisplayService
     private let resolver: GitHubRepositoryResolver
+    private let refreshMetrics: GitHubRefreshMetrics
 
     public init(runner: any ProcessRunning = LocalProcessRunner(), executable: String? = nil,
                 api: GitHubAPIClient? = nil, resolver: GitHubRepositoryResolver = GitHubRepositoryResolver(),
-                clock: any GitHubClock = SystemGitHubClock(), limits: GitHubDisplayLimits = GitHubDisplayLimits()) {
+                clock: any GitHubClock = SystemGitHubClock(), limits: GitHubDisplayLimits = GitHubDisplayLimits(),
+                refreshMetrics: GitHubRefreshMetrics = GitHubRefreshMetrics()) {
         self.runner = runner
         self.configuredExecutable = executable
         let client = api ?? GitHubAPIClient(authentication: GitHubDeviceFlowProvider(clientID: UserDefaults.standard.string(forKey: "githubAppClientID") ?? ""))
-        self.display = GitHubDisplayService(api: client, clock: clock, limits: limits)
+        self.refreshMetrics = refreshMetrics
+        self.display = GitHubDisplayService(api: client, clock: clock, limits: limits, metrics: refreshMetrics)
         self.resolver = resolver
+    }
+
+    public func refreshMetricsSnapshot() -> [GitHubTargetRefreshMetric] {
+        refreshMetrics.snapshot()
     }
 
     public static let requestTimeout: TimeInterval = 10

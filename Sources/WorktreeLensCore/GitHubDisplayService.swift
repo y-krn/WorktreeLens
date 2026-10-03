@@ -87,6 +87,68 @@ public struct GitHubDisplayLimits: Sendable {
     public init() {}
 }
 
+public struct GitHubTargetRefreshMetric: Hashable, Sendable {
+    public let branchID: String
+    public let baseRepository: String
+    public let headRepository: String
+    public let branch: String
+    public let sha: String
+    public let refreshCount: Int
+    public let apiRequestCount: Int
+    public let lastAPIRequestCount: Int
+    public let totalLatency: TimeInterval
+    public let lastLatency: TimeInterval
+}
+
+public final class GitHubRefreshMetrics: @unchecked Sendable {
+    private struct Key: Hashable {
+        let branchID: String
+        let baseRepository: String
+        let headRepository: String
+        let branch: String
+        let sha: String
+        init(_ target: GitHubBranchTarget) {
+            branchID = target.branchID; baseRepository = target.base.fullName; headRepository = target.head.fullName
+            branch = target.branch; sha = target.sha
+        }
+    }
+    private struct Value {
+        var refreshCount = 0
+        var apiRequestCount = 0
+        var lastAPIRequestCount = 0
+        var totalLatency: TimeInterval = 0
+        var lastLatency: TimeInterval = 0
+    }
+    private let lock = NSLock()
+    private var values: [Key: Value] = [:]
+
+    public init() {}
+
+    public func snapshot() -> [GitHubTargetRefreshMetric] {
+        lock.lock(); defer { lock.unlock() }
+        return values.map { key, value in
+            GitHubTargetRefreshMetric(branchID: key.branchID, baseRepository: key.baseRepository,
+                headRepository: key.headRepository, branch: key.branch, sha: key.sha,
+                refreshCount: value.refreshCount, apiRequestCount: value.apiRequestCount,
+                lastAPIRequestCount: value.lastAPIRequestCount, totalLatency: value.totalLatency,
+                lastLatency: value.lastLatency)
+        }.sorted {
+            ($0.baseRepository, $0.branch, $0.sha, $0.branchID) < ($1.baseRepository, $1.branch, $1.sha, $1.branchID)
+        }
+    }
+
+    fileprivate func record(target: GitHubBranchTarget, apiRequestCount: Int, latency: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        var value = values[Key(target)] ?? Value()
+        value.refreshCount += 1
+        value.apiRequestCount += apiRequestCount
+        value.lastAPIRequestCount = apiRequestCount
+        value.lastLatency = max(0, latency)
+        value.totalLatency += value.lastLatency
+        values[Key(target)] = value
+    }
+}
+
 private struct PageInfo: Decodable, Sendable { let hasNextPage: Bool; let endCursor: String? }
 private struct Connection<Node: Decodable & Sendable>: Decodable, Sendable {
     let nodes: [Node?]?
@@ -171,8 +233,9 @@ public struct GitHubDisplayService: Sendable {
     private let stateStore: GitHubStateStore
     private let clock: any GitHubClock
     private let limits: GitHubDisplayLimits
-    public init(api: GitHubAPIClient, clock: any GitHubClock = SystemGitHubClock(), limits: GitHubDisplayLimits = GitHubDisplayLimits()) {
-        self.api = api; self.stateStore = api.stateStore; self.clock = clock; self.limits = limits
+    private let metrics: GitHubRefreshMetrics
+    public init(api: GitHubAPIClient, clock: any GitHubClock = SystemGitHubClock(), limits: GitHubDisplayLimits = GitHubDisplayLimits(), metrics: GitHubRefreshMetrics = GitHubRefreshMetrics()) {
+        self.api = api; self.stateStore = api.stateStore; self.clock = clock; self.limits = limits; self.metrics = metrics
     }
     private static let prFields = """
     id number title state isDraft baseRefName headRefName headRefOid mergedAt url
@@ -198,6 +261,7 @@ public struct GitHubDisplayService: Sendable {
     }
     private struct Budget {
         var requests = 0; var items = 0; var cost = 0
+        var requestsByTarget: [String: Int] = [:]
         let deadline: Date
         let requestContext: GitHubRequestContext?
     }
@@ -220,9 +284,10 @@ public struct GitHubDisplayService: Sendable {
             return try await group.next()!
         }
     }
-    private func query(_ fields: String, budget: inout Budget) async throws -> GitHubGraphQLResult<GraphData> {
+    private func query(_ fields: String, budget: inout Budget, targets: [GitHubBranchTarget] = []) async throws -> GitHubGraphQLResult<GraphData> {
         guard await available(budget) else { throw ProcessRunnerError.failed("GitHub retrieval budget exhausted.") }
         budget.requests += 1
+        for target in targets { budget.requestsByTarget[target.branchID, default: 0] += 1 }
         let deadline = budget.deadline
         let requestContext = budget.requestContext
         let result: GitHubGraphQLResult<GraphData> = try await bounded(deadline: deadline) {
@@ -233,9 +298,16 @@ public struct GitHubDisplayService: Sendable {
         return result
     }
     public func summaries(targets: [GitHubBranchTarget], timeout: TimeInterval = 10) async -> [String: GitHubStatus] {
+        let startedAt = await clock.now()
         let context = try? await api.requestContext()
         var budget = Budget(deadline: (await clock.now()).addingTimeInterval(timeout), requestContext: context)
-        return await summaries(targets: targets, budget: &budget)
+        let result = await summaries(targets: targets, budget: &budget)
+        let completedAt = await clock.now()
+        for target in targets {
+            metrics.record(target: target, apiRequestCount: budget.requestsByTarget[target.branchID, default: 0],
+                           latency: completedAt.timeIntervalSince(startedAt))
+        }
+        return result
     }
     public func cachedStatuses(targets: [GitHubBranchTarget]) async -> [String: GitHubStatus] {
         guard let context = try? await api.requestContext() else { return [:] }
@@ -273,7 +345,9 @@ public struct GitHubDisplayService: Sendable {
                     "k\(offset): " + repository(batch[item.0], fields: "pullRequest(number: \(item.1)) { \(Self.prFields) }")
                 }
                 do {
-                    let response = try await query(fields.joined(separator: "\n"), budget: &budget)
+                    let requestedIDs = Set(work.map { batch[$0.0].branchID } + known.map { batch[$0.0].branchID })
+                    let requestTargets = batch.filter { requestedIDs.contains($0.branchID) }
+                    let response = try await query(fields.joined(separator: "\n"), budget: &budget, targets: requestTargets)
                     for (offset, item) in work.enumerated() {
                         let index = item.0
                         guard let repo = response.data?.repositories["b\(offset)"], let page = repo.pullRequests,
@@ -339,6 +413,7 @@ public struct GitHubDisplayService: Sendable {
     }
 
     public func details(target: GitHubBranchTarget, summary: GitHubStatus, timeout: TimeInterval = 10) async -> GitHubStatus {
+        let startedAt = await clock.now()
         let context = try? await api.requestContext()
         let accountIdentifier = context?.accountIdentifier
         var budget = Budget(deadline: (await clock.now()).addingTimeInterval(timeout), requestContext: context)
@@ -367,7 +442,7 @@ public struct GitHubDisplayService: Sendable {
                 return "i\(index): " + repository(target, fields: "pullRequest(number: \(item.0)) { \(Self.prFields) mergeStateStatus mergeable potentialMergeCommit { oid } closingIssuesReferences(first: \(pageSize)\(cursor)) { nodes { \(Self.issueFields) } pageInfo { hasNextPage endCursor } } }")
             } + (checkPending ? ["ci: " + repository(target, fields: "object(expression: \(literal(target.sha))) { ... on Commit { oid statusCheckRollup { contexts(first: \(pageSize)\(checkCursor.map { ", after: \(literal($0))" } ?? "")) { nodes { \(Self.checkFields) } pageInfo { hasNextPage endCursor } } } } }")] : [])
             do {
-                let response = try await query(fields.joined(separator: "\n"), budget: &budget)
+                let response = try await query(fields.joined(separator: "\n"), budget: &budget, targets: [target])
                 for (offset, item) in work.enumerated() {
                     guard let repo = response.data?.repositories["i\(offset)"], let pr = repo.pullRequest,
                           pr.number == item.0, accepted(pr, target: target, repo: repo) else {
@@ -423,6 +498,7 @@ public struct GitHubDisplayService: Sendable {
         while count < total, await available(budget) {
             do {
                 budget.requests += 1
+                budget.requestsByTarget[target.branchID, default: 0] += 1
                 let deadline = budget.deadline
                 let requestContext = budget.requestContext
                 let path = "/repos/\(target.base.fullName)/actions/runs?head_sha=\(target.sha.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")&per_page=\(actionPageSize)&page=\(page)"
@@ -453,9 +529,16 @@ public struct GitHubDisplayService: Sendable {
         let status = GitHubStatus(issues: Array(Dictionary(issues.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest }).values).sorted { $0.id < $1.id }, pullRequests: prs, actions: latest,
                             error: prFetch.error, isLoaded: true, mergeEvidenceLoaded: prFetch.isComplete, checks: Array(Dictionary(checks.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest }).values).sorted { $0.id < $1.id },
                             pullRequestFetch: prFetch, issueFetch: issueFetch, checkFetch: checkFetch, actionFetch: actionFetch, localSHA: target.sha)
-        guard let accountIdentifier else { return status }
-        return await stateStore.recordStatus(accountIdentifier: accountIdentifier, target: target,
-                                              repositoryID: resolvedRepositoryID,
-                                              sessionRevision: budget.requestContext?.revision, status: status)
+        let result: GitHubStatus
+        if let accountIdentifier {
+            result = await stateStore.recordStatus(accountIdentifier: accountIdentifier, target: target,
+                repositoryID: resolvedRepositoryID, sessionRevision: budget.requestContext?.revision, status: status)
+        } else {
+            result = status
+        }
+        let completedAt = await clock.now()
+        metrics.record(target: target, apiRequestCount: budget.requestsByTarget[target.branchID, default: 0],
+                       latency: completedAt.timeIntervalSince(startedAt))
+        return result
     }
 }
