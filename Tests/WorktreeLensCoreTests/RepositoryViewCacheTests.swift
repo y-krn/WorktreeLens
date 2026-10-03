@@ -559,6 +559,36 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertEqual(model.snapshot?.branches.first?.id, "b")
     }
 
+    func testAccountRestorationPreservesInitialLocalScan() async throws {
+        let started = expectation(description: "initial local scan started")
+        let release = DispatchSemaphore(value: 0)
+        let source = localResult(path: "/tmp/auth-restore-during-scan", branch: "feature")
+        let branch = try XCTUnwrap(source.snapshot.branches.first).withGitHubStatus(
+            GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil, localSHA: "sha"))
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: source.snapshot.path,
+            defaultBranch: source.snapshot.defaultBranch, branches: [branch]), sessionNotes: source.sessionNotes)
+        let scanner = FirstScanBlockingScanner(firstPath: local.snapshot.path, firstResult: local,
+            secondResult: local, started: started, release: release)
+        let clock = ModelRefreshClock()
+        let events = ModelRefreshEventSource()
+        let model = makeModel(paths: [local.snapshot.path], scanner: scanner, refreshClock: clock,
+                              refreshEventSource: events)
+
+        model.selectRepository(path: local.snapshot.path)
+        await fulfillment(of: [started], timeout: 2)
+        model.invalidateGitHubAccountState(isAuthenticated: true)
+
+        XCTAssertTrue(model.isLoading, "Account restoration must preserve the in-flight local scan")
+        release.signal()
+        await waitForRefresh(model)
+
+        XCTAssertEqual(model.snapshot?.path, local.snapshot.path)
+        XCTAssertEqual(model.snapshot?.branches.map(\.id), ["feature"])
+        for _ in 0..<10_000 where events.lastSubscription == nil { await Task.yield() }
+        XCTAssertNotNil(events.lastSubscription)
+        XCTAssertEqual(clock.activeTimerCount, 1)
+    }
+
     func testRemovingRepositoryDiscardsItsCacheAndRestoresNextRepository() async throws {
         let a = localResult(path: "/tmp/remove-A", branch: "a")
         let b = localResult(path: "/tmp/remove-B", branch: "b")

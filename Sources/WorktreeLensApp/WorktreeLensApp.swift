@@ -206,7 +206,17 @@ final class ApplicationModel: ObservableObject {
     func invalidateGitHubAccountState(isAuthenticated: Bool) {
         githubMonitoringEnabled = isAuthenticated
         refreshCoordinator.clear()
-        invalidateRepositoryTasks()
+        // Preserve the initial local scan: before its snapshot exists, there is no selection to reload.
+        let preservingInitialScan = selectedPath != nil && isLoading && snapshot == nil && refreshTaskPath == selectedPath
+        if preservingInitialScan {
+            refreshTargetResolutionToken = UUID()
+            githubDetailTask?.cancel()
+            githubDetailTask = nil
+            githubDetailTaskPath = nil
+            githubDetailToken = UUID()
+        } else {
+            invalidateRepositoryTasks()
+        }
         func withoutGitHub(_ snapshot: RepositorySnapshot) -> RepositorySnapshot {
             let branches = snapshot.branches.map { branch -> BranchInfo in
                 let evidence: MergeEvidence
@@ -223,9 +233,11 @@ final class ApplicationModel: ObservableObject {
             viewCache[path] = cached
         }
         if let snapshot { self.snapshot = withoutGitHub(snapshot) }
-        isLoading = false
-        canCancelGitHub = false
-        scanPhase = nil
+        if !preservingInitialScan {
+            isLoading = false
+            canCancelGitHub = false
+            scanPhase = nil
+        }
         if isAuthenticated { selectionDidChange() }
     }
 
