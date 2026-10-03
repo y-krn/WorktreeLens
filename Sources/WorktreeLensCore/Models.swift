@@ -409,16 +409,22 @@ public struct CleanupPreviewItem: Identifiable, Sendable {
     public let reason: CleanupBlockReason?
     public let detail: String?
     public let expectedSHA: String?
+    public let expectedDefaultBranch: String?
     public let step: CleanupPlanStep?
+    public let mergeEvidence: MergeEvidence?
 
-    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil, detail: String? = nil, expectedSHA: String? = nil, step: CleanupPlanStep? = nil) {
+    public init(id: String, target: String, allowed: Bool, reason: CleanupBlockReason? = nil, detail: String? = nil,
+                expectedSHA: String? = nil, expectedDefaultBranch: String? = nil, step: CleanupPlanStep? = nil,
+                mergeEvidence: MergeEvidence? = nil) {
         self.id = id
         self.target = target
         self.allowed = allowed
         self.reason = reason
         self.detail = detail
         self.expectedSHA = expectedSHA
+        self.expectedDefaultBranch = expectedDefaultBranch
         self.step = step
+        self.mergeEvidence = mergeEvidence
     }
 }
 
@@ -464,12 +470,15 @@ public struct CleanupExecutionResult: Equatable, Sendable {
     public let removedWorktreePaths: [String]
     public let deletedLocalBranches: [String]
     public let requiresFullRefresh: Bool
+    public let failureReason: String?
 
-    public init(completedTargetIDs: [String] = [], removedWorktreePaths: [String] = [], deletedLocalBranches: [String] = [], requiresFullRefresh: Bool = false) {
+    public init(completedTargetIDs: [String] = [], removedWorktreePaths: [String] = [], deletedLocalBranches: [String] = [],
+                requiresFullRefresh: Bool = false, failureReason: String? = nil) {
         self.completedTargetIDs = completedTargetIDs
         self.removedWorktreePaths = removedWorktreePaths
         self.deletedLocalBranches = deletedLocalBranches
         self.requiresFullRefresh = requiresFullRefresh
+        self.failureReason = failureReason
     }
 
     public var count: Int { completedTargetIDs.count }

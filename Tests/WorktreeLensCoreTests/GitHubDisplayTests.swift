@@ -19,12 +19,6 @@ struct DisplayConfigRunner: ProcessRunning {
         return ProcessResult(status: 0, stdout: config)
     }
 }
-struct DisplayForbiddenCLIRunner: ProcessRunning {
-    func run(_ executable: String, arguments: [String], currentDirectory: String?, timeout: TimeInterval?) throws -> ProcessResult {
-        XCTFail("Display invoked CLI: \(executable) \(arguments)")
-        throw ProcessRunnerError.executableNotFound("gh")
-    }
-}
 actor DisplayScriptTransport: GitHubTransport {
     private(set) var requests: [URLRequest] = []
     let respond: @Sendable (URLRequest, Int) throws -> GitHubHTTPResponse
@@ -67,15 +61,39 @@ func displayTarget(_ name: String = "feature", sha: String = "local-sha", known:
                        head: GitHubRepositoryIdentity(fullName: "example/repo")!, knownNumbers: known)
 }
 
-/// Targeted API fixture used by the pre-existing scanner safety tests after the CLI migration.
-func scannerDisplayFixture(pr: Data, runner: any ProcessRunning = DisplayForbiddenCLIRunner()) -> (GitHubService, DisplayScriptTransport) {
+/// Targeted API fixture used by scanner and cleanup safety tests.
+func scannerDisplayFixture(pr: Data) -> (GitHubService, DisplayScriptTransport) {
     let transport = DisplayScriptTransport { request, _ in
         XCTAssertEqual(request.url?.path, "/graphql")
         let query = try displayQuery(request)
-        XCTAssertFalse(query.contains("closingIssuesReferences")); XCTAssertFalse(query.contains("statusCheckRollup"))
-        let regex = try NSRegularExpression(pattern: #"(?s)b([0-9]+): repository.*?headRefName: ("(?:\\.|[^"\\])*")"#)
         let prs = try XCTUnwrap(JSONSerialization.jsonObject(with: pr) as? [[String: Any]])
         var data: [String: Any] = [:]
+        if query.contains("base: repository(") {
+            let knownPattern = try NSRegularExpression(pattern: #"pullRequest\(number: ([0-9]+)\)"#)
+            let knownMatch = knownPattern.firstMatch(in: query, range: NSRange(query.startIndex..., in: query))
+            let requestedNumber = knownMatch.flatMap { Int(query[Range($0.range(at: 1), in: query)!]) }
+            let branchPattern = try NSRegularExpression(pattern: #"headRefName: ("(?:\\.|[^"\\])*")"#)
+            let branchMatch = branchPattern.firstMatch(in: query, range: NSRange(query.startIndex..., in: query))
+            let requestedBranch = try branchMatch.map { match -> String in
+                let text = String(query[Range(match.range(at: 1), in: query)!])
+                return try JSONDecoder().decode(String.self, from: Data(text.utf8))
+            }
+            let candidates = prs.filter { raw in
+                (requestedNumber == nil || raw["number"] as? Int == requestedNumber) &&
+                (requestedBranch == nil || raw["headRefName"] as? String == requestedBranch)
+            }
+            let selected = candidates.first
+            var base = displayRepo(["isFork": false])
+            if requestedNumber != nil { base["pullRequest"] = selected as Any? ?? NSNull() }
+            else { base["pullRequests"] = displayPage(candidates) }
+            let headRepository = selected?["headRepository"] as? [String: Any]
+            data["base"] = base
+            data["head"] = ["id": headRepository?["id"] as? String ?? "BASE",
+                            "nameWithOwner": headRepository?["nameWithOwner"] as? String ?? "example/repo"]
+            return try displayResponse(data)
+        }
+        XCTAssertFalse(query.contains("closingIssuesReferences")); XCTAssertFalse(query.contains("statusCheckRollup"))
+        let regex = try NSRegularExpression(pattern: #"(?s)b([0-9]+): repository.*?headRefName: ("(?:\\.|[^"\\])*")"#)
         for match in regex.matches(in: query, range: NSRange(query.startIndex..., in: query)) {
             let alias = "b" + String(query[Range(match.range(at: 1), in: query)!])
             let text = String(query[Range(match.range(at: 2), in: query)!])
@@ -88,7 +106,7 @@ func scannerDisplayFixture(pr: Data, runner: any ProcessRunning = DisplayForbidd
         }
         return try displayResponse(data)
     }
-    let github = GitHubService(runner: runner, executable: "gh", api: displayAPI(transport), resolver: GitHubRepositoryResolver(runner: DisplayConfigRunner(config: "remote.origin.url=https://github.com/example/repo.git")))
+    let github = GitHubService(api: displayAPI(transport), resolver: GitHubRepositoryResolver(runner: DisplayConfigRunner(config: "remote.origin.url=https://github.com/example/repo.git")))
     return (github, transport)
 }
 
