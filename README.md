@@ -24,7 +24,7 @@ xcodebuild \
 
 Xcode では `WorktreeLens.xcodeproj` を開き、`My Mac` を選んで `WorktreeLens` scheme を Run します。生成物は `WorktreeLens.app` です。
 
-GitHub App の Device Flow 認証と設定手順は [GitHub App 認証の運用](docs/github-app-authentication.md) を参照してください。既存の PR 表示と Cleanup の GitHub CLI 経路は後続の移行まで維持します。
+GitHub App の Device Flow 認証と設定手順は [GitHub App 認証の運用](docs/github-app-authentication.md) を参照してください。PR 表示と Cleanup は GitHub App 認証を使って GitHub API と直接通信します。GitHub CLI は不要です。
 
 ## ローカルインストール
 

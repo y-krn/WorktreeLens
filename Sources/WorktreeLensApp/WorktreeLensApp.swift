@@ -745,7 +745,9 @@ final class ApplicationModel: ObservableObject {
         let cleanup = self.cleanup
         let cleanupExecutor = self.cleanupExecutor
         Task.detached(priority: .userInitiated) {
-            let result = cleanupExecutor?(preview) ?? cleanup.execute(preview)
+            let result: CleanupExecutionResult
+            if let cleanupExecutor { result = cleanupExecutor(preview) }
+            else { result = await cleanup.executeAsync(preview) }
             await MainActor.run {
                 guard self.cleanupPreview?.id == preview.id else { return }
                 self.publishCleanupResult(result, repositoryPath: repositoryPath)
@@ -755,7 +757,13 @@ final class ApplicationModel: ObservableObject {
 
     func publishCleanupResult(_ result: CleanupExecutionResult, repositoryPath: String) {
         cleanupExecutionState = .completed(result.count)
-        statusMessage = result.count == 0 ? "Completed 0 target(s) — no changes after final guard" : "Completed \(result.count) target(s)"
+        if let failureReason = result.failureReason {
+            statusMessage = result.count == 0
+                ? "Cleanup stopped: \(failureReason)"
+                : "Completed \(result.count) target(s); remaining cleanup stopped: \(failureReason)"
+        } else {
+            statusMessage = result.count == 0 ? "Completed 0 target(s) — no changes after final guard" : "Completed \(result.count) target(s)"
+        }
         applyCleanupResult(result, repositoryPath: repositoryPath)
     }
 
@@ -1491,7 +1499,7 @@ struct GitHubAuthenticationSettings: View {
                 if model.isBusy { Button("Cancel") { model.cancel() }; ProgressView().controlSize(.small) }
             }
             if let message = model.message { Text(message).font(.caption).textSelection(.enabled) }
-            Text("PR display uses the authenticated GitHub API. Cleanup final verification still requires GitHub CLI.")
+            Text("PR display and Cleanup verification use the authenticated GitHub API.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         .padding(24).frame(width: 520)

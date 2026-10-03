@@ -39,6 +39,7 @@ public actor GitHubStateStore {
         let body: Data?
         let accept: String?
         let apiVersion: String?
+        let isolationID: UUID?
     }
     private struct Representation {
         let data: Data
@@ -117,8 +118,10 @@ public actor GitHubStateStore {
     /// GraphQL POSTs are only coalesced while in flight and always execute on a later refresh.
     public func send(_ request: URLRequest, accountIdentifier: String,
                      sessionRevision: UUID? = nil,
+                     shareInFlight: Bool = true,
                      operation: @escaping @Sendable (URLRequest) async throws -> GitHubHTTPResponse) async throws -> GitHubHTTPResponse {
-        guard let key = requestKey(request, accountIdentifier: accountIdentifier) else { throw GitHubAPIError.unsupportedURL }
+        guard let key = requestKey(request, accountIdentifier: accountIdentifier,
+                                   isolationID: shareInFlight ? nil : UUID()) else { throw GitHubAPIError.unsupportedURL }
         let accountGeneration = generation(for: accountIdentifier)
         if let sessionRevision {
             if activeRevisions[accountIdentifier] != nil, activeRevisions[accountIdentifier] != sessionRevision {
@@ -206,12 +209,13 @@ public actor GitHubStateStore {
         }
     }
 
-    private func requestKey(_ request: URLRequest, accountIdentifier: String) -> RequestKey? {
+    private func requestKey(_ request: URLRequest, accountIdentifier: String, isolationID: UUID? = nil) -> RequestKey? {
         guard let url = request.url else { return nil }
         return RequestKey(accountIdentifier: accountIdentifier, method: (request.httpMethod ?? "GET").uppercased(),
                           url: url.absoluteString, body: request.httpBody,
                           accept: request.value(forHTTPHeaderField: "Accept"),
-                          apiVersion: request.value(forHTTPHeaderField: "X-GitHub-Api-Version"))
+                          apiVersion: request.value(forHTTPHeaderField: "X-GitHub-Api-Version"),
+                          isolationID: isolationID)
     }
 
     public func cachedStatus(accountIdentifier: String, target: GitHubBranchTarget) -> GitHubStatus? {

@@ -1,6 +1,6 @@
 # GitHub App 認証の運用
 
-Issue #46 は、GitHub CLI の認証とは独立した GitHub App Device Flow と直接 API 通信の基盤を追加します。既存の PR 表示と Cleanup は、後続 Issue #47 / #50 で移行するまで従来の `gh` 経路を使用します。
+GitHub App Device Flow で認証し、PR 表示と Cleanup の検証を GitHub API へ直接送信します。GitHub CLI の認証状態や `gh` のインストールは不要です。
 
 ## GitHub App の登録とインストール
 
@@ -9,7 +9,7 @@ Issue #46 は、GitHub CLI の認証とは独立した GitHub App Device Flow �
 3. App をインストールし、Only select repositories で監視対象の repository だけを選択します。組織のポリシーによって管理者の承認が必要です。権限を変更した場合はインストール先で再承認します。
 4. App settings の **Client ID** をコピーします。App ID ではありません。client secret と App private key はアプリに設定しません。Device Flow 由来の refresh token 更新にも client secret は不要です。
 5. Worktree Lens の Settings → GitHub App Authentication に Client ID を入力し、Sign In を選択します。開いた `https://github.com/login/device` で画面の user code を入力し、App を承認します。組織で SAML SSO を使用する場合は、その組織の SAML セッションを開始してから認証します。
-6. Verify API Read で認証済み `GET /user` を確認します。この操作は `gh` を起動しません。アカウントの読取成功は対象 repository の権限確認を意味しません。対象 repository の取得失敗は、後続 API 移行でも「データなし」に変換せず表示する必要があります。
+6. Verify API Read で認証済み `GET /user` を確認します。アカウントの読取成功は対象 repository の権限確認を意味しません。Cleanup は対象 repository と PR を別途検証し、取得失敗を「データなし」として扱いません。
 
 認証を拒否した場合、期限が切れた場合、Cancel を選択した場合は自動的に新しい認証を開始しません。利用者が Sign In を再度選択します。失効したトークンは再認証が必要です。
 
