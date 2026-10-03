@@ -510,6 +510,45 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertEqual(detail.requestedPaths, [a.snapshot.path])
     }
 
+    func testLateDetailCannotPublishAfterLocalHEADChanges() async throws {
+        let started = expectation(description: "detail started before HEAD change")
+        let local = localResult(path: "/tmp/detail-head", branch: "feature", githubLoaded: false)
+        let scanner = CountingScanner(results: [local.snapshot.path: [local]])
+        let detail = BlockingDetailLoader(started: started)
+        let model = makeModel(paths: [local.snapshot.path], scanner: scanner, detailLoader: detail)
+        model.selectRepository(path: local.snapshot.path)
+        await waitForRefresh(model)
+        await fulfillment(of: [started], timeout: 2)
+        let pending = try XCTUnwrap(model.githubDetailTask)
+        let newer = displayBranch("feature", sha: "new-head")
+        model.snapshot = RepositorySnapshot(path: local.snapshot.path, defaultBranch: "main", branches: [newer])
+        detail.release()
+        await pending.value
+        XCTAssertEqual(model.snapshot?.branches.first?.sha, "new-head")
+        XCTAssertFalse(try XCTUnwrap(model.snapshot?.branches.first).github.isLoaded)
+    }
+
+    func testSelectingLoadedBranchCancelsPreviousDetailAndRejectsItsResponse() async throws {
+        let started = expectation(description: "detail started before selection change")
+        let local = localResult(path: "/tmp/detail-selection", branch: "feature", githubLoaded: false)
+        let scanner = CountingScanner(results: [local.snapshot.path: [local]])
+        let detail = BlockingDetailLoader(started: started)
+        let model = makeModel(paths: [local.snapshot.path], scanner: scanner, detailLoader: detail)
+        model.selectRepository(path: local.snapshot.path)
+        await waitForRefresh(model)
+        await fulfillment(of: [started], timeout: 2)
+        let pending = try XCTUnwrap(model.githubDetailTask)
+        let loaded = displayBranch("loaded").withGitHubStatus(GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil))
+        model.snapshot = RepositorySnapshot(path: local.snapshot.path, defaultBranch: "main", branches: local.snapshot.branches + [loaded])
+        model.selectBranch(id: "loaded")
+        model.selectionDidChange()
+        XCTAssertTrue(pending.isCancelled)
+        detail.release()
+        await pending.value
+        XCTAssertEqual(model.selectedBranchID, "loaded")
+        XCTAssertFalse(try XCTUnwrap(model.snapshot?.branches.first).github.isLoaded)
+    }
+
     private func makeModel(paths: [String], scanner: any RepositoryScanning, detailLoader: (any GitHubDetailLoading)? = nil, git: GitService = GitService(), cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil) -> ApplicationModel {
         // An absolute suite path keeps the plist out of ~/Library/Preferences; removePersistentDomain alone leaves the file behind.
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RepositoryViewCacheTests-\(UUID().uuidString)")

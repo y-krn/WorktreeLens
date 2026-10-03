@@ -54,19 +54,12 @@ public final class RepositoryScanService: @unchecked Sendable, RepositoryScannin
     public func enrichGitHub(local: RepositoryLocalScanResult, progress: @escaping @Sendable (_ completed: Int, _ total: Int) -> Void = { _, _ in }) async -> RepositorySnapshot {
         let branches = local.snapshot.branches.filter { !$0.isDetachedGroup }
         guard !branches.isEmpty else { return local.snapshot }
-        let evidence = await github.mergeEvidenceAsync(repositoryPath: local.snapshot.path)
+        let statuses = await github.summariesAsync(repositoryPath: local.snapshot.path, branches: branches)
+        guard !Task.isCancelled else { return local.snapshot }
         progress(1, 1)
         let enrichedBranches = local.snapshot.branches.map { branch in
             guard !branch.isDetachedGroup else { return branch }
-            let branchPullRequests = evidence.pullRequests.filter { $0.headRefName == branch.name }
-            let status = GitHubStatus(
-                issues: [],
-                pullRequests: branchPullRequests,
-                actions: [],
-                error: evidence.error,
-                isLoaded: false,
-                mergeEvidenceLoaded: evidence.isLoaded
-            )
+            let status = statuses[branch.id] ?? .unavailable
             let evidence: MergeEvidence
             if branch.mergeEvidence.isMerged {
                 evidence = branch.mergeEvidence
