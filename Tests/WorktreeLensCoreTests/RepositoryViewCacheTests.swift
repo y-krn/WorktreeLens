@@ -96,6 +96,40 @@ final class RepositoryViewCacheTests: XCTestCase {
         }
     }
 
+    @MainActor
+    private final class ModelRefreshTimer: RefreshTimerHandle {
+        var cancelled = false
+        func cancel() { cancelled = true }
+    }
+
+    @MainActor
+    private final class ModelRefreshClock: RefreshClock {
+        var now = Date(timeIntervalSince1970: 20_000)
+        private(set) var timers: [ModelRefreshTimer] = []
+        func schedule(after interval: TimeInterval, _ action: @escaping @MainActor () -> Void) -> any RefreshTimerHandle {
+            let timer = ModelRefreshTimer()
+            timers.append(timer)
+            return timer
+        }
+        var activeTimerCount: Int { timers.filter { !$0.cancelled }.count }
+    }
+
+    @MainActor
+    private final class ModelRefreshSubscription: RefreshEventSubscription {
+        var cancelled = false
+        func cancel() { cancelled = true }
+    }
+
+    @MainActor
+    private final class ModelRefreshEventSource: RefreshEventSource {
+        private(set) var lastSubscription: ModelRefreshSubscription?
+        func watch(target: RefreshTarget, onChange: @escaping @MainActor () -> Void) -> any RefreshEventSubscription {
+            let subscription = ModelRefreshSubscription()
+            lastSubscription = subscription
+            return subscription
+        }
+    }
+
     func testRepositorySwitchRestoresSnapshotNotesAndSelectionWithoutRefresh() async throws {
         let a = localResult(path: "/tmp/cache-A", branch: "a-branch", worktree: "a-worktree", notes: ["note A"])
         let b = localResult(path: "/tmp/cache-B", branch: "b-branch", worktree: "b-worktree", notes: ["note B"])
@@ -118,6 +152,28 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertEqual(scanner.counts(for: b.snapshot.path).git, 1)
         XCTAssertEqual(scanner.counts(for: b.snapshot.path).bulk, 1)
         XCTAssertEqual(scanner.sessionScans, 2)
+    }
+
+    func testLogoutStopsSelectedBranchRefreshTimerAndWatcher() async throws {
+        let source = localResult(path: "/tmp/logout-refresh", branch: "feature")
+        let status = GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil, localSHA: "sha")
+        let branch = try XCTUnwrap(source.snapshot.branches.first).withGitHubStatus(status)
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: source.snapshot.path,
+            defaultBranch: source.snapshot.defaultBranch, branches: [branch]), sessionNotes: source.sessionNotes)
+        let scanner = CountingScanner(results: [local.snapshot.path: [local]])
+        let clock = ModelRefreshClock()
+        let events = ModelRefreshEventSource()
+        let model = makeModel(paths: [local.snapshot.path], scanner: scanner, refreshClock: clock,
+                              refreshEventSource: events, githubMonitoringEnabled: true)
+        model.selectRepository(path: local.snapshot.path)
+        await waitForRefresh(model)
+        for _ in 0..<10_000 where events.lastSubscription == nil { await Task.yield() }
+
+        XCTAssertNotNil(events.lastSubscription)
+        XCTAssertEqual(clock.activeTimerCount, 1)
+        model.invalidateGitHubAccountState(isAuthenticated: false)
+        XCTAssertTrue(try XCTUnwrap(events.lastSubscription).cancelled)
+        XCTAssertEqual(clock.activeTimerCount, 0)
     }
 
     func testExplicitRefreshFetchesFreshDataAndUpdatesCachedView() async throws {
@@ -463,7 +519,8 @@ final class RepositoryViewCacheTests: XCTestCase {
         let scanner = CountingScanner(results: [a.snapshot.path: [a]])
         let result = CleanupExecutionResult(completedTargetIDs: ["feature-wt"], removedWorktreePaths: ["\(a.snapshot.path)/feature-wt"])
         let detail = BlockingDetailLoader(started: detailStarted)
-        let model = makeModel(paths: [a.snapshot.path], scanner: scanner, detailLoader: detail, cleanupExecutor: { _ in result })
+        let model = makeModel(paths: [a.snapshot.path], scanner: scanner, detailLoader: detail,
+                              cleanupExecutor: { _ in result }, githubMonitoringEnabled: true)
         model.selectRepository(path: a.snapshot.path)
         await waitForRefresh(model)
         await fulfillment(of: [detailStarted], timeout: 2)
@@ -502,6 +559,36 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertEqual(model.snapshot?.branches.first?.id, "b")
     }
 
+    func testAccountRestorationPreservesInitialLocalScan() async throws {
+        let started = expectation(description: "initial local scan started")
+        let release = DispatchSemaphore(value: 0)
+        let source = localResult(path: "/tmp/auth-restore-during-scan", branch: "feature")
+        let branch = try XCTUnwrap(source.snapshot.branches.first).withGitHubStatus(
+            GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil, localSHA: "sha"))
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: source.snapshot.path,
+            defaultBranch: source.snapshot.defaultBranch, branches: [branch]), sessionNotes: source.sessionNotes)
+        let scanner = FirstScanBlockingScanner(firstPath: local.snapshot.path, firstResult: local,
+            secondResult: local, started: started, release: release)
+        let clock = ModelRefreshClock()
+        let events = ModelRefreshEventSource()
+        let model = makeModel(paths: [local.snapshot.path], scanner: scanner, refreshClock: clock,
+                              refreshEventSource: events)
+
+        model.selectRepository(path: local.snapshot.path)
+        await fulfillment(of: [started], timeout: 2)
+        model.invalidateGitHubAccountState(isAuthenticated: true)
+
+        XCTAssertTrue(model.isLoading, "Account restoration must preserve the in-flight local scan")
+        release.signal()
+        await waitForRefresh(model)
+
+        XCTAssertEqual(model.snapshot?.path, local.snapshot.path)
+        XCTAssertEqual(model.snapshot?.branches.map(\.id), ["feature"])
+        for _ in 0..<10_000 where events.lastSubscription == nil { await Task.yield() }
+        XCTAssertNotNil(events.lastSubscription)
+        XCTAssertEqual(clock.activeTimerCount, 1)
+    }
+
     func testRemovingRepositoryDiscardsItsCacheAndRestoresNextRepository() async throws {
         let a = localResult(path: "/tmp/remove-A", branch: "a")
         let b = localResult(path: "/tmp/remove-B", branch: "b")
@@ -529,7 +616,8 @@ final class RepositoryViewCacheTests: XCTestCase {
         let b = localResult(path: "/tmp/detail-B", branch: "b")
         let scanner = CountingScanner(results: [a.snapshot.path: [a], b.snapshot.path: [b]])
         let detail = BlockingDetailLoader(started: detailStarted)
-        let model = makeModel(paths: [a.snapshot.path, b.snapshot.path], scanner: scanner, detailLoader: detail)
+        let model = makeModel(paths: [a.snapshot.path, b.snapshot.path], scanner: scanner,
+                              detailLoader: detail, githubMonitoringEnabled: true)
 
         model.selectRepository(path: a.snapshot.path)
         await waitForRefresh(model)
@@ -549,7 +637,8 @@ final class RepositoryViewCacheTests: XCTestCase {
         let local = localResult(path: "/tmp/detail-head", branch: "feature", githubLoaded: false)
         let scanner = CountingScanner(results: [local.snapshot.path: [local]])
         let detail = BlockingDetailLoader(started: started)
-        let model = makeModel(paths: [local.snapshot.path], scanner: scanner, detailLoader: detail)
+        let model = makeModel(paths: [local.snapshot.path], scanner: scanner,
+                              detailLoader: detail, githubMonitoringEnabled: true)
         model.selectRepository(path: local.snapshot.path)
         await waitForRefresh(model)
         await fulfillment(of: [started], timeout: 2)
@@ -567,7 +656,8 @@ final class RepositoryViewCacheTests: XCTestCase {
         let local = localResult(path: "/tmp/detail-selection", branch: "feature", githubLoaded: false)
         let scanner = CountingScanner(results: [local.snapshot.path: [local]])
         let detail = BlockingDetailLoader(started: started)
-        let model = makeModel(paths: [local.snapshot.path], scanner: scanner, detailLoader: detail)
+        let model = makeModel(paths: [local.snapshot.path], scanner: scanner,
+                              detailLoader: detail, githubMonitoringEnabled: true)
         model.selectRepository(path: local.snapshot.path)
         await waitForRefresh(model)
         await fulfillment(of: [started], timeout: 2)
@@ -583,7 +673,7 @@ final class RepositoryViewCacheTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(model.snapshot?.branches.first).github.isLoaded)
     }
 
-    private func makeModel(paths: [String], scanner: any RepositoryScanning, detailLoader: (any GitHubDetailLoading)? = nil, git: GitService = GitService(), github: GitHubService = GitHubService(), cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil) -> ApplicationModel {
+    private func makeModel(paths: [String], scanner: any RepositoryScanning, detailLoader: (any GitHubDetailLoading)? = nil, git: GitService = GitService(), github: GitHubService = GitHubService(), cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil, refreshClock: (any RefreshClock)? = nil, refreshEventSource: (any RefreshEventSource)? = nil, githubMonitoringEnabled: Bool = false) -> ApplicationModel {
         // An absolute suite path keeps the plist out of ~/Library/Preferences; removePersistentDomain alone leaves the file behind.
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("RepositoryViewCacheTests-\(UUID().uuidString)")
         try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -591,7 +681,11 @@ final class RepositoryViewCacheTests: XCTestCase {
         let defaults = UserDefaults(suiteName: directory.appendingPathComponent("defaults").path)!
         let store = RepositoryStore(defaults: defaults)
         paths.forEach(store.add)
-        return ApplicationModel(loadRepositories: false, repositoryStore: store, git: git, github: github, detailLoader: detailLoader, scanner: scanner, cleanupExecutor: cleanupExecutor)
+        let model = ApplicationModel(loadRepositories: false, repositoryStore: store, git: git, github: github,
+            detailLoader: detailLoader, scanner: scanner, cleanupExecutor: cleanupExecutor,
+            refreshClock: refreshClock, refreshEventSource: refreshEventSource)
+        if githubMonitoringEnabled { model.setGitHubMonitoringEnabled(true) }
+        return model
     }
 
     private func localResult(path: String, branch: String, worktree: String? = nil, notes: [String] = [], githubLoaded: Bool = true) -> RepositoryLocalScanResult {

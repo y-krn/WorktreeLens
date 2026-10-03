@@ -8,6 +8,7 @@
 /* Begin PBXBuildFile section */
 		A10000000000000000000001 /* WorktreeLensApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* WorktreeLensApp.swift */; };
 		A10000000000000000000002 /* WorktreePathClipboard.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* WorktreePathClipboard.swift */; };
+		A10000000000000000000003 /* RefreshCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* RefreshCoordinator.swift */; };
 		A1000000000000000000000A /* WorktreeLensCore in Frameworks */ = {isa = PBXBuildFile; productRef = B10000000000000000000001 /* WorktreeLensCore */; };
 		A1000000000000000000000B /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* Assets.xcassets */; };
 /* End PBXBuildFile section */
@@ -15,6 +16,7 @@
 /* Begin PBXFileReference section */
 		A20000000000000000000001 /* WorktreeLensApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensApp/WorktreeLensApp.swift; sourceTree = SOURCE_ROOT; };
 		A20000000000000000000002 /* WorktreePathClipboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensApp/WorktreePathClipboard.swift; sourceTree = SOURCE_ROOT; };
+		A20000000000000000000003 /* RefreshCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/WorktreeLensApp/RefreshCoordinator.swift; sourceTree = SOURCE_ROOT; };
 		A2000000000000000000000A /* WorktreeLens.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WorktreeLens.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A2000000000000000000000B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
@@ -29,12 +31,12 @@
 
 /* Begin PBXGroup section */
 		A80000000000000000000001 = {isa = PBXGroup; children = (A80000000000000000000002 /* WorktreeLens */, A80000000000000000000003 /* Products */, ); sourceTree = "<group>"; };
-		A80000000000000000000002 /* WorktreeLens */ = {isa = PBXGroup; children = (A20000000000000000000001 /* WorktreeLensApp.swift */, A20000000000000000000002 /* WorktreePathClipboard.swift */, A2000000000000000000000B /* Assets.xcassets */, ); path = .; sourceTree = SOURCE_ROOT; };
+		A80000000000000000000002 /* WorktreeLens */ = {isa = PBXGroup; children = (A20000000000000000000001 /* WorktreeLensApp.swift */, A20000000000000000000002 /* WorktreePathClipboard.swift */, A20000000000000000000003 /* RefreshCoordinator.swift */, A2000000000000000000000B /* Assets.xcassets */, ); path = .; sourceTree = SOURCE_ROOT; };
 		A80000000000000000000003 /* Products */ = {isa = PBXGroup; children = (A2000000000000000000000A /* WorktreeLens.app */, ); name = Products; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXSourcesBuildPhase section */
-		A50000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* WorktreeLensApp.swift in Sources */, A10000000000000000000002 /* WorktreePathClipboard.swift in Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
+		A50000000000000000000003 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* WorktreeLensApp.swift in Sources */, A10000000000000000000002 /* WorktreePathClipboard.swift in Sources */, A10000000000000000000003 /* RefreshCoordinator.swift in Sources */, ); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXNativeTarget section */

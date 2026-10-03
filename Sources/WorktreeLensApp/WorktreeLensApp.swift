@@ -1,5 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import AppKit
 import WorktreeLensCore
 #if KEYCHAIN_VERIFICATION
 import Security
@@ -27,8 +28,19 @@ struct WorktreeLensApp: App {
             ContentView(model: model)
                 .frame(minWidth: 1_240, minHeight: 760)
                 .tint(Color(red: 0.10, green: 0.54, blue: 0.56))
+                .task { await authentication.restoreAccount() }
+                .onAppear {
+                    model.setApplicationActive(NSApp.isActive)
+                    model.setGitHubMonitoringEnabled(authentication.account != nil)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    model.setApplicationActive(true)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+                    model.setApplicationActive(false)
+                }
                 .onChange(of: authentication.account?.identifier) { _ in
-                    model.invalidateGitHubAccountState()
+                    model.invalidateGitHubAccountState(isAuthenticated: authentication.account != nil)
                 }
         }
         Settings {
@@ -52,11 +64,16 @@ enum CleanupExecutionState: Equatable {
 protocol GitHubDetailLoading: Sendable {
     func statusAsync(repositoryPath: String, branch: String, timeout: TimeInterval) async -> GitHubStatus
     func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus
+    func refreshStatusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus
 }
 
 extension GitHubDetailLoading {
     func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus {
         await statusAsync(repositoryPath: repositoryPath, branch: branchInfo.name, timeout: timeout)
+    }
+
+    func refreshStatusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval) async -> GitHubStatus {
+        await statusAsync(repositoryPath: repositoryPath, branchInfo: branchInfo, timeout: timeout)
     }
 }
 
@@ -101,8 +118,34 @@ final class ApplicationModel: ObservableObject {
     private(set) var githubDetailTask: Task<Void, Never>?
     private var githubDetailTaskPath: String?
     private var cleanupPreviewToken = UUID()
+    private let refreshClock: any RefreshClock
+    private let refreshEventSource: any RefreshEventSource
+    private let refreshPolicy: GitHubRefreshPolicy
+    private let refreshJitter: @Sendable () -> Double
+    private var refreshTargetResolutionToken = UUID()
+    private var refreshIdentities: [String: GitBranchRefreshIdentity] = [:]
+    private var githubMonitoringEnabled = false
+    private lazy var refreshCoordinator: RefreshCoordinator = {
+        let git = self.git
+        return RefreshCoordinator(policy: refreshPolicy, clock: refreshClock, eventSource: refreshEventSource,
+            jitter: refreshJitter,
+            refresh: { [weak self] target in
+                guard let self else { return nil }
+                return await self.performAutomaticGitHubRefresh(target)
+            },
+            readIdentity: { target in
+                await Task.detached {
+                    try? git.refreshIdentity(repositoryPath: target.gitPath, branchName: target.branchName,
+                                             tracksWorktreeHead: target.tracksWorktreeHead)
+                }.value
+            },
+            identityChanged: { [weak self] target, identity in
+                guard let self else { return nil }
+                return await self.applyGitRefreshIdentity(target, identity: identity)
+            })
+    }()
 
-    init(loadRepositories: Bool = true, repositoryStore: RepositoryStore = RepositoryStore(), git: GitService = GitService(), sessions: SessionService = SessionService(), github: GitHubService = GitHubService(), detailLoader: (any GitHubDetailLoading)? = nil, scanner injectedScanner: (any RepositoryScanning)? = nil, cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil) {
+    init(loadRepositories: Bool = true, repositoryStore: RepositoryStore = RepositoryStore(), git: GitService = GitService(), sessions: SessionService = SessionService(), github: GitHubService = GitHubService(), detailLoader: (any GitHubDetailLoading)? = nil, scanner injectedScanner: (any RepositoryScanning)? = nil, cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil, refreshClock: (any RefreshClock)? = nil, refreshEventSource: (any RefreshEventSource)? = nil, refreshPolicy: GitHubRefreshPolicy = GitHubRefreshPolicy(), refreshJitter: @escaping @Sendable () -> Double = { Double.random(in: -1...1) }) {
         self.repositoryStore = repositoryStore
         self.git = git
         self.sessions = sessions
@@ -110,6 +153,10 @@ final class ApplicationModel: ObservableObject {
         self.detailLoader = detailLoader ?? github
         self.cleanupExecutor = cleanupExecutor
         self.scanner = injectedScanner ?? RepositoryScanService(git: git, sessions: sessions, github: github)
+        self.refreshClock = refreshClock ?? SystemRefreshClock()
+        self.refreshEventSource = refreshEventSource ?? GitMetadataEventSource(git: git)
+        self.refreshPolicy = refreshPolicy
+        self.refreshJitter = refreshJitter
         registeredPaths = repositoryStore.paths
         selectedPath = nil
         if loadRepositories, let path = registeredPaths.first { selectRepository(path: path) }
@@ -123,6 +170,7 @@ final class ApplicationModel: ObservableObject {
 
     func removeSelectedRepository() {
         guard let selectedPath else { return }
+        refreshCoordinator.clear()
         invalidateRepositoryTasks()
         viewCache.removeValue(forKey: selectedPath)
         repositoryStore.remove(selectedPath)
@@ -137,6 +185,7 @@ final class ApplicationModel: ObservableObject {
         if selectedPath == canonicalPath { return }
         saveCurrentView()
         invalidateRepositoryTasks()
+        refreshCoordinator.clear()
         selectedPath = canonicalPath
         errorMessage = nil
         statusMessage = nil
@@ -147,15 +196,27 @@ final class ApplicationModel: ObservableObject {
             isLoading = false
             scanPhase = nil
             canCancelGitHub = false
-            loadGitHubDetailForCurrentSelection()
+            selectionDidChange()
         } else {
             clearVisibleRepository()
             refresh(path: canonicalPath)
         }
     }
 
-    func invalidateGitHubAccountState() {
-        invalidateRepositoryTasks()
+    func invalidateGitHubAccountState(isAuthenticated: Bool) {
+        githubMonitoringEnabled = isAuthenticated
+        refreshCoordinator.clear()
+        // Preserve the initial local scan: before its snapshot exists, there is no selection to reload.
+        let preservingInitialScan = selectedPath != nil && isLoading && snapshot == nil && refreshTaskPath == selectedPath
+        if preservingInitialScan {
+            refreshTargetResolutionToken = UUID()
+            githubDetailTask?.cancel()
+            githubDetailTask = nil
+            githubDetailTaskPath = nil
+            githubDetailToken = UUID()
+        } else {
+            invalidateRepositoryTasks()
+        }
         func withoutGitHub(_ snapshot: RepositorySnapshot) -> RepositorySnapshot {
             let branches = snapshot.branches.map { branch -> BranchInfo in
                 let evidence: MergeEvidence
@@ -172,9 +233,27 @@ final class ApplicationModel: ObservableObject {
             viewCache[path] = cached
         }
         if let snapshot { self.snapshot = withoutGitHub(snapshot) }
-        isLoading = false
-        canCancelGitHub = false
-        scanPhase = nil
+        if !preservingInitialScan {
+            isLoading = false
+            canCancelGitHub = false
+            scanPhase = nil
+        }
+        if isAuthenticated { selectionDidChange() }
+    }
+
+    func setGitHubMonitoringEnabled(_ enabled: Bool) {
+        guard githubMonitoringEnabled != enabled else { return }
+        githubMonitoringEnabled = enabled
+        if enabled {
+            selectionDidChange()
+        } else {
+            refreshTargetResolutionToken = UUID()
+            refreshCoordinator.clear()
+            githubDetailTask?.cancel()
+            githubDetailTask = nil
+            githubDetailTaskPath = nil
+            githubDetailToken = UUID()
+        }
     }
 
     func refreshSelected(includeGitHub: Bool = true) {
@@ -184,6 +263,8 @@ final class ApplicationModel: ObservableObject {
 
     func refresh(path: String, includeGitHub: Bool = true) {
         guard selectedPath == path else { return }
+        refreshTargetResolutionToken = UUID()
+        refreshCoordinator.suspend()
         saveCurrentView()
         refreshTask?.cancel()
         githubDetailTask?.cancel()
@@ -257,7 +338,7 @@ final class ApplicationModel: ObservableObject {
                     self.scanPhase = nil
                     self.statusMessage = cancelled ? "GitHub loading cancelled" : nil
                     self.saveCurrentView()
-                    if !cancelled && includeGitHub { self.loadGitHubDetailForCurrentSelection() }
+                    if !cancelled { self.selectionDidChange() }
                 }
             } catch {
                 await MainActor.run {
@@ -310,11 +391,73 @@ final class ApplicationModel: ObservableObject {
     }
 
     func selectionDidChange() {
+        refreshCoordinator.clear()
+        refreshTargetResolutionToken = UUID()
+        let token = refreshTargetResolutionToken
+        guard !isLoading, let path = selectedPath, let snapshot, snapshot.path == path,
+              let branchID = selectedBranchID,
+              let branch = snapshot.branches.first(where: { $0.id == branchID }), !branch.isDetachedGroup else {
+            refreshCoordinator.select(nil)
+            return
+        }
+        guard githubMonitoringEnabled else { return }
         loadGitHubDetailForCurrentSelection()
+        let pendingBranch = branch
+        let selectedWorktreePath = selectedWorktree()?.path
+        let gitPath = selectedWorktreePath ?? path
+        let tracksWorktreeHead = selectedWorktreePath != nil
+        let provisional = RefreshTarget(path: path, branchID: branch.id, branchName: branch.name,
+            identity: GitBranchRefreshIdentity(branchName: branch.name, sha: branch.sha, upstream: branch.upstream,
+                                               upstreamSHA: nil, configurationFingerprint: ""),
+            gitPath: gitPath, tracksWorktreeHead: tracksWorktreeHead)
+        let git = self.git
+        Task.detached {
+            let identity = try? git.refreshIdentity(repositoryPath: gitPath, branchName: pendingBranch.name,
+                                                    tracksWorktreeHead: tracksWorktreeHead)
+            await MainActor.run {
+                guard self.refreshTargetResolutionToken == token, self.selectedPath == path,
+                      self.selectedBranchID == branchID, let current = self.selectedBranch() else { return }
+                guard let identity else {
+                    let fallback = RefreshTarget(path: path, branchID: current.id, branchName: current.name,
+                        identity: GitBranchRefreshIdentity(branchName: current.name, sha: pendingBranch.sha,
+                            upstream: pendingBranch.upstream, upstreamSHA: nil, configurationFingerprint: ""),
+                        gitPath: gitPath, tracksWorktreeHead: tracksWorktreeHead)
+                    let requestPending = self.githubDetailTaskPath == path && self.githubDetailTask != nil && !self.githubDetailTask!.isCancelled
+                    self.refreshCoordinator.select(fallback, status: current.github, externalRefreshPending: requestPending)
+                    return
+                }
+                let priorKey = self.refreshIdentityKey(path: path, branchID: current.id, gitPath: gitPath)
+                let priorIdentity = self.refreshIdentities[priorKey]
+                let identityChanged = priorIdentity.map { $0 != identity } ??
+                    (identity.branchName != current.name || identity.sha != current.sha || identity.upstream != current.upstream)
+                if identityChanged {
+                    Task { @MainActor in
+                        guard self.refreshTargetResolutionToken == token, self.selectedPath == path,
+                              self.selectedBranchID == branchID else { return }
+                        guard let update = await self.applyGitRefreshIdentity(provisional, identity: identity),
+                              self.refreshTargetResolutionToken == token else {
+                            self.refreshCoordinator.clear()
+                            return
+                        }
+                        let requestPending = self.githubDetailTaskPath == path && self.githubDetailTask != nil && !self.githubDetailTask!.isCancelled
+                        self.refreshCoordinator.select(update.target, status: update.status,
+                                                       externalRefreshPending: requestPending)
+                    }
+                } else {
+                    let resolved = RefreshTarget(path: path, branchID: current.id, branchName: current.name,
+                        identity: identity, gitPath: gitPath, tracksWorktreeHead: tracksWorktreeHead)
+                    self.refreshIdentities[priorKey] = identity
+                    let requestPending = self.githubDetailTaskPath == path && self.githubDetailTask != nil && !self.githubDetailTask!.isCancelled
+                    self.refreshCoordinator.select(resolved, status: current.github, externalRefreshPending: requestPending)
+                }
+            }
+        }
     }
 
     private func loadGitHubDetailForCurrentSelection() {
         githubDetailTask?.cancel()
+        githubDetailTask = nil
+        githubDetailTaskPath = nil
         githubDetailToken = UUID()
         guard !isLoading,
               let path = selectedPath,
@@ -339,17 +482,160 @@ final class ApplicationModel: ObservableObject {
                       self.selectedPath == path,
                       self.selectedBranchID == branchID,
                       self.snapshot?.path == path else { return }
+                guard status.localSHA == nil || status.localSHA == branch.sha else {
+                    self.githubDetailTask = nil
+                    self.githubDetailTaskPath = nil
+                    self.refreshCoordinator.externalRefreshFinished(status: nil)
+                    return
+                }
                 guard let snapshot = self.snapshot,
                       let index = snapshot.branches.firstIndex(where: { $0.id == branchID && $0.sha == branch.sha }) else { return }
                 var branches = snapshot.branches
                 branches[index] = branches[index].withGitHubStatus(status)
                 self.snapshot = RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: branches, refreshedAt: snapshot.refreshedAt)
                 self.saveCurrentView()
+                self.githubDetailTask = nil
+                self.githubDetailTaskPath = nil
+                self.refreshCoordinator.externalRefreshFinished(status: status)
             }
         }
     }
 
+    func setApplicationActive(_ active: Bool) {
+        refreshCoordinator.setForeground(active)
+    }
+
+    private func resumeRefreshCoordinatorAfterCleanup() {
+        guard githubMonitoringEnabled, let path = selectedPath, let branch = selectedBranch(), !branch.isDetachedGroup else {
+            refreshCoordinator.clear()
+            return
+        }
+        refreshTargetResolutionToken = UUID()
+        let token = refreshTargetResolutionToken
+        let selectedWorktreePath = selectedWorktree()?.path
+        let gitPath = selectedWorktreePath ?? path
+        let tracksWorktreeHead = selectedWorktreePath != nil
+        let git = self.git
+        Task.detached {
+            let identity = try? git.refreshIdentity(repositoryPath: gitPath, branchName: branch.name,
+                                                    tracksWorktreeHead: tracksWorktreeHead)
+            await MainActor.run {
+                guard self.refreshTargetResolutionToken == token, self.selectedPath == path,
+                      self.selectedBranchID == branch.id, let current = self.selectedBranch() else { return }
+                let localIdentity = identity ?? GitBranchRefreshIdentity(branchName: current.name, sha: current.sha,
+                    upstream: current.upstream, upstreamSHA: nil, configurationFingerprint: "")
+                let target = RefreshTarget(path: path, branchID: current.id, branchName: current.name,
+                    identity: localIdentity, gitPath: gitPath, tracksWorktreeHead: tracksWorktreeHead)
+                self.refreshCoordinator.select(target, status: current.github, suppressImmediateRefresh: true)
+            }
+        }
+    }
+
+    private func performAutomaticGitHubRefresh(_ target: RefreshTarget) async -> GitHubStatus? {
+        guard selectedPath == target.path, selectedBranchID == target.branchID,
+              let currentSnapshot = snapshot, currentSnapshot.path == target.path,
+              let index = currentSnapshot.branches.firstIndex(where: { $0.id == target.branchID && $0.name == target.branchName && $0.sha == target.sha }) else { return nil }
+        githubDetailTask?.cancel()
+        githubDetailTask = nil
+        githubDetailTaskPath = nil
+        let token = UUID()
+        githubDetailToken = token
+        let requestBranch = currentSnapshot.branches[index]
+        var refreshingBranches = currentSnapshot.branches
+        refreshingBranches[index] = requestBranch.withGitHubStatus(requestBranch.github.markingRefresh())
+        snapshot = RepositorySnapshot(path: currentSnapshot.path, defaultBranch: currentSnapshot.defaultBranch,
+                                      branches: refreshingBranches, refreshedAt: currentSnapshot.refreshedAt)
+        saveCurrentView()
+        let status = await detailLoader.refreshStatusAsync(repositoryPath: target.path, branchInfo: requestBranch,
+                                                           timeout: GitHubService.requestTimeout)
+        guard status.localSHA == nil || status.localSHA == target.sha else { return nil }
+        guard githubDetailToken == token, selectedPath == target.path, selectedBranchID == target.branchID,
+              let latest = snapshot, latest.path == target.path,
+              let latestIndex = latest.branches.firstIndex(where: { $0.id == target.branchID && $0.sha == target.sha }) else { return nil }
+        var branches = latest.branches
+        let updatedBranch = branches[latestIndex]
+        let evidence: MergeEvidence
+        if case .gitAncestor = updatedBranch.mergeEvidence {
+            evidence = .gitAncestor
+        } else if let defaultBranch = latest.defaultBranch,
+                  let merged = status.verifiedMergedPullRequest(defaultBranch: defaultBranch,
+                                                               branchName: updatedBranch.name, localSHA: updatedBranch.sha) {
+            evidence = .githubVerified(prNumber: merged.number, mergedAt: merged.mergedAt!)
+        } else {
+            evidence = .none
+        }
+        branches[latestIndex] = updatedBranch.withMergeEvidence(evidence, github: status)
+        snapshot = RepositorySnapshot(path: latest.path, defaultBranch: latest.defaultBranch,
+                                      branches: branches, refreshedAt: latest.refreshedAt)
+        saveCurrentView()
+        return status
+    }
+
+    private func applyGitRefreshIdentity(_ target: RefreshTarget, identity: GitBranchRefreshIdentity) async -> RefreshIdentityUpdate? {
+        guard selectedPath == target.path, let current = snapshot, current.path == target.path,
+              let sourceIndex = current.branches.firstIndex(where: { $0.id == target.branchID && $0.name == target.branchName }) else { return nil }
+        githubDetailTask?.cancel()
+        githubDetailTask = nil
+        githubDetailTaskPath = nil
+        githubDetailToken = UUID()
+        var branches = current.branches
+        var destinationIndex = sourceIndex
+        if target.tracksWorktreeHead && identity.branchName != target.branchName {
+            guard case .worktree(let selectedWorktreeID) = selection,
+                  let moved = branches[sourceIndex].worktrees.first(where: { $0.id == selectedWorktreeID }),
+                  let resolvedIndex = branches.firstIndex(where: { $0.name == identity.branchName }) else { return nil }
+            destinationIndex = resolvedIndex
+            let movedWorktree = WorktreeInfo(id: moved.id, path: moved.path, branch: identity.branchName,
+                head: identity.headSHA, isBare: moved.isBare, isLocked: moved.isLocked,
+                isDetached: moved.isDetached, isClean: moved.isClean, stagedCount: moved.stagedCount,
+                unstagedCount: moved.unstagedCount, untrackedCount: moved.untrackedCount,
+                lastActivity: moved.lastActivity, defaultAhead: moved.defaultAhead,
+                defaultBehind: moved.defaultBehind, sessions: moved.sessions)
+            let source = branches[sourceIndex]
+            branches[sourceIndex] = BranchInfo(id: source.id, name: source.name, sha: source.sha,
+                upstream: source.upstream, ahead: source.ahead, behind: source.behind,
+                isMerged: source.isMerged, remoteGone: source.remoteGone, lastCommitAt: source.lastCommitAt,
+                isDefaultBranch: source.isDefaultBranch, isDetachedGroup: source.isDetachedGroup,
+                defaultAhead: source.defaultAhead, defaultBehind: source.defaultBehind,
+                worktrees: source.worktrees.filter { $0.id != selectedWorktreeID }, github: source.github,
+                mergeEvidence: source.mergeEvidence)
+            let destination = branches[destinationIndex]
+            branches[destinationIndex] = BranchInfo(id: destination.id, name: destination.name,
+                sha: destination.sha, upstream: destination.upstream, ahead: destination.ahead,
+                behind: destination.behind, isMerged: destination.isMerged, remoteGone: destination.remoteGone,
+                lastCommitAt: destination.lastCommitAt, isDefaultBranch: destination.isDefaultBranch,
+                isDetachedGroup: destination.isDetachedGroup, defaultAhead: destination.defaultAhead,
+                defaultBehind: destination.defaultBehind, worktrees: destination.worktrees + [movedWorktree],
+                github: destination.github, mergeEvidence: destination.mergeEvidence)
+        } else if target.tracksWorktreeHead && identity.headBranch == nil {
+            return nil
+        }
+        let previousBranch = branches[destinationIndex]
+        var updated = previousBranch.withRefreshIdentity(identity, github: .unavailable)
+        if identity.sha == previousBranch.sha, case .gitAncestor = previousBranch.mergeEvidence {
+            updated = updated.withMergeEvidence(.gitAncestor, github: .unavailable)
+        }
+        let resolutionToken = refreshTargetResolutionToken
+        let cachedStatuses = await github.cachedStatusesAsync(repositoryPath: target.path, branches: [updated])
+        guard refreshTargetResolutionToken == resolutionToken, selectedPath == target.path else { return nil }
+        let status = cachedStatuses[updated.id] ?? .unavailable
+        branches[destinationIndex] = updated.withGitHubStatus(status)
+        snapshot = RepositorySnapshot(path: current.path, defaultBranch: current.defaultBranch,
+                                      branches: branches, refreshedAt: current.refreshedAt)
+        saveCurrentView()
+        let updatedTarget = RefreshTarget(path: target.path, branchID: updated.id,
+            branchName: updated.name, identity: identity, gitPath: target.gitPath,
+            tracksWorktreeHead: target.tracksWorktreeHead)
+        refreshIdentities[refreshIdentityKey(path: target.path, branchID: updated.id, gitPath: target.gitPath)] = identity
+        return RefreshIdentityUpdate(target: updatedTarget, status: status)
+    }
+
+    private func refreshIdentityKey(path: String, branchID: String, gitPath: String) -> String {
+        "\(path)\u{0}\(branchID)\u{0}\(gitPath)"
+    }
+
     private func invalidateRepositoryTasks() {
+        refreshTargetResolutionToken = UUID()
         refreshTask?.cancel()
         githubDetailTask?.cancel()
         refreshToken = UUID()
@@ -361,6 +647,7 @@ final class ApplicationModel: ObservableObject {
     }
 
     private func invalidateRepositoryTasks(for path: String) {
+        if selectedPath == path { refreshTargetResolutionToken = UUID() }
         if refreshTaskPath == path {
             refreshTask?.cancel()
             refreshToken = UUID()
@@ -438,6 +725,7 @@ final class ApplicationModel: ObservableObject {
     func executeCleanup(_ preview: CleanupPreview) {
         guard cleanupExecutionState == .idle, !isCleanupPreviewLoading, cleanupPreview?.id == preview.id else { return }
         let repositoryPath = URL(fileURLWithPath: preview.repositoryPath).standardizedFileURL.path
+        if selectedPath == repositoryPath { refreshCoordinator.suspend() }
         invalidateRepositoryTasks(for: repositoryPath)
         if selectedPath == repositoryPath {
             if let cached = viewCache[repositoryPath], cached.snapshot.path == repositoryPath {
@@ -506,6 +794,7 @@ final class ApplicationModel: ObservableObject {
             isLoading = false
             scanPhase = nil
             canCancelGitHub = false
+            resumeRefreshCoordinatorAfterCleanup()
         }
     }
 

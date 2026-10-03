@@ -2,6 +2,38 @@ import XCTest
 @testable import WorktreeLensCore
 
 final class PR52ReviewRegressionTests: XCTestCase {
+    func testAutomaticRefreshDiscoversNewPRWithoutLocalSHAChange() async throws {
+        let transport = DisplayScriptTransport { request, count in
+            if request.url?.path != "/graphql" {
+                return GitHubHTTPResponse(data: Data(#"{"total_count":0,"workflow_runs":[]}"#.utf8), status: 200)
+            }
+            let query = try displayQuery(request)
+            if query.contains("pullRequests(") {
+                var opened = displayPR(number: 201)
+                opened["state"] = "OPEN"
+                opened["mergedAt"] = NSNull()
+                return try displayResponse(["b0": displayRepo(["pullRequests": displayPage(count == 1 ? [] : [opened])])])
+            }
+            var detailed = displayPR(number: 201)
+            detailed["closingIssuesReferences"] = displayPage([])
+            return try displayResponse([
+                "i0": displayRepo(["pullRequest": detailed]),
+                "ci": displayRepo(["object": ["oid": "local-sha", "statusCheckRollup": ["contexts": displayPage([])]]])
+            ])
+        }
+        let github = GitHubService(api: displayAPI(transport, stateStore: GitHubStateStore()),
+            resolver: GitHubRepositoryResolver(runner: DisplayConfigRunner(config: "remote.origin.url=https://github.com/example/repo.git")))
+        let branch = displayBranch()
+        let summaries = await github.summariesAsync(repositoryPath: "/fixture", branches: [branch])
+        let summary = try XCTUnwrap(summaries[branch.id])
+        XCTAssertTrue(summary.pullRequests.isEmpty)
+
+        let refreshed = await github.refreshStatusAsync(repositoryPath: "/fixture", branchInfo: branch.withGitHubStatus(summary))
+        XCTAssertEqual(refreshed.pullRequests.map(\.number), [201], "Automatic polling must discover a newly opened PR at the same SHA")
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 4)
+    }
+
     func testSameSHAReplacementPRMustBeRediscovered() async throws {
         let transport = DisplayScriptTransport { request, _ in
             let query = try displayQuery(request)

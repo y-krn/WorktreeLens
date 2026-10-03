@@ -1,4 +1,26 @@
 import Foundation
+import CryptoKit
+
+public struct GitBranchRefreshIdentity: Hashable, Sendable {
+    public let branchName: String
+    public let sha: String
+    public let upstream: String?
+    public let upstreamSHA: String?
+    public let headBranch: String?
+    public let headSHA: String
+    public let configurationFingerprint: String
+
+    public init(branchName: String, sha: String, upstream: String?, upstreamSHA: String?, headBranch: String? = nil,
+                headSHA: String? = nil, configurationFingerprint: String) {
+        self.branchName = branchName
+        self.sha = sha
+        self.upstream = upstream
+        self.upstreamSHA = upstreamSHA
+        self.headBranch = headBranch
+        self.headSHA = headSHA ?? sha
+        self.configurationFingerprint = configurationFingerprint
+    }
+}
 
 public struct CleanupBranchState: Sendable {
     public let name: String
@@ -49,6 +71,76 @@ public final class GitService: @unchecked Sendable {
 
     public func canonicalRepositoryPath(_ path: String) throws -> String {
         try run(["-C", path, "rev-parse", "--show-toplevel"]).stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Reads only the selected branch, its upstream, and repository remotes.
+    public func refreshIdentity(repositoryPath: String, branchName: String, tracksWorktreeHead: Bool = false) throws -> GitBranchRefreshIdentity {
+        let headSHA = try run(["-C", repositoryPath, "rev-parse", "--verify", "HEAD"])
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let headBranchResult = try? run(["-C", repositoryPath, "symbolic-ref", "--quiet", "--short", "HEAD"])
+        let headBranchValue = headBranchResult?.succeeded == true
+            ? headBranchResult?.stdout.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        let effectiveBranch = tracksWorktreeHead ? (headBranchValue ?? branchName) : branchName
+        let ref = "refs/heads/\(effectiveBranch)"
+        let sha = try run(["-C", repositoryPath, "rev-parse", "--verify", "--end-of-options", ref])
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sha.isEmpty else { throw ProcessRunnerError.failed("Selected Git branch unavailable.") }
+        let upstreamValue = try run(["-C", repositoryPath, "for-each-ref", "--format=%(upstream)", ref])
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let upstream = upstreamValue.isEmpty ? nil : upstreamValue
+        let upstreamSHA: String?
+        if let upstream {
+            upstreamSHA = try? run(["-C", repositoryPath, "rev-parse", "--verify", "--end-of-options", upstream])
+                .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            upstreamSHA = nil
+        }
+        let config = try run(["-C", repositoryPath, "config", "--local", "--list", "--null"]).stdout
+        let remoteList = try run(["-C", repositoryPath, "remote", "-v"]).stdout
+        let digest = SHA256.hash(data: Data((config + "\u{0}" + remoteList).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        return GitBranchRefreshIdentity(branchName: effectiveBranch, sha: sha, upstream: upstream,
+                                        upstreamSHA: upstreamSHA, headBranch: headBranchValue,
+                                        headSHA: headSHA, configurationFingerprint: digest)
+    }
+
+    /// Git metadata paths for HEAD, repository configuration, the selected ref, and its upstream.
+    public func refreshWatchPaths(repositoryPath: String, branchName: String, tracksWorktreeHead: Bool = false) throws -> [String] {
+        let gitDirectory = try run(["-C", repositoryPath, "rev-parse", "--absolute-git-dir"])
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let commonDirectory = try run(["-C", repositoryPath, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let headBranchResult = try? run(["-C", repositoryPath, "symbolic-ref", "--quiet", "--short", "HEAD"])
+        let headBranch = headBranchResult?.succeeded == true
+            ? headBranchResult?.stdout.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        let effectiveBranch = tracksWorktreeHead ? (headBranch ?? branchName) : branchName
+        let ref = "refs/heads/\(effectiveBranch)"
+        let upstream = try run(["-C", repositoryPath, "for-each-ref", "--format=%(upstream)", ref])
+            .stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var paths = [
+            "\(gitDirectory)/HEAD", "\(gitDirectory)/config", "\(gitDirectory)/config.worktree",
+            "\(commonDirectory)/config", "\(gitDirectory)/packed-refs", "\(commonDirectory)/packed-refs"
+        ]
+        let refs = [ref, upstream].filter { !$0.isEmpty && $0.hasPrefix("refs/") }
+        for base in Set([gitDirectory, commonDirectory]) {
+            paths += refs.map { "\(base)/\($0)" }
+        }
+        return Array(Set(paths.map(nearestExistingWatchPath))).sorted()
+    }
+
+    private func nearestExistingWatchPath(_ path: String) -> String {
+        var candidate = URL(fileURLWithPath: path).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+            candidate.deleteLastPathComponent()
+        }
+        while !FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
+            let parent = candidate.deletingLastPathComponent()
+            if parent.path == candidate.path { break }
+            candidate = parent
+        }
+        return candidate.path
     }
 
     public func snapshot(repositoryPath: String, sessions: [SessionRecord] = []) throws -> RepositorySnapshot {

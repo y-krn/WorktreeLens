@@ -5,15 +5,22 @@ public final class GitHubService: @unchecked Sendable {
     private let configuredExecutable: String?
     private let display: GitHubDisplayService
     private let resolver: GitHubRepositoryResolver
+    private let refreshMetrics: GitHubRefreshMetrics
 
     public init(runner: any ProcessRunning = LocalProcessRunner(), executable: String? = nil,
                 api: GitHubAPIClient? = nil, resolver: GitHubRepositoryResolver = GitHubRepositoryResolver(),
-                clock: any GitHubClock = SystemGitHubClock(), limits: GitHubDisplayLimits = GitHubDisplayLimits()) {
+                clock: any GitHubClock = SystemGitHubClock(), limits: GitHubDisplayLimits = GitHubDisplayLimits(),
+                refreshMetrics: GitHubRefreshMetrics = GitHubRefreshMetrics()) {
         self.runner = runner
         self.configuredExecutable = executable
         let client = api ?? GitHubAPIClient(authentication: GitHubDeviceFlowProvider(clientID: UserDefaults.standard.string(forKey: "githubAppClientID") ?? ""))
-        self.display = GitHubDisplayService(api: client, clock: clock, limits: limits)
+        self.refreshMetrics = refreshMetrics
+        self.display = GitHubDisplayService(api: client, clock: clock, limits: limits, metrics: refreshMetrics)
         self.resolver = resolver
+    }
+
+    public func refreshMetricsSnapshot() -> [GitHubTargetRefreshMetric] {
+        refreshMetrics.snapshot()
     }
 
     public static let requestTimeout: TimeInterval = 10
@@ -47,12 +54,22 @@ public final class GitHubService: @unchecked Sendable {
     }
 
     public func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval = GitHubService.requestTimeout) async -> GitHubStatus {
+        await statusAsync(repositoryPath: repositoryPath, branchInfo: branchInfo, timeout: timeout, refreshSummary: false)
+    }
+
+    public func refreshStatusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval = GitHubService.requestTimeout) async -> GitHubStatus {
+        await statusAsync(repositoryPath: repositoryPath, branchInfo: branchInfo, timeout: timeout, refreshSummary: true)
+    }
+
+    private func statusAsync(repositoryPath: String, branchInfo: BranchInfo, timeout: TimeInterval,
+                             refreshSummary: Bool) async -> GitHubStatus {
         do {
             try Task.checkCancellation()
             guard let target = try resolver.targets(path: repositoryPath, branches: [branchInfo]).first else {
                 return GitHubStatus(issues: [], pullRequests: branchInfo.github.pullRequests, actions: [], error: "GitHub repository unresolved.", isLoaded: false)
             }
-            return await display.details(target: target, summary: branchInfo.github, timeout: timeout)
+            return await display.details(target: target, summary: branchInfo.github, timeout: timeout,
+                                         refreshSummary: refreshSummary)
         } catch {
             return GitHubStatus(issues: [], pullRequests: branchInfo.github.pullRequests, actions: [], error: error.localizedDescription, isLoaded: false)
         }

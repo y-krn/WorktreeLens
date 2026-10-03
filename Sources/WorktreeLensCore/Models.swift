@@ -131,6 +131,14 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
     public func withRemoteGone(_ value: Bool) -> BranchInfo {
         BranchInfo(id: id, name: name, sha: sha, upstream: upstream, ahead: ahead, behind: behind, isMerged: isMerged, remoteGone: value, lastCommitAt: lastCommitAt, isDefaultBranch: isDefaultBranch, isDetachedGroup: isDetachedGroup, defaultAhead: defaultAhead, defaultBehind: defaultBehind, worktrees: worktrees, github: github, mergeEvidence: mergeEvidence)
     }
+
+    public func withRefreshIdentity(_ identity: GitBranchRefreshIdentity, github status: GitHubStatus? = nil) -> BranchInfo {
+        BranchInfo(id: id, name: name, sha: identity.sha, upstream: identity.upstream,
+                   ahead: ahead, behind: behind, isMerged: false, remoteGone: remoteGone,
+                   lastCommitAt: lastCommitAt, isDefaultBranch: isDefaultBranch, isDetachedGroup: isDetachedGroup,
+                   defaultAhead: defaultAhead, defaultBehind: defaultBehind, worktrees: worktrees,
+                   github: status ?? github, mergeEvidence: MergeEvidence.none)
+    }
 }
 
 public enum MergeEvidence: Hashable, Sendable {
