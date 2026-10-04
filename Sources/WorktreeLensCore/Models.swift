@@ -116,7 +116,6 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
         switch mergeEvidence {
         case .gitAncestor: return "Merged · Git"
         case .githubVerified(let prNumber, _): return "Merged · GitHub verified · PR #\(prNumber)"
-        case .stackedPR: return "Merged · stacked PR"
         case .rebasedEquivalent: return "Integrated · rebased equivalent"
         case .uniqueCommitsRemain: return "Unique commits remain"
         case .verificationUnavailable: return "Verification unavailable"
@@ -128,6 +127,20 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
         BranchInfo(id: id, name: name, sha: sha, upstream: upstream, ahead: ahead, behind: behind, isMerged: evidence.isMerged, remoteGone: remoteGone, lastCommitAt: lastCommitAt, isDefaultBranch: isDefaultBranch, isDetachedGroup: isDetachedGroup, defaultAhead: defaultAhead, defaultBehind: defaultBehind, worktrees: worktrees, github: github ?? self.github, mergeEvidence: evidence)
     }
 
+    public func resolvingMergeEvidence(defaultBranch: String?, status: GitHubStatus) -> BranchInfo {
+        let evidence: MergeEvidence
+        if case .gitAncestor = mergeEvidence {
+            evidence = .gitAncestor
+        } else if let defaultBranch,
+                  let pullRequest = status.verifiedMergedPullRequest(defaultBranch: defaultBranch,
+                      branchName: name, localSHA: sha), let mergedAt = pullRequest.mergedAt {
+            evidence = .githubVerified(prNumber: pullRequest.number, mergedAt: mergedAt)
+        } else {
+            evidence = mergeEvidence
+        }
+        return withMergeEvidence(evidence, github: status)
+    }
+
     public func withGitHubStatus(_ status: GitHubStatus) -> BranchInfo {
         BranchInfo(id: id, name: name, sha: sha, upstream: upstream, ahead: ahead, behind: behind, isMerged: isMerged, remoteGone: remoteGone, lastCommitAt: lastCommitAt, isDefaultBranch: isDefaultBranch, isDetachedGroup: isDetachedGroup, defaultAhead: defaultAhead, defaultBehind: defaultBehind, worktrees: worktrees, github: status, mergeEvidence: mergeEvidence)
     }
@@ -137,18 +150,18 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
     }
 
     public func withRefreshIdentity(_ identity: GitBranchRefreshIdentity, github status: GitHubStatus? = nil) -> BranchInfo {
-        BranchInfo(id: id, name: name, sha: identity.sha, upstream: identity.upstream,
-                   ahead: ahead, behind: behind, isMerged: false, remoteGone: remoteGone,
+        let evidence = identity.sha == sha ? mergeEvidence : MergeEvidence.none
+        return BranchInfo(id: id, name: name, sha: identity.sha, upstream: identity.upstream,
+                   ahead: ahead, behind: behind, isMerged: evidence.isMerged, remoteGone: remoteGone,
                    lastCommitAt: lastCommitAt, isDefaultBranch: isDefaultBranch, isDetachedGroup: isDetachedGroup,
                    defaultAhead: defaultAhead, defaultBehind: defaultBehind, worktrees: worktrees,
-                   github: status ?? github, mergeEvidence: MergeEvidence.none)
+                   github: status ?? github, mergeEvidence: evidence)
     }
 }
 
 public enum MergeEvidence: Hashable, Sendable {
     case gitAncestor
     case githubVerified(prNumber: Int, mergedAt: Date)
-    case stackedPR
     case rebasedEquivalent
     case uniqueCommitsRemain
     case verificationUnavailable
@@ -156,7 +169,7 @@ public enum MergeEvidence: Hashable, Sendable {
 
     public var isMerged: Bool {
         switch self {
-        case .gitAncestor, .githubVerified, .stackedPR, .rebasedEquivalent: return true
+        case .gitAncestor, .githubVerified, .rebasedEquivalent: return true
         case .uniqueCommitsRemain, .verificationUnavailable, .none: return false
         }
     }

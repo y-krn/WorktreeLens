@@ -69,14 +69,23 @@ final class RepositoryViewCacheTests: XCTestCase {
         private let lock = NSLock()
         private var paths: [String] = []
         private var continuation: CheckedContinuation<GitHubStatus, Never>?
+        private var hasBlockedOnce = false
 
         init(started: XCTestExpectation) { self.started = started }
 
         func statusAsync(repositoryPath: String, branch: String, timeout: TimeInterval) async -> GitHubStatus {
             record(path: repositoryPath)
             return await withCheckedContinuation { continuation in
-                lock.lock(); self.continuation = continuation; lock.unlock()
-                started.fulfill()
+                lock.lock()
+                if hasBlockedOnce {
+                    lock.unlock()
+                    continuation.resume(returning: GitHubStatus(issues: [], pullRequests: [], actions: [], error: nil))
+                } else {
+                    hasBlockedOnce = true
+                    self.continuation = continuation
+                    lock.unlock()
+                    started.fulfill()
+                }
             }
         }
 
@@ -671,6 +680,31 @@ final class RepositoryViewCacheTests: XCTestCase {
         await pending.value
         XCTAssertEqual(model.selectedBranchID, "loaded")
         XCTAssertFalse(try XCTUnwrap(model.snapshot?.branches.first).github.isLoaded)
+    }
+
+    func testDetailRefreshRetainsRebasedEquivalentEvidenceWithoutDirectPR() async throws {
+        let started = expectation(description: "detail refresh started")
+        let path = "/tmp/detail-retains-patch-evidence"
+        let base = localResult(path: path, branch: "feature", githubLoaded: false)
+        let branch = try XCTUnwrap(base.snapshot.branches.first).withMergeEvidence(.rebasedEquivalent)
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: path, defaultBranch: "main", branches: [branch]), sessionNotes: [])
+        let scanner = CountingScanner(results: [path: [local]])
+        let detail = BlockingDetailLoader(started: started)
+        let model = makeModel(paths: [path], scanner: scanner, detailLoader: detail, githubMonitoringEnabled: true)
+        model.selectRepository(path: path)
+        await waitForRefresh(model)
+        model.selectBranch(id: "feature")
+        let target = RefreshTarget(path: path, branchID: "feature", branchName: "feature",
+            identity: GitBranchRefreshIdentity(branchName: "feature", sha: branch.sha, upstream: nil,
+                upstreamSHA: nil, configurationFingerprint: "config"))
+        let pending = Task { await model.performAutomaticGitHubRefresh(target) }
+        await fulfillment(of: [started], timeout: 2)
+        detail.release()
+        let refreshedStatus = await pending.value
+        XCTAssertNotNil(refreshedStatus)
+
+        XCTAssertEqual(model.snapshot?.branches.first?.mergeEvidence, .rebasedEquivalent)
+        XCTAssertEqual(model.snapshot?.branches.first?.mergeStatus, "Integrated · rebased equivalent")
     }
 
     private func makeModel(paths: [String], scanner: any RepositoryScanning, detailLoader: (any GitHubDetailLoading)? = nil, git: GitService = GitService(), github: GitHubService = GitHubService(), cleanupExecutor: (@Sendable (CleanupPreview) -> CleanupExecutionResult)? = nil, refreshClock: (any RefreshClock)? = nil, refreshEventSource: (any RefreshEventSource)? = nil, githubMonitoringEnabled: Bool = false) -> ApplicationModel {

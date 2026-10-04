@@ -929,6 +929,43 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(enriched.branches[0].mergeStatus, "Not merged")
     }
 
+    func testFullRefreshCombinesAncestorDirectPRThenPatchEvidence() async throws {
+        let pullRequests = try JSONSerialization.data(withJSONObject: [
+            displayPR(number: 211, branch: "ancestor", sha: "ancestor-sha"),
+            displayPR(number: 212, branch: "direct", sha: "direct-sha")
+        ])
+        let branches = [
+            displayBranch("ancestor", sha: "ancestor-sha").withMergeEvidence(.gitAncestor),
+            displayBranch("direct", sha: "direct-sha").withMergeEvidence(.rebasedEquivalent),
+            displayBranch("rebased", sha: "rebased-sha").withMergeEvidence(.rebasedEquivalent),
+            displayBranch("unique", sha: "unique-sha").withMergeEvidence(.uniqueCommitsRemain),
+            displayBranch("unknown", sha: "unknown-sha").withMergeEvidence(.verificationUnavailable)
+        ]
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: "/tmp/evidence-order", defaultBranch: "main", branches: branches), sessionNotes: [])
+        let scanner = RepositoryScanService(github: scannerDisplayFixture(pr: pullRequests).0)
+
+        let refreshed = await scanner.enrichGitHub(local: local)
+        let results = Dictionary(uniqueKeysWithValues: refreshed.branches.map { ($0.name, $0) })
+        XCTAssertEqual(results["ancestor"]?.mergeEvidence, .gitAncestor)
+        XCTAssertEqual(results["direct"]?.mergeEvidence, .githubVerified(prNumber: 212, mergedAt: Date(timeIntervalSince1970: 1_767_225_600)))
+        XCTAssertEqual(results["rebased"]?.mergeEvidence, .rebasedEquivalent)
+        XCTAssertEqual(results["unique"]?.mergeEvidence, .uniqueCommitsRemain)
+        XCTAssertEqual(results["unknown"]?.mergeEvidence, .verificationUnavailable)
+    }
+
+    func testDetailIdentityRefreshKeepsPatchEvidenceOnlyWhenSHAIsUnchanged() {
+        let identity = GitBranchRefreshIdentity(branchName: "feature", sha: "same-sha", upstream: nil,
+            upstreamSHA: nil, configurationFingerprint: "config")
+        for evidence in [MergeEvidence.rebasedEquivalent, .uniqueCommitsRemain, .verificationUnavailable] {
+            let branch = displayBranch("feature", sha: "same-sha").withMergeEvidence(evidence)
+            XCTAssertEqual(branch.withRefreshIdentity(identity).mergeEvidence, evidence)
+        }
+        let changed = GitBranchRefreshIdentity(branchName: "feature", sha: "new-sha", upstream: nil,
+            upstreamSHA: nil, configurationFingerprint: "config")
+        XCTAssertEqual(displayBranch("feature", sha: "same-sha").withMergeEvidence(.rebasedEquivalent)
+            .withRefreshIdentity(changed).mergeEvidence, .none)
+    }
+
     func testGitHubUnavailableAndDefaultBranchRemainBlocked() {
         let unavailableBranch = BranchInfo(id: "feature", name: "feature", sha: "abc", upstream: nil, ahead: 0, behind: 0, isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])
         let unavailablePreview = CleanupService().previewDeleteBranch(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [unavailableBranch]), name: "feature")
@@ -2077,6 +2114,27 @@ final class CoreTests: XCTestCase {
         let preview = CleanupService(git: git).previewDeleteBranch(
             snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch]), name: "feature")
         XCTAssertFalse(preview.items.first?.allowed ?? true)
+    }
+
+    func testTenNonAncestorBranchesUseAtMostThreePatchChecksPerBranch() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        for index in 2...10 {
+            let branchName = "feature-\(index)"
+            _ = try runGit(["-C", fixture.repository.path, "switch", "-c", branchName, "main"])
+            try Data("change-\(index)\n".utf8).write(to: fixture.repository.appendingPathComponent("\(branchName).txt"))
+            _ = try runGit(["-C", fixture.repository.path, "add", "\(branchName).txt"])
+            _ = try runGit(["-C", fixture.repository.path, "commit", "-m", branchName])
+        }
+        _ = try runGit(["-C", fixture.repository.path, "switch", "main"])
+
+        let recorder = RecordingRunner()
+        let snapshot = try GitService(runner: recorder).snapshot(repositoryPath: fixture.repository.path)
+        let nonAncestorCount = snapshot.branches.filter { !$0.isDefaultBranch }.count
+        XCTAssertEqual(nonAncestorCount, 10)
+        XCTAssertEqual(recorder.arguments.filter { $0.contains("--merges") }.count, nonAncestorCount)
+        XCTAssertEqual(recorder.arguments.filter { $0.contains("--no-merges") }.count, nonAncestorCount)
+        XCTAssertEqual(recorder.arguments.filter { $0.contains("cherry") }.count, nonAncestorCount)
     }
 
     private func makeFeatureRepository() throws -> (root: URL, repository: URL, featureSHA: String) {
