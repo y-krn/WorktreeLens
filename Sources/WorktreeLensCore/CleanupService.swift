@@ -221,6 +221,10 @@ public final class CleanupService: @unchecked Sendable {
                 guard let expectedSHA else { return nil }
                 return (name, expectedSHA, expectedDefaultBranch, evidence)
             }
+            if case .stackedPR = evidence {
+                guard let expectedSHA else { return nil }
+                return (name, expectedSHA, expectedDefaultBranch, evidence)
+            }
             guard let state = try? git.cleanupBranchState(repositoryPath: preview.repositoryPath, name: name),
                   let expectedSHA, state.sha == expectedSHA,
                   expectedDefaultBranch == nil || state.defaultBranch == expectedDefaultBranch,
@@ -456,6 +460,7 @@ public final class CleanupService: @unchecked Sendable {
 
     private func executeDeleteBranch(repositoryPath: String, canonicalPath: String?, name: String, expectedSHA: String?, expectedDefaultBranch: String?, mergeEvidence: MergeEvidence?, context: CleanupRepositoryContext? = nil) -> Bool {
         let executionRoot = canonicalPath ?? repositoryPath
+        if case .stackedPR = mergeEvidence { return false }
         if case .rebasedEquivalent = mergeEvidence {
             guard let branch = try? git.cleanupBranchState(repositoryPath: executionRoot, name: name,
                     canonicalPath: executionRoot, verifyGitAncestor: false, verifyPatchEquivalence: true, context: context),
@@ -487,6 +492,9 @@ public final class CleanupService: @unchecked Sendable {
         let verifiedNumber: Int?
         if case .githubVerified(let prNumber, _) = mergeEvidence { verifiedNumber = prNumber }
         else { verifiedNumber = nil }
+        let stackedNumber: Int?
+        if case .stackedPR(let prNumber, _) = mergeEvidence { stackedNumber = prNumber }
+        else { stackedNumber = nil }
         guard let expectedSHA else { return false }
         if case .rebasedEquivalent = mergeEvidence {
             guard let current = try? git.cleanupBranchState(repositoryPath: executionRoot, name: name,
@@ -498,7 +506,7 @@ public final class CleanupService: @unchecked Sendable {
             return (try? git.deleteBranchVerified(repositoryPath: executionRoot, branch: name, expectedOldSHA: expectedSHA)) != nil
         }
         let defaultBranch: String
-        if verifiedNumber != nil {
+        if verifiedNumber != nil || stackedNumber != nil {
             guard let expectedDefaultBranch else { return false }
             defaultBranch = expectedDefaultBranch
         } else {
@@ -515,9 +523,14 @@ public final class CleanupService: @unchecked Sendable {
             defaultBranch = currentDefaultBranch
         }
 
-        let verified = try await github.verifyCleanupPullRequest(repositoryPath: executionRoot, branch: name,
-            localSHA: expectedSHA, defaultBranch: defaultBranch, knownNumber: verifiedNumber)
-        guard verified.mergedAt != nil, verifiedNumber == nil || verified.number == verifiedNumber else { return false }
+        if let stackedNumber {
+            guard await github.verifyStackedPRChain(repositoryPath: executionRoot, branch: name, localSHA: expectedSHA,
+                defaultBranch: defaultBranch, status: .unavailable, knownNumber: stackedNumber, maxHops: 8) != nil else { return false }
+        } else {
+            let verified = try await github.verifyCleanupPullRequest(repositoryPath: executionRoot, branch: name,
+                localSHA: expectedSHA, defaultBranch: defaultBranch, knownNumber: verifiedNumber)
+            guard verified.mergedAt != nil, verifiedNumber == nil || verified.number == verifiedNumber else { return false }
+        }
 
         // Re-read local refs after the network round trip; update-ref then enforces the exact old SHA.
         guard let current = try? git.cleanupBranchState(repositoryPath: executionRoot, name: name,
@@ -551,6 +564,15 @@ public final class CleanupService: @unchecked Sendable {
         let knownNumber: Int?
         if case .githubVerified(let number, _) = evidence { knownNumber = number }
         else { knownNumber = nil }
+        let stackedNumber: Int?
+        if case .stackedPR(let number, _) = evidence { stackedNumber = number }
+        else { stackedNumber = nil }
+        if let stackedNumber {
+            guard await github.verifyStackedPRChain(repositoryPath: canonicalPath ?? repositoryPath,
+                branch: branch.name, localSHA: expectedSHA, defaultBranch: defaultBranch,
+                status: .unavailable, knownNumber: stackedNumber, maxHops: 8) != nil else { return nil }
+            return branch.withMergeEvidence(evidence)
+        }
         let verified = try await github.verifyCleanupPullRequest(repositoryPath: canonicalPath ?? repositoryPath,
             branch: branch.name, localSHA: branch.sha, defaultBranch: defaultBranch, knownNumber: knownNumber)
         guard let mergedAt = verified.mergedAt,

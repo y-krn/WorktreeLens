@@ -164,10 +164,130 @@ public final class GitHubService: @unchecked Sendable {
         return selected.model(mergedAt: mergedAt)
     }
 
+    /// Proves a stacked chain by matching each merged PR's exact merge result to the next PR head SHA.
+    /// Branch names only scope candidate discovery; they never establish a link.
+    public func verifyStackedPRChain(repositoryPath: String, branch: String, localSHA: String,
+                                     defaultBranch: String, status: GitHubStatus,
+                                     knownNumber: Int? = nil,
+                                     maxHops: Int = 8,
+                                     timeout: TimeInterval = GitHubService.requestTimeout) async -> GitHubPullRequest? {
+        if let knownNumber, knownNumber <= 0 { return nil }
+        guard (1...Self.stackedMaxHops).contains(maxHops) else { return nil }
+        let statusMatches = status.pullRequests.filter({
+                  $0.state.uppercased() == "MERGED" && $0.mergedAt != nil &&
+                  $0.headRefName == branch && $0.headRefOid == localSHA &&
+                  $0.baseRefName != nil && $0.baseRefName != defaultBranch
+              })
+        guard let target = try? resolver.targets(path: repositoryPath, branches: [BranchInfo(
+                  id: branch, name: branch, sha: localSHA, upstream: nil, ahead: 0, behind: 0,
+                  isMerged: false, remoteGone: false, lastCommitAt: nil, worktrees: [])]).first else { return nil }
+
+        let context: GitHubRequestContext
+        do { context = try await api.requestContext() } catch { return nil }
+        let deadline = Date().addingTimeInterval(timeout)
+        let statusCandidate: GitHubPullRequest?
+        if knownNumber == nil {
+            guard status.mergeEvidenceLoaded, status.error == nil, statusMatches.count == 1,
+                  let candidate = statusMatches.first,
+                  candidate.baseRepositoryName?.caseInsensitiveCompare(target.base.fullName) == .orderedSame,
+                  candidate.headRepositoryName?.caseInsensitiveCompare(target.head.fullName) == .orderedSame,
+                  candidate.baseRepositoryID != nil, candidate.headRepositoryID != nil else { return nil }
+            statusCandidate = candidate
+        } else { statusCandidate = nil }
+        guard let startingNumber = knownNumber ?? statusCandidate?.number else { return nil }
+        let response: GitHubGraphQLResult<CleanupGraphData>
+        do {
+            response = try await api.graphQL(query: stackedStartingQuery(target: target, number: startingNumber),
+                variables: [String: String](), deadline: deadline, context: context, shareInFlight: false)
+        } catch { return nil }
+        guard !response.hasErrors, let base = response.data?.base, let head = response.data?.head,
+              base.nameWithOwner.caseInsensitiveCompare(target.base.fullName) == .orderedSame,
+              head.nameWithOwner.caseInsensitiveCompare(target.head.fullName) == .orderedSame,
+              base.defaultBranchRef?.name == defaultBranch,
+              !(base.isFork == true && !target.explicitBase),
+              let pr = base.pullRequest, pr.number == startingNumber,
+              pr.state.uppercased() == "MERGED", let mergedAtText = pr.mergedAt,
+              let mergedAt = parseCleanupDate(mergedAtText), pr.headRefName == branch,
+              pr.headRefOid == localSHA, let baseRef = pr.baseRefName, baseRef != defaultBranch,
+              pr.baseRepository?.id == base.id, pr.headRepository?.id == head.id,
+              pr.baseRepository?.nameWithOwner.caseInsensitiveCompare(target.base.fullName) == .orderedSame,
+              pr.headRepository?.nameWithOwner.caseInsensitiveCompare(target.head.fullName) == .orderedSame,
+              statusCandidate == nil || (pr.baseRepository?.id == statusCandidate?.baseRepositoryID &&
+                                         pr.headRepository?.id == statusCandidate?.headRepositoryID) else { return nil }
+        let initial = pr.model(mergedAt: mergedAt)
+        guard initial.baseRepositoryID != nil, initial.headRepositoryID != nil else { return nil }
+        guard let startCost = response.data?.rateLimitCost, startCost <= Self.cleanupMaxCost else { return nil }
+        var totalCost = startCost
+        var requestCount = 1
+        var current = initial
+        for _ in 0..<maxHops {
+            guard let baseRef = current.baseRefName else { return nil }
+            if baseRef == defaultBranch { return initial }
+            guard let mergeResult = current.mergeCommitOID, !mergeResult.isEmpty else { return nil }
+            var cursor: String?
+            var matches: [CleanupWirePullRequest] = []
+            var pages = 0
+            repeat {
+                guard pages < Self.stackedMaxPages else { return nil }
+                guard requestCount < Self.stackedMaxRequests else { return nil }
+                pages += 1
+                requestCount += 1
+                let response: GitHubGraphQLResult<CleanupGraphData>
+                do {
+                    response = try await api.graphQL(query: stackedQuery(target: target, headBranch: baseRef, cursor: cursor),
+                        variables: [String: String](), deadline: deadline, context: context, shareInFlight: false)
+                } catch { return nil }
+                guard !response.hasErrors, let base = response.data?.base, let head = response.data?.head,
+                      base.nameWithOwner.caseInsensitiveCompare(target.base.fullName) == .orderedSame,
+                      head.nameWithOwner.caseInsensitiveCompare(target.head.fullName) == .orderedSame,
+                      base.id == initial.baseRepositoryID, head.id == initial.headRepositoryID,
+                      base.defaultBranchRef?.name == defaultBranch,
+                      !(base.isFork == true && !target.explicitBase),
+                      let page = base.pullRequests, let nodes = page.nodes,
+                      !nodes.contains(where: { $0 == nil }) else { return nil }
+                guard let cost = response.data?.rateLimitCost else { return nil }
+                totalCost += cost
+                guard totalCost <= Self.cleanupMaxCost else { return nil }
+                let pageMatches = nodes.compactMap { $0 }.filter {
+                    $0.state.uppercased() == "MERGED" && $0.mergedAt != nil &&
+                    $0.headRefName == baseRef && $0.headRefOid == mergeResult &&
+                    $0.baseRepository?.id == initial.baseRepositoryID &&
+                    $0.baseRepository?.nameWithOwner.caseInsensitiveCompare(target.base.fullName) == .orderedSame &&
+                    $0.headRepository?.id == initial.headRepositoryID &&
+                    $0.headRepository?.nameWithOwner.caseInsensitiveCompare(target.head.fullName) == .orderedSame
+                }
+                matches += pageMatches
+                guard matches.count <= 1 else { return nil }
+                if !page.pageInfo.hasNextPage { break }
+                guard let next = page.pageInfo.endCursor, next != cursor else { return nil }
+                cursor = next
+            } while true
+            guard let next = matches.first, let mergedAtText = next.mergedAt,
+                  let mergedAt = parseCleanupDate(mergedAtText) else { return nil }
+            current = next.model(mergedAt: mergedAt)
+        }
+        return nil
+    }
+
     private static let cleanupMaxRequests = 40
     private static let cleanupMaxPullRequests = 2_000
     private static let cleanupMaxCost = 1_000
+    private static let stackedMaxHops = 8
+    private static let stackedMaxPages = 4
+    private static let stackedMaxRequests = 12
     private static let cleanupPRFields = "number state baseRefName headRefName headRefOid mergedAt url baseRepository { id nameWithOwner } headRepository { id nameWithOwner }"
+    private static let stackedPRFields = "number state baseRefName headRefName headRefOid mergedAt mergeCommit { oid } url baseRepository { id nameWithOwner } headRepository { id nameWithOwner }"
+
+    private func stackedStartingQuery(target: GitHubBranchTarget, number: Int) -> String {
+        func literal(_ value: String) -> String { String(data: try! JSONEncoder().encode(value), encoding: .utf8)! }
+        return "query { base: repository(owner: \(literal(target.base.owner)), name: \(literal(target.base.name))) { id nameWithOwner isFork defaultBranchRef { name } pullRequest(number: \(number)) { \(Self.stackedPRFields) } } head: repository(owner: \(literal(target.head.owner)), name: \(literal(target.head.name))) { id nameWithOwner } rateLimit { cost } }"
+    }
+
+    private func stackedQuery(target: GitHubBranchTarget, headBranch: String, cursor: String?) -> String {
+        func literal(_ value: String) -> String { String(data: try! JSONEncoder().encode(value), encoding: .utf8)! }
+        let after = cursor.map { ", after: \(literal($0))" } ?? ""
+        return "query { base: repository(owner: \(literal(target.base.owner)), name: \(literal(target.base.name))) { id nameWithOwner isFork defaultBranchRef { name } pullRequests(first: 100, states: [MERGED], headRefName: \(literal(headBranch)), orderBy: {field: UPDATED_AT, direction: DESC}\(after)) { nodes { \(Self.stackedPRFields) } pageInfo { hasNextPage endCursor } } } head: repository(owner: \(literal(target.head.owner)), name: \(literal(target.head.name))) { id nameWithOwner } rateLimit { cost } }"
+    }
 
     private func parseCleanupDate(_ value: String) -> Date? {
         let formatter = ISO8601DateFormatter()
@@ -224,9 +344,12 @@ private struct CleanupGraphRepository: Decodable, Sendable {
     let id: String
     let nameWithOwner: String
     let isFork: Bool?
+    let defaultBranchRef: CleanupDefaultBranchRef?
     let pullRequest: CleanupWirePullRequest?
     let pullRequests: CleanupPullRequestPage?
 }
+
+private struct CleanupDefaultBranchRef: Decodable, Sendable { let name: String }
 
 private struct CleanupPullRequestPage: Decodable, Sendable {
     let nodes: [CleanupWirePullRequest?]?
@@ -250,6 +373,7 @@ private struct CleanupWirePullRequest: Decodable, Sendable {
     let headRefName: String?
     let headRefOid: String?
     let mergedAt: String?
+    let mergeCommit: CleanupOID?
     let url: String?
     let baseRepository: CleanupWireRepository?
     let headRepository: CleanupWireRepository?
@@ -258,6 +382,9 @@ private struct CleanupWirePullRequest: Decodable, Sendable {
                           baseRefName: baseRefName, headRefName: headRefName, headRefOid: headRefOid,
                           mergedAt: mergedAt, url: URL(string: url ?? ""),
                           baseRepositoryID: baseRepository?.id, headRepositoryID: headRepository?.id,
-                          baseRepositoryName: baseRepository?.nameWithOwner, headRepositoryName: headRepository?.nameWithOwner)
+                          baseRepositoryName: baseRepository?.nameWithOwner, headRepositoryName: headRepository?.nameWithOwner,
+                          mergeCommitOID: mergeCommit?.oid)
     }
 }
+
+private struct CleanupOID: Decodable, Sendable { let oid: String }

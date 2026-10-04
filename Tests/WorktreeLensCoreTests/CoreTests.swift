@@ -953,6 +953,82 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(results["unknown"]?.mergeEvidence, .verificationUnavailable)
     }
 
+    func testStackedPRChainUsesExactMergeResultToNextHeadSHA() async throws {
+        let localSHA = "e20e8a9450997310878283b284b1391e0e484587"
+        let firstMerge = "f3c604a975a9abed29713565d41bceb6ee9c9c22"
+        let first = displayPR(number: 1763, branch: "codex/issue-1752-phase4c-4jb-trial", sha: localSHA,
+            base: "issue-1753-phase3-trial", mergeCommit: firstMerge)
+        let second = displayPR(number: 1757, branch: "issue-1753-phase3-trial", sha: firstMerge,
+            base: "main", mergeCommit: "a26e13665626314020648b3ea9f8975c58ac2504")
+        let branch = displayBranch("codex/issue-1752-phase4c-4jb-trial", sha: localSHA)
+        let local = RepositoryLocalScanResult(snapshot: RepositorySnapshot(path: "/tmp/repository", defaultBranch: "main", branches: [branch]), sessionNotes: [])
+        let (github, transport) = scannerDisplayFixture(pr: try JSONSerialization.data(withJSONObject: [first, second]))
+
+        let refreshed = await RepositoryScanService(github: github).enrichGitHub(local: local)
+
+        XCTAssertEqual(refreshed.branches.first?.mergeEvidence,
+            .stackedPR(prNumber: 1763, mergedAt: Date(timeIntervalSince1970: 1_767_225_600)))
+        XCTAssertEqual(refreshed.branches.first?.mergeStatus, "Merged · stacked PR")
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 3, "one bulk summary plus targeted starting-PR and exact-SHA hop lookups")
+        let startQuery = try displayQuery(requests[1])
+        XCTAssertTrue(startQuery.contains("pullRequest(number: 1763)"))
+        let hopQuery = try displayQuery(requests[2])
+        XCTAssertTrue(hopQuery.contains("headRefName: \"issue-1753-phase3-trial\""))
+        XCTAssertTrue(hopQuery.contains("headRefOid"))
+        XCTAssertTrue(hopQuery.contains("mergeCommit { oid }"))
+    }
+
+    func testStackedPRChainRejectsBrokenOrAmbiguousExactSHAHop() async throws {
+        let localSHA = "e20e8a9450997310878283b284b1391e0e484587"
+        let firstMerge = "f3c604a975a9abed29713565d41bceb6ee9c9c22"
+        let first = displayPR(number: 1763, branch: "codex/issue-1752-phase4c-4jb-trial", sha: localSHA,
+            base: "issue-1753-phase3-trial", mergeCommit: firstMerge)
+        let wrong = displayPR(number: 1757, branch: "issue-1753-phase3-trial", sha: "different-sha", base: "main",
+            mergeCommit: "a26e13665626314020648b3ea9f8975c58ac2504")
+        let duplicate = displayPR(number: 1758, branch: "issue-1753-phase3-trial", sha: firstMerge, base: "main",
+            mergeCommit: "a26e13665626314020648b3ea9f8975c58ac2504")
+        let exact = displayPR(number: 1757, branch: "issue-1753-phase3-trial", sha: firstMerge, base: "main",
+            mergeCommit: "a26e13665626314020648b3ea9f8975c58ac2504")
+        let branch = displayBranch("codex/issue-1752-phase4c-4jb-trial", sha: localSHA)
+        let (brokenGitHub, _) = scannerDisplayFixture(pr: try JSONSerialization.data(withJSONObject: [first, wrong]))
+        let brokenStatus = await brokenGitHub.summariesAsync(repositoryPath: "/tmp/repository", branches: [branch])
+        let brokenResult = await brokenGitHub.verifyStackedPRChain(repositoryPath: "/tmp/repository", branch: branch.name,
+            localSHA: localSHA, defaultBranch: "main", status: brokenStatus[branch.id] ?? .unavailable, maxHops: 4)
+        XCTAssertNil(brokenResult)
+
+        let (ambiguousGitHub, _) = scannerDisplayFixture(pr: try JSONSerialization.data(withJSONObject: [first, exact, duplicate]))
+        let ambiguousStatus = await ambiguousGitHub.summariesAsync(repositoryPath: "/tmp/repository", branches: [branch])
+        let ambiguousResult = await ambiguousGitHub.verifyStackedPRChain(repositoryPath: "/tmp/repository", branch: branch.name,
+            localSHA: localSHA, defaultBranch: "main", status: ambiguousStatus[branch.id] ?? .unavailable, maxHops: 4)
+        XCTAssertNil(ambiguousResult)
+    }
+
+    func testStackedPRCleanupRechecksExactChainBeforeSHADeletion() async throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let local = try GitService().snapshot(repositoryPath: fixture.repository.path)
+        let branch = try XCTUnwrap(local.branches.first { $0.name == "feature" })
+            .withMergeEvidence(.stackedPR(prNumber: 1763, mergedAt: Date(timeIntervalSince1970: 1)))
+            .withRemoteGone(true)
+        let preview = CleanupService().previewDeleteBranch(
+            snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch]), name: "feature")
+        XCTAssertTrue(preview.items[0].allowed)
+
+        let firstMerge = "f3c604a975a9abed29713565d41bceb6ee9c9c22"
+        let first = displayPR(number: 1763, branch: "feature", sha: fixture.featureSHA,
+            base: "feature-parent", mergeCommit: firstMerge)
+        let next = displayPR(number: 1757, branch: "feature-parent", sha: firstMerge,
+            base: "main", mergeCommit: "a26e13665626314020648b3ea9f8975c58ac2504")
+        let (github, transport) = scannerDisplayFixture(pr: try JSONSerialization.data(withJSONObject: [first, next]))
+        let result = await CleanupService(github: github).executeAsync(preview)
+
+        XCTAssertEqual(result.deletedLocalBranches, ["feature"])
+        XCTAssertFalse(try GitService().snapshot(repositoryPath: fixture.repository.path).branches.contains { $0.name == "feature" })
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 2, "fresh starting PR plus exact merge-result hop")
+    }
+
     func testDetailIdentityRefreshKeepsPatchEvidenceOnlyWhenSHAIsUnchanged() {
         let identity = GitBranchRefreshIdentity(branchName: "feature", sha: "same-sha", upstream: nil,
             upstreamSHA: nil, configurationFingerprint: "config")
@@ -963,6 +1039,18 @@ final class CoreTests: XCTestCase {
         let changed = GitBranchRefreshIdentity(branchName: "feature", sha: "new-sha", upstream: nil,
             upstreamSHA: nil, configurationFingerprint: "config")
         XCTAssertEqual(displayBranch("feature", sha: "same-sha").withMergeEvidence(.rebasedEquivalent)
+            .withRefreshIdentity(changed).mergeEvidence, .none)
+    }
+
+    func testDetailIdentityRefreshRetainsStackedPREvidenceOnlyForExactSHA() {
+        let same = GitBranchRefreshIdentity(branchName: "feature", sha: "same-sha", upstream: nil,
+            upstreamSHA: nil, configurationFingerprint: "config")
+        let evidence = MergeEvidence.stackedPR(prNumber: 1763, mergedAt: Date(timeIntervalSince1970: 1))
+        XCTAssertEqual(displayBranch("feature", sha: "same-sha").withMergeEvidence(evidence)
+            .withRefreshIdentity(same).mergeEvidence, evidence)
+        let changed = GitBranchRefreshIdentity(branchName: "feature", sha: "changed-sha", upstream: nil,
+            upstreamSHA: nil, configurationFingerprint: "config")
+        XCTAssertEqual(displayBranch("feature", sha: "same-sha").withMergeEvidence(evidence)
             .withRefreshIdentity(changed).mergeEvidence, .none)
     }
 
