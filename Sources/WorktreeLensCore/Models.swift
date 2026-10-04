@@ -116,6 +116,7 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
         switch mergeEvidence {
         case .gitAncestor: return "Merged · Git"
         case .githubVerified(let prNumber, _): return "Merged · GitHub verified · PR #\(prNumber)"
+        case .stackedPR: return "Merged · stacked PR"
         case .rebasedEquivalent: return "Integrated · rebased equivalent"
         case .uniqueCommitsRemain: return "Unique commits remain"
         case .verificationUnavailable: return "Verification unavailable"
@@ -162,6 +163,7 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
 public enum MergeEvidence: Hashable, Sendable {
     case gitAncestor
     case githubVerified(prNumber: Int, mergedAt: Date)
+    case stackedPR(prNumber: Int, mergedAt: Date)
     case rebasedEquivalent
     case uniqueCommitsRemain
     case verificationUnavailable
@@ -169,7 +171,7 @@ public enum MergeEvidence: Hashable, Sendable {
 
     public var isMerged: Bool {
         switch self {
-        case .gitAncestor, .githubVerified, .rebasedEquivalent: return true
+        case .gitAncestor, .githubVerified, .stackedPR, .rebasedEquivalent: return true
         case .uniqueCommitsRemain, .verificationUnavailable, .none: return false
         }
     }
@@ -286,6 +288,7 @@ public struct GitHubPullRequest: Identifiable, Hashable, Sendable {
     public let headRefName: String?
     public let headRefOid: String?
     public let mergedAt: Date?
+    public let mergeCommitOID: String?
     public let url: URL?
 
     public let baseRepositoryID: String?
@@ -298,7 +301,7 @@ public struct GitHubPullRequest: Identifiable, Hashable, Sendable {
 
     public init(id: String, number: Int, title: String, state: String, isDraft: Bool, baseRefName: String?, headRefName: String?, headRefOid: String?, mergedAt: Date?, url: URL?, baseRepositoryID: String? = nil, headRepositoryID: String? = nil,
                 baseRepositoryName: String? = nil, headRepositoryName: String? = nil, mergeStateStatus: String? = nil,
-                mergeable: String? = nil, testMergeSHA: String? = nil) {
+                mergeable: String? = nil, testMergeSHA: String? = nil, mergeCommitOID: String? = nil) {
         self.id = id
         self.number = number
         self.title = title
@@ -308,6 +311,7 @@ public struct GitHubPullRequest: Identifiable, Hashable, Sendable {
         self.headRefName = headRefName
         self.headRefOid = headRefOid
         self.mergedAt = mergedAt
+        self.mergeCommitOID = mergeCommitOID
         self.url = url
         self.baseRepositoryID = baseRepositoryID; self.headRepositoryID = headRepositoryID
         self.baseRepositoryName = baseRepositoryName; self.headRepositoryName = headRepositoryName

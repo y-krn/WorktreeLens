@@ -42,9 +42,10 @@ func displayRepo(_ fields: [String: Any], fork: Bool = false) -> [String: Any] {
 func displayPage(_ nodes: [[String: Any]], next: String? = nil) -> [String: Any] {
     ["nodes": nodes, "pageInfo": ["hasNextPage": next != nil, "endCursor": next as Any? ?? NSNull()]]
 }
-func displayPR(number: Int = 201, branch: String = "feature", sha: String = "local-sha", head: String = "example/repo", baseID: String = "BASE", base: String = "main") -> [String: Any] {
+func displayPR(number: Int = 201, branch: String = "feature", sha: String = "local-sha", head: String = "example/repo", baseID: String = "BASE", base: String = "main", mergeCommit: String? = nil) -> [String: Any] {
     ["id": "PR-\(number)", "number": number, "title": "Feature", "state": "MERGED", "isDraft": false,
      "baseRefName": base, "headRefName": branch, "headRefOid": sha, "mergedAt": "2026-01-01T00:00:00Z",
+     "mergeCommit": mergeCommit.map { ["oid": $0] as Any } ?? NSNull(),
      "url": "https://github.com/example/repo/pull/\(number)", "baseRepository": ["id": baseID, "nameWithOwner": "example/repo"],
      "headRepository": ["id": head == "example/repo" ? "BASE" : "FORK", "nameWithOwner": head]]
 }
@@ -85,7 +86,7 @@ func scannerDisplayFixture(pr: Data, cleanupNodes: [Any]? = nil,
                 (requestedBranch == nil || raw["headRefName"] as? String == requestedBranch)
             }
             let selected = candidates.first
-            var base = displayRepo(["isFork": false])
+            var base = displayRepo(["isFork": false, "defaultBranchRef": ["name": "main"]])
             if requestedNumber != nil { base["pullRequest"] = selected as Any? ?? NSNull() }
             else { base["pullRequests"] = displayPage(candidates) }
             if requestedNumber == nil, let cleanupNodes,

@@ -221,6 +221,7 @@ final class ApplicationModel: ObservableObject {
             let branches = snapshot.branches.map { branch -> BranchInfo in
                 let evidence: MergeEvidence
                 if case .githubVerified = branch.mergeEvidence { evidence = .none }
+                else if case .stackedPR = branch.mergeEvidence { evidence = .none }
                 else { evidence = branch.mergeEvidence }
                 return branch.withMergeEvidence(evidence, github: .unavailable)
             }
@@ -473,8 +474,17 @@ final class ApplicationModel: ObservableObject {
         githubDetailTaskPath = path
         let refreshToken = self.refreshToken
         let detailLoader = self.detailLoader
+        let github = self.github
         githubDetailTask = Task.detached(priority: .utility) {
             let status = await detailLoader.statusAsync(repositoryPath: path, branchInfo: branch, timeout: GitHubService.requestTimeout)
+            let stacked: GitHubPullRequest?
+            if case .gitAncestor = branch.mergeEvidence { stacked = nil }
+            else if let defaultBranch = snapshot.defaultBranch,
+               status.verifiedMergedPullRequest(defaultBranch: defaultBranch, branchName: branch.name, localSHA: branch.sha) == nil,
+               status.pullRequests.contains(where: { $0.state.uppercased() == "MERGED" && $0.mergedAt != nil && $0.baseRefName != defaultBranch && $0.headRefName == branch.name && $0.headRefOid == branch.sha }) {
+                stacked = await github.verifyStackedPRChain(repositoryPath: path, branch: branch.name, localSHA: branch.sha,
+                    defaultBranch: defaultBranch, status: status)
+            } else { stacked = nil }
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard self.githubDetailToken == token,
@@ -491,7 +501,15 @@ final class ApplicationModel: ObservableObject {
                 guard let snapshot = self.snapshot,
                       let index = snapshot.branches.firstIndex(where: { $0.id == branchID && $0.sha == branch.sha }) else { return }
                 var branches = snapshot.branches
-                branches[index] = branches[index].resolvingMergeEvidence(defaultBranch: snapshot.defaultBranch, status: status)
+                var updated = branches[index].resolvingMergeEvidence(defaultBranch: snapshot.defaultBranch, status: status)
+                if case .stackedPR = branches[index].mergeEvidence,
+                   case .stackedPR = updated.mergeEvidence, stacked == nil {
+                    updated = updated.withMergeEvidence(.none, github: status)
+                }
+                if let stacked, let pr = status.pullRequests.first(where: { $0.number == stacked.number }), let mergedAt = pr.mergedAt {
+                    updated = updated.withMergeEvidence(.stackedPR(prNumber: stacked.number, mergedAt: mergedAt), github: status)
+                }
+                branches[index] = updated
                 self.snapshot = RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: branches, refreshedAt: snapshot.refreshedAt)
                 self.saveCurrentView()
                 self.githubDetailTask = nil
@@ -549,12 +567,28 @@ final class ApplicationModel: ObservableObject {
         let status = await detailLoader.refreshStatusAsync(repositoryPath: target.path, branchInfo: requestBranch,
                                                            timeout: GitHubService.requestTimeout)
         guard status.localSHA == nil || status.localSHA == target.sha else { return nil }
+        let stacked: GitHubPullRequest?
+        if case .gitAncestor = requestBranch.mergeEvidence { stacked = nil }
+        else if let defaultBranch = currentSnapshot.defaultBranch,
+           status.verifiedMergedPullRequest(defaultBranch: defaultBranch, branchName: requestBranch.name, localSHA: requestBranch.sha) == nil,
+           status.pullRequests.contains(where: { $0.state.uppercased() == "MERGED" && $0.mergedAt != nil && $0.baseRefName != defaultBranch && $0.headRefName == requestBranch.name && $0.headRefOid == requestBranch.sha }) {
+            stacked = await github.verifyStackedPRChain(repositoryPath: target.path, branch: requestBranch.name,
+                localSHA: requestBranch.sha, defaultBranch: defaultBranch, status: status)
+        } else { stacked = nil }
         guard githubDetailToken == token, selectedPath == target.path, selectedBranchID == target.branchID,
               let latest = snapshot, latest.path == target.path,
               let latestIndex = latest.branches.firstIndex(where: { $0.id == target.branchID && $0.sha == target.sha }) else { return nil }
         var branches = latest.branches
         let updatedBranch = branches[latestIndex]
-        branches[latestIndex] = updatedBranch.resolvingMergeEvidence(defaultBranch: latest.defaultBranch, status: status)
+        var resolved = updatedBranch.resolvingMergeEvidence(defaultBranch: latest.defaultBranch, status: status)
+        if case .stackedPR = updatedBranch.mergeEvidence,
+           case .stackedPR = resolved.mergeEvidence, stacked == nil {
+            resolved = resolved.withMergeEvidence(.none, github: status)
+        }
+        if let stacked, let pr = status.pullRequests.first(where: { $0.number == stacked.number }), let mergedAt = pr.mergedAt {
+            resolved = resolved.withMergeEvidence(.stackedPR(prNumber: stacked.number, mergedAt: mergedAt), github: status)
+        }
+        branches[latestIndex] = resolved
         snapshot = RepositorySnapshot(path: latest.path, defaultBranch: latest.defaultBranch,
                                       branches: branches, refreshedAt: latest.refreshedAt)
         saveCurrentView()
