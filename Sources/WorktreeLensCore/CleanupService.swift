@@ -525,7 +525,7 @@ public final class CleanupService: @unchecked Sendable {
 
         if let stackedNumber {
             guard await github.verifyStackedPRChain(repositoryPath: executionRoot, branch: name, localSHA: expectedSHA,
-                defaultBranch: defaultBranch, status: .unavailable, knownNumber: stackedNumber, maxHops: 8) != nil else { return false }
+                defaultBranch: defaultBranch, status: .unavailable, knownNumber: stackedNumber) != nil else { return false }
         } else {
             let verified = try await github.verifyCleanupPullRequest(repositoryPath: executionRoot, branch: name,
                 localSHA: expectedSHA, defaultBranch: defaultBranch, knownNumber: verifiedNumber)
@@ -570,7 +570,7 @@ public final class CleanupService: @unchecked Sendable {
         if let stackedNumber {
             guard await github.verifyStackedPRChain(repositoryPath: canonicalPath ?? repositoryPath,
                 branch: branch.name, localSHA: expectedSHA, defaultBranch: defaultBranch,
-                status: .unavailable, knownNumber: stackedNumber, maxHops: 8) != nil else { return nil }
+                status: .unavailable, knownNumber: stackedNumber) != nil else { return nil }
             return branch.withMergeEvidence(evidence)
         }
         let verified = try await github.verifyCleanupPullRequest(repositoryPath: canonicalPath ?? repositoryPath,

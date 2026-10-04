@@ -58,7 +58,7 @@ public final class RepositoryScanService: @unchecked Sendable, RepositoryScannin
         guard !Task.isCancelled else { return local.snapshot }
         progress(1, 1)
         var enrichedBranches: [BranchInfo] = []
-        var stackedCandidates = 0
+        let stackedBudget = GitHubStackedPRBudget()
         for branch in local.snapshot.branches {
             guard !branch.isDetachedGroup else { enrichedBranches.append(branch); continue }
             let status = statuses[branch.id] ?? .unavailable
@@ -70,16 +70,14 @@ public final class RepositoryScanService: @unchecked Sendable, RepositoryScannin
             }
             if enriched.mergeEvidence != .gitAncestor,
                let defaultBranch = local.snapshot.defaultBranch,
-               stackedCandidates < 2,
                let pr = status.pullRequests.first(where: {
                    $0.state.uppercased() == "MERGED" && $0.mergedAt != nil &&
                    $0.headRefName == branch.name && $0.headRefOid == branch.sha &&
                    $0.baseRefName != nil && $0.baseRefName != defaultBranch
                }) {
-                stackedCandidates += 1
                 if await github.verifyStackedPRChain(repositoryPath: local.snapshot.path,
                     branch: branch.name, localSHA: branch.sha, defaultBranch: defaultBranch,
-                    status: status, maxHops: 4) != nil, let mergedAt = pr.mergedAt {
+                    status: status, budget: stackedBudget) != nil, let mergedAt = pr.mergedAt {
                     enriched = enriched.withMergeEvidence(.stackedPR(prNumber: pr.number, mergedAt: mergedAt))
                 }
             }

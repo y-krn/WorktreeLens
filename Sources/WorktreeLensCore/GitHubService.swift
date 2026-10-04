@@ -1,5 +1,32 @@
 import Foundation
 
+public final class GitHubStackedPRBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maxRequests: Int
+    private let maxCost: Int
+    private var requests = 0
+    private var cost = 0
+
+    public init(maxRequests: Int = 12, maxCost: Int = 1_000) {
+        self.maxRequests = max(0, maxRequests)
+        self.maxCost = max(0, maxCost)
+    }
+
+    fileprivate func reserveRequest() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard requests < maxRequests, cost < maxCost else { return false }
+        requests += 1
+        return true
+    }
+
+    fileprivate func recordCost(_ value: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard value >= 0 else { return false }
+        cost += value
+        return cost <= maxCost
+    }
+}
+
 public final class GitHubService: @unchecked Sendable {
     private let api: GitHubAPIClient
     private let display: GitHubDisplayService
@@ -21,6 +48,7 @@ public final class GitHubService: @unchecked Sendable {
     }
 
     public static let requestTimeout: TimeInterval = 10
+    public static let stackedPRChainHopLimit = 8
 
     public func summariesAsync(repositoryPath: String, branches: [BranchInfo], timeout: TimeInterval = GitHubService.requestTimeout) async -> [String: GitHubStatus] {
         do {
@@ -169,10 +197,9 @@ public final class GitHubService: @unchecked Sendable {
     public func verifyStackedPRChain(repositoryPath: String, branch: String, localSHA: String,
                                      defaultBranch: String, status: GitHubStatus,
                                      knownNumber: Int? = nil,
-                                     maxHops: Int = 8,
+                                     budget: GitHubStackedPRBudget = GitHubStackedPRBudget(),
                                      timeout: TimeInterval = GitHubService.requestTimeout) async -> GitHubPullRequest? {
         if let knownNumber, knownNumber <= 0 { return nil }
-        guard (1...Self.stackedMaxHops).contains(maxHops) else { return nil }
         let statusMatches = status.pullRequests.filter({
                   $0.state.uppercased() == "MERGED" && $0.mergedAt != nil &&
                   $0.headRefName == branch && $0.headRefOid == localSHA &&
@@ -195,6 +222,7 @@ public final class GitHubService: @unchecked Sendable {
             statusCandidate = candidate
         } else { statusCandidate = nil }
         guard let startingNumber = knownNumber ?? statusCandidate?.number else { return nil }
+        guard budget.reserveRequest() else { return nil }
         let response: GitHubGraphQLResult<CleanupGraphData>
         do {
             response = try await api.graphQL(query: stackedStartingQuery(target: target, number: startingNumber),
@@ -216,11 +244,9 @@ public final class GitHubService: @unchecked Sendable {
                                          pr.headRepository?.id == statusCandidate?.headRepositoryID) else { return nil }
         let initial = pr.model(mergedAt: mergedAt)
         guard initial.baseRepositoryID != nil, initial.headRepositoryID != nil else { return nil }
-        guard let startCost = response.data?.rateLimitCost, startCost <= Self.cleanupMaxCost else { return nil }
-        var totalCost = startCost
-        var requestCount = 1
+        guard let startCost = response.data?.rateLimitCost, budget.recordCost(startCost) else { return nil }
         var current = initial
-        for _ in 0..<maxHops {
+        for _ in 0..<Self.stackedPRChainHopLimit {
             guard let baseRef = current.baseRefName else { return nil }
             if baseRef == defaultBranch { return initial }
             guard let mergeResult = current.mergeCommitOID, !mergeResult.isEmpty else { return nil }
@@ -229,9 +255,8 @@ public final class GitHubService: @unchecked Sendable {
             var pages = 0
             repeat {
                 guard pages < Self.stackedMaxPages else { return nil }
-                guard requestCount < Self.stackedMaxRequests else { return nil }
+                guard budget.reserveRequest() else { return nil }
                 pages += 1
-                requestCount += 1
                 let response: GitHubGraphQLResult<CleanupGraphData>
                 do {
                     response = try await api.graphQL(query: stackedQuery(target: target, headBranch: baseRef, cursor: cursor),
@@ -245,9 +270,7 @@ public final class GitHubService: @unchecked Sendable {
                       !(base.isFork == true && !target.explicitBase),
                       let page = base.pullRequests, let nodes = page.nodes,
                       !nodes.contains(where: { $0 == nil }) else { return nil }
-                guard let cost = response.data?.rateLimitCost else { return nil }
-                totalCost += cost
-                guard totalCost <= Self.cleanupMaxCost else { return nil }
+                guard let cost = response.data?.rateLimitCost, budget.recordCost(cost) else { return nil }
                 let pageMatches = nodes.compactMap { $0 }.filter {
                     $0.state.uppercased() == "MERGED" && $0.mergedAt != nil &&
                     $0.headRefName == baseRef && $0.headRefOid == mergeResult &&
@@ -265,6 +288,7 @@ public final class GitHubService: @unchecked Sendable {
             guard let next = matches.first, let mergedAtText = next.mergedAt,
                   let mergedAt = parseCleanupDate(mergedAtText) else { return nil }
             current = next.model(mergedAt: mergedAt)
+            if current.baseRefName == defaultBranch { return initial }
         }
         return nil
     }
@@ -272,9 +296,7 @@ public final class GitHubService: @unchecked Sendable {
     private static let cleanupMaxRequests = 40
     private static let cleanupMaxPullRequests = 2_000
     private static let cleanupMaxCost = 1_000
-    private static let stackedMaxHops = 8
     private static let stackedMaxPages = 4
-    private static let stackedMaxRequests = 12
     private static let cleanupPRFields = "number state baseRefName headRefName headRefOid mergedAt url baseRepository { id nameWithOwner } headRepository { id nameWithOwner }"
     private static let stackedPRFields = "number state baseRefName headRefName headRefOid mergedAt mergeCommit { oid } url baseRepository { id nameWithOwner } headRepository { id nameWithOwner }"
 

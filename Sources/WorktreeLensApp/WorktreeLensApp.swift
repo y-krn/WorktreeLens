@@ -483,7 +483,7 @@ final class ApplicationModel: ObservableObject {
                status.verifiedMergedPullRequest(defaultBranch: defaultBranch, branchName: branch.name, localSHA: branch.sha) == nil,
                status.pullRequests.contains(where: { $0.state.uppercased() == "MERGED" && $0.mergedAt != nil && $0.baseRefName != defaultBranch && $0.headRefName == branch.name && $0.headRefOid == branch.sha }) {
                 stacked = await github.verifyStackedPRChain(repositoryPath: path, branch: branch.name, localSHA: branch.sha,
-                    defaultBranch: defaultBranch, status: status, maxHops: 4)
+                    defaultBranch: defaultBranch, status: status)
             } else { stacked = nil }
             guard !Task.isCancelled else { return }
             await MainActor.run {
@@ -573,7 +573,7 @@ final class ApplicationModel: ObservableObject {
            status.verifiedMergedPullRequest(defaultBranch: defaultBranch, branchName: requestBranch.name, localSHA: requestBranch.sha) == nil,
            status.pullRequests.contains(where: { $0.state.uppercased() == "MERGED" && $0.mergedAt != nil && $0.baseRefName != defaultBranch && $0.headRefName == requestBranch.name && $0.headRefOid == requestBranch.sha }) {
             stacked = await github.verifyStackedPRChain(repositoryPath: target.path, branch: requestBranch.name,
-                localSHA: requestBranch.sha, defaultBranch: defaultBranch, status: status, maxHops: 4)
+                localSHA: requestBranch.sha, defaultBranch: defaultBranch, status: status)
         } else { stacked = nil }
         guard githubDetailToken == token, selectedPath == target.path, selectedBranchID == target.branchID,
               let latest = snapshot, latest.path == target.path,
