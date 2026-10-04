@@ -228,6 +228,7 @@ public final class GitHubService: @unchecked Sendable {
             response = try await api.graphQL(query: stackedStartingQuery(target: target, number: startingNumber),
                 variables: [String: String](), deadline: deadline, context: context, shareInFlight: false)
         } catch { return nil }
+        guard let startCost = response.data?.rateLimitCost, budget.recordCost(startCost) else { return nil }
         guard !response.hasErrors, let base = response.data?.base, let head = response.data?.head,
               base.nameWithOwner.caseInsensitiveCompare(target.base.fullName) == .orderedSame,
               head.nameWithOwner.caseInsensitiveCompare(target.head.fullName) == .orderedSame,
@@ -244,7 +245,6 @@ public final class GitHubService: @unchecked Sendable {
                                          pr.headRepository?.id == statusCandidate?.headRepositoryID) else { return nil }
         let initial = pr.model(mergedAt: mergedAt)
         guard initial.baseRepositoryID != nil, initial.headRepositoryID != nil else { return nil }
-        guard let startCost = response.data?.rateLimitCost, budget.recordCost(startCost) else { return nil }
         var current = initial
         for _ in 0..<Self.stackedPRChainHopLimit {
             guard let baseRef = current.baseRefName else { return nil }
@@ -262,6 +262,7 @@ public final class GitHubService: @unchecked Sendable {
                     response = try await api.graphQL(query: stackedQuery(target: target, headBranch: baseRef, cursor: cursor),
                         variables: [String: String](), deadline: deadline, context: context, shareInFlight: false)
                 } catch { return nil }
+                guard let cost = response.data?.rateLimitCost, budget.recordCost(cost) else { return nil }
                 guard !response.hasErrors, let base = response.data?.base, let head = response.data?.head,
                       base.nameWithOwner.caseInsensitiveCompare(target.base.fullName) == .orderedSame,
                       head.nameWithOwner.caseInsensitiveCompare(target.head.fullName) == .orderedSame,
@@ -270,7 +271,6 @@ public final class GitHubService: @unchecked Sendable {
                       !(base.isFork == true && !target.explicitBase),
                       let page = base.pullRequests, let nodes = page.nodes,
                       !nodes.contains(where: { $0 == nil }) else { return nil }
-                guard let cost = response.data?.rateLimitCost, budget.recordCost(cost) else { return nil }
                 let pageMatches = nodes.compactMap { $0 }.filter {
                     $0.state.uppercased() == "MERGED" && $0.mergedAt != nil &&
                     $0.headRefName == baseRef && $0.headRefOid == mergeResult &&
