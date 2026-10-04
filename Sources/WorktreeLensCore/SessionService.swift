@@ -15,11 +15,15 @@ public protocol SessionDiscovering: Sendable {
     func makeCleanupSafetyCache() -> SessionCleanupSafetyCache?
     /// Current working directory of every readable process, or nil when it cannot be determined.
     func processWorkingDirectories() -> [String]?
+    func worktreeProcesses() -> [WorktreeProcess]?
 }
 
 public extension SessionDiscovering {
     func makeCleanupSafetyCache() -> SessionCleanupSafetyCache? { nil }
     func processWorkingDirectories() -> [String]? { nil }
+    func worktreeProcesses() -> [WorktreeProcess]? {
+        processWorkingDirectories()?.map { WorktreeProcess(pid: 0, cwd: $0) }
+    }
 }
 
 public protocol SessionCleanupSafetyChecking: Sendable {
@@ -286,6 +290,19 @@ public struct ProcessActivityProbe: SessionActivityProbing {
 
     public func workingDirectories() -> [String]? {
         processCwds().map { Array($0.values) }
+    }
+
+    public func worktreeProcesses() -> [WorktreeProcess]? {
+        guard let cwds = processCwds(),
+              let ps = try? runner.run("/bin/ps", arguments: ["-axo", "pid=,command="], currentDirectory: nil), ps.succeeded else { return nil }
+        var commands: [Int: String] = [:]
+        for line in ps.stdout.split(whereSeparator: \.isNewline) {
+            let fields = line.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+            guard fields.count == 2, let pid = Int(fields[0]) else { continue }
+            commands[pid] = String(fields[1])
+        }
+        return cwds.map { pid, cwd in WorktreeProcess(pid: pid, command: commands[pid], cwd: cwd) }
+            .sorted { $0.pid < $1.pid }
     }
 
     private func processCwds() -> [Int: String]? {
@@ -800,6 +817,10 @@ public final class SessionService: @unchecked Sendable, SessionDiscovering {
 
     public func processWorkingDirectories() -> [String]? {
         processProbe.workingDirectories()
+    }
+
+    public func worktreeProcesses() -> [WorktreeProcess]? {
+        processProbe.worktreeProcesses()
     }
 
     private func rawThreadID(_ session: SessionRecord) -> String {

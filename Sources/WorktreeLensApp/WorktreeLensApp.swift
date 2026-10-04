@@ -220,8 +220,8 @@ final class ApplicationModel: ObservableObject {
         func withoutGitHub(_ snapshot: RepositorySnapshot) -> RepositorySnapshot {
             let branches = snapshot.branches.map { branch -> BranchInfo in
                 let evidence: MergeEvidence
-                if case .gitAncestor = branch.mergeEvidence { evidence = .gitAncestor }
-                else { evidence = .none }
+                if case .githubVerified = branch.mergeEvidence { evidence = .none }
+                else { evidence = branch.mergeEvidence }
                 return branch.withMergeEvidence(evidence, github: .unavailable)
             }
             return RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch,
@@ -491,7 +491,7 @@ final class ApplicationModel: ObservableObject {
                 guard let snapshot = self.snapshot,
                       let index = snapshot.branches.firstIndex(where: { $0.id == branchID && $0.sha == branch.sha }) else { return }
                 var branches = snapshot.branches
-                branches[index] = branches[index].withGitHubStatus(status)
+                branches[index] = branches[index].resolvingMergeEvidence(defaultBranch: snapshot.defaultBranch, status: status)
                 self.snapshot = RepositorySnapshot(path: snapshot.path, defaultBranch: snapshot.defaultBranch, branches: branches, refreshedAt: snapshot.refreshedAt)
                 self.saveCurrentView()
                 self.githubDetailTask = nil
@@ -531,7 +531,7 @@ final class ApplicationModel: ObservableObject {
         }
     }
 
-    private func performAutomaticGitHubRefresh(_ target: RefreshTarget) async -> GitHubStatus? {
+    func performAutomaticGitHubRefresh(_ target: RefreshTarget) async -> GitHubStatus? {
         guard selectedPath == target.path, selectedBranchID == target.branchID,
               let currentSnapshot = snapshot, currentSnapshot.path == target.path,
               let index = currentSnapshot.branches.firstIndex(where: { $0.id == target.branchID && $0.name == target.branchName && $0.sha == target.sha }) else { return nil }
@@ -554,17 +554,7 @@ final class ApplicationModel: ObservableObject {
               let latestIndex = latest.branches.firstIndex(where: { $0.id == target.branchID && $0.sha == target.sha }) else { return nil }
         var branches = latest.branches
         let updatedBranch = branches[latestIndex]
-        let evidence: MergeEvidence
-        if case .gitAncestor = updatedBranch.mergeEvidence {
-            evidence = .gitAncestor
-        } else if let defaultBranch = latest.defaultBranch,
-                  let merged = status.verifiedMergedPullRequest(defaultBranch: defaultBranch,
-                                                               branchName: updatedBranch.name, localSHA: updatedBranch.sha) {
-            evidence = .githubVerified(prNumber: merged.number, mergedAt: merged.mergedAt!)
-        } else {
-            evidence = .none
-        }
-        branches[latestIndex] = updatedBranch.withMergeEvidence(evidence, github: status)
+        branches[latestIndex] = updatedBranch.resolvingMergeEvidence(defaultBranch: latest.defaultBranch, status: status)
         snapshot = RepositorySnapshot(path: latest.path, defaultBranch: latest.defaultBranch,
                                       branches: branches, refreshedAt: latest.refreshedAt)
         saveCurrentView()
@@ -611,15 +601,12 @@ final class ApplicationModel: ObservableObject {
             return nil
         }
         let previousBranch = branches[destinationIndex]
-        var updated = previousBranch.withRefreshIdentity(identity, github: .unavailable)
-        if identity.sha == previousBranch.sha, case .gitAncestor = previousBranch.mergeEvidence {
-            updated = updated.withMergeEvidence(.gitAncestor, github: .unavailable)
-        }
+        let updated = previousBranch.withRefreshIdentity(identity, github: .unavailable)
         let resolutionToken = refreshTargetResolutionToken
         let cachedStatuses = await github.cachedStatusesAsync(repositoryPath: target.path, branches: [updated])
         guard refreshTargetResolutionToken == resolutionToken, selectedPath == target.path else { return nil }
         let status = cachedStatuses[updated.id] ?? .unavailable
-        branches[destinationIndex] = updated.withGitHubStatus(status)
+        branches[destinationIndex] = updated.resolvingMergeEvidence(defaultBranch: current.defaultBranch, status: status)
         snapshot = RepositorySnapshot(path: current.path, defaultBranch: current.defaultBranch,
                                       branches: branches, refreshedAt: current.refreshedAt)
         saveCurrentView()
@@ -714,6 +701,12 @@ final class ApplicationModel: ObservableObject {
         guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path, let branch = selectedBranch() else { return }
         let cleanup = self.cleanup
         requestPreview { cleanup.previewDeleteBranch(snapshot: snapshot, name: branch.name) }
+    }
+
+    func requestDeleteSelectedBranchAndWorktrees() {
+        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path, let branch = selectedBranch() else { return }
+        let cleanup = self.cleanup
+        requestPreview { cleanup.previewDeleteBranchAndWorktrees(snapshot: snapshot, name: branch.name) }
     }
 
     func requestDeleteMergedBranches() {
@@ -1014,6 +1007,12 @@ struct ContentView: View {
                                             Button("Delete Branch…") {
                                                 model.selectBranch(id: branch.id)
                                                 model.requestCleanupAfterMenuDismissal { model.requestDeleteSelectedBranch() }
+                                            }
+                                            if !branch.worktrees.isEmpty {
+                                                Button("Remove Worktree and Delete Branch…") {
+                                                    model.selectBranch(id: branch.id)
+                                                    model.requestCleanupAfterMenuDismissal { model.requestDeleteSelectedBranchAndWorktrees() }
+                                                }
                                             }
                                         }
                                     }
@@ -1323,7 +1322,14 @@ struct CleanupConfirmationView: View {
                 if let step = item.step { Text(step.rawValue).font(.subheadline.weight(.semibold)) }
                 Text(item.target).lineLimit(2)
                 if let detail = item.detail { Text(detail).font(.caption).foregroundStyle(item.allowed ? .green : .secondary) }
-                if let reason = item.reason { Text(reason.message).font(.caption).foregroundStyle(.orange) }
+                if let reason = item.reason {
+                    Text(reason.message).font(.caption).foregroundStyle(.orange)
+                    if case .processRunningDetails(let processes) = reason {
+                        ForEach(processes, id: \.self) { process in
+                            Text(process.summary).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
+                    }
+                }
             }
         }
     }
