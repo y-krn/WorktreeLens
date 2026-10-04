@@ -1970,8 +1970,13 @@ final class CoreTests: XCTestCase {
         let snapshot = try git.snapshot(repositoryPath: fixture.repository.path)
         let path = try XCTUnwrap(snapshot.branches.flatMap(\.worktrees).first { $0.branch == "feature" }?.path)
 
-        let busy = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: ProcessTableRunner(ps: "", lsof: "p7\nfcwd\nn\(featurePath.resolvingSymlinksInPath().path)/src\n")))
-        XCTAssertEqual(busy.previewRemoveWorktree(snapshot: snapshot, path: path).items.first?.reason, .processRunning)
+        let busy = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: ProcessTableRunner(ps: "7 zsh\n", lsof: "p7\nfcwd\nn\(featurePath.resolvingSymlinksInPath().path)/src\n")))
+        guard case .processRunningDetails(let processes)? = busy.previewRemoveWorktree(snapshot: snapshot, path: path).items.first?.reason else {
+            return XCTFail("expected process details")
+        }
+        XCTAssertEqual(processes.map(\.pid), [7])
+        XCTAssertEqual(processes[0].command, "zsh")
+        XCTAssertTrue(processes[0].cwd.hasPrefix(featurePath.path))
         let idlePreview = CleanupService(git: git, sessions: SessionService(home: fixture.root.appendingPathComponent("no-sessions").path, runner: StaticRunner(output: ""))).previewRemoveWorktree(snapshot: snapshot, path: path)
         XCTAssertTrue(idlePreview.items[0].allowed)
         XCTAssertTrue(busy.execute(idlePreview).isEmpty, "a process appearing after preview blocks removal")
@@ -2041,6 +2046,37 @@ final class CoreTests: XCTestCase {
     private func verifiedGitHubFixture(number: Int, sha: String, branch: String = "feature") throws -> (GitHubService, DisplayScriptTransport) {
         let payload = try JSONSerialization.data(withJSONObject: [displayPR(number: number, branch: branch, sha: sha)])
         return scannerDisplayFixture(pr: payload)
+    }
+
+    func testRebasedPatchEquivalentBranchCanBeDeletedWithExpectedSHA() async throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try Data("main-only\n".utf8).write(to: fixture.repository.appendingPathComponent("main-only.txt"))
+        _ = try runGit(["-C", fixture.repository.path, "add", "main-only.txt"])
+        _ = try runGit(["-C", fixture.repository.path, "commit", "-m", "main-only"])
+        _ = try runGit(["-C", fixture.repository.path, "cherry-pick", fixture.featureSHA])
+        let git = GitService()
+        let branch = try XCTUnwrap(try git.snapshot(repositoryPath: fixture.repository.path).branches.first { $0.name == "feature" })
+        XCTAssertEqual(branch.mergeEvidence, .rebasedEquivalent)
+        XCTAssertEqual(branch.mergeStatus, "Integrated · rebased equivalent")
+        let preview = CleanupService(git: git).previewDeleteBranch(
+            snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch]), name: "feature")
+        XCTAssertTrue(preview.allowedItems.first?.allowed == true)
+        let result = await CleanupService(git: git).executeAsync(preview)
+        XCTAssertEqual(result.deletedLocalBranches, ["feature"])
+        XCTAssertTrue(try runGit(["-C", fixture.repository.path, "branch", "--list", "feature"]).isEmpty)
+    }
+
+    func testUniquePatchRemainsBlockedAfterBranchSnapshot() throws {
+        let fixture = try makeFeatureRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let git = GitService()
+        let branch = try XCTUnwrap(try git.snapshot(repositoryPath: fixture.repository.path).branches.first { $0.name == "feature" })
+        XCTAssertEqual(branch.mergeEvidence, .uniqueCommitsRemain)
+        XCTAssertEqual(branch.mergeStatus, "Unique commits remain")
+        let preview = CleanupService(git: git).previewDeleteBranch(
+            snapshot: RepositorySnapshot(path: fixture.repository.path, defaultBranch: "main", branches: [branch]), name: "feature")
+        XCTAssertFalse(preview.items.first?.allowed ?? true)
     }
 
     private func makeFeatureRepository() throws -> (root: URL, repository: URL, featureSHA: String) {

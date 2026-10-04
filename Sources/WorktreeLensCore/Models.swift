@@ -116,6 +116,10 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
         switch mergeEvidence {
         case .gitAncestor: return "Merged · Git"
         case .githubVerified(let prNumber, _): return "Merged · GitHub verified · PR #\(prNumber)"
+        case .stackedPR: return "Merged · stacked PR"
+        case .rebasedEquivalent: return "Integrated · rebased equivalent"
+        case .uniqueCommitsRemain: return "Unique commits remain"
+        case .verificationUnavailable: return "Verification unavailable"
         case .none: return github.mergeEvidenceLoaded ? "Not merged" : "GitHub verification unavailable"
         }
     }
@@ -144,11 +148,17 @@ public struct BranchInfo: Identifiable, Hashable, Sendable {
 public enum MergeEvidence: Hashable, Sendable {
     case gitAncestor
     case githubVerified(prNumber: Int, mergedAt: Date)
+    case stackedPR
+    case rebasedEquivalent
+    case uniqueCommitsRemain
+    case verificationUnavailable
     case none
 
     public var isMerged: Bool {
-        if case .none = self { return false }
-        return true
+        switch self {
+        case .gitAncestor, .githubVerified, .stackedPR, .rebasedEquivalent: return true
+        case .uniqueCommitsRemain, .verificationUnavailable, .none: return false
+        }
     }
 }
 
@@ -369,6 +379,7 @@ public enum CleanupBlockReason: Equatable, Sendable {
     case githubVerificationUnavailable
     case mainWorktree
     case processRunning
+    case processRunningDetails([WorktreeProcess])
     case commandFailed(String)
 
     public var message: String {
@@ -386,8 +397,26 @@ public enum CleanupBlockReason: Equatable, Sendable {
         case .githubVerificationUnavailable: return "GitHub verification unavailable"
         case .mainWorktree: return "Main worktree cannot be removed"
         case .processRunning: return "Process running in worktree"
+        case .processRunningDetails: return "Process running in worktree"
         case .commandFailed(let message): return message
         }
+    }
+}
+
+public struct WorktreeProcess: Hashable, Sendable {
+    public let pid: Int
+    public let command: String?
+    public let cwd: String
+
+    public init(pid: Int, command: String? = nil, cwd: String) {
+        self.pid = pid
+        self.command = command
+        self.cwd = cwd
+    }
+
+    public var summary: String {
+        let process = command ?? "process"
+        return pid > 0 ? "\(process) · PID \(pid) · cwd \(cwd)" : "\(process) · cwd \(cwd)"
     }
 }
 

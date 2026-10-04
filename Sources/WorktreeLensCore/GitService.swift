@@ -29,14 +29,16 @@ public struct CleanupBranchState: Sendable {
     public let isDefaultBranch: Bool
     public let worktreePaths: [String]
     public let isGitAncestor: Bool
+    public let isPatchEquivalent: Bool
 
-    public init(name: String, sha: String, defaultBranch: String?, isDefaultBranch: Bool, worktreePaths: [String], isGitAncestor: Bool) {
+    public init(name: String, sha: String, defaultBranch: String?, isDefaultBranch: Bool, worktreePaths: [String], isGitAncestor: Bool, isPatchEquivalent: Bool = false) {
         self.name = name
         self.sha = sha
         self.defaultBranch = defaultBranch
         self.isDefaultBranch = isDefaultBranch
         self.worktreePaths = worktreePaths
         self.isGitAncestor = isGitAncestor
+        self.isPatchEquivalent = isPatchEquivalent
     }
 }
 
@@ -253,7 +255,7 @@ public final class GitService: @unchecked Sendable {
     }
 
     /// Revalidates only the state required before deleting one branch.
-    public func cleanupBranchState(repositoryPath: String, name: String, canonicalPath: String? = nil, verifyGitAncestor: Bool = true, context: CleanupRepositoryContext? = nil) throws -> CleanupBranchState? {
+    public func cleanupBranchState(repositoryPath: String, name: String, canonicalPath: String? = nil, verifyGitAncestor: Bool = true, verifyPatchEquivalence: Bool = false, context: CleanupRepositoryContext? = nil) throws -> CleanupBranchState? {
         let root = try context?.path ?? canonicalPath ?? canonicalRepositoryPath(repositoryPath)
         let defaultBranch: DefaultBranch?
         if let context {
@@ -278,7 +280,8 @@ public final class GitService: @unchecked Sendable {
             defaultBranch: defaultBranch?.name,
             isDefaultBranch: defaultBranch?.name == name,
             worktreePaths: worktreePaths,
-            isGitAncestor: verifyGitAncestor && (defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false)
+            isGitAncestor: verifyGitAncestor && (defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false),
+            isPatchEquivalent: verifyPatchEquivalence && (defaultBranch.map { patchEquivalence(root: root, branch: name, defaultRef: $0.ref) == .rebasedEquivalent } ?? false)
         )
     }
 
@@ -403,8 +406,12 @@ public final class GitService: @unchecked Sendable {
         }
         let branchWorktrees = worktrees.filter { $0.branch == name }
         let relation = includeCleanupUIData ? (defaultBranch.flatMap { defaultDelta(root: root, branch: name, defaultRef: $0.ref) } ?? (ahead: 0, behind: 0)) : (ahead: 0, behind: 0)
-        let merged = includeMergeEvidence && (defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false)
-        return BranchInfo(id: name, name: name, sha: fields[1], upstream: fields[2].isEmpty ? nil : fields[2], ahead: aheadBehind.ahead, behind: aheadBehind.behind, isMerged: merged, remoteGone: tracking.contains("gone"), lastCommitAt: strictDate(fields[4]), isDefaultBranch: defaultBranch?.name == name, defaultAhead: relation.ahead, defaultBehind: relation.behind, worktrees: branchWorktrees, mergeEvidence: merged ? .gitAncestor : MergeEvidence.none)
+        let ancestor = includeMergeEvidence && (defaultBranch.map { isAncestor(root: root, branch: name, defaultRef: $0.ref) } ?? false)
+        let patchStatus = includeMergeEvidence && !ancestor
+            ? defaultBranch.flatMap { patchEquivalence(root: root, branch: name, defaultRef: $0.ref) }
+            : nil
+        let mergeEvidence: MergeEvidence = ancestor ? .gitAncestor : (patchStatus ?? .none)
+        return BranchInfo(id: name, name: name, sha: fields[1], upstream: fields[2].isEmpty ? nil : fields[2], ahead: aheadBehind.ahead, behind: aheadBehind.behind, isMerged: mergeEvidence.isMerged, remoteGone: tracking.contains("gone"), lastCommitAt: strictDate(fields[4]), isDefaultBranch: defaultBranch?.name == name, defaultAhead: relation.ahead, defaultBehind: relation.behind, worktrees: branchWorktrees, mergeEvidence: mergeEvidence)
     }
 
     private func worktreeList(repositoryPath: String, defaultBranch: DefaultBranch?, sessions: [SessionRecord]) throws -> [WorktreeInfo] {
@@ -443,6 +450,18 @@ public final class GitService: @unchecked Sendable {
 
     private func isAncestor(root: String, branch: String, defaultRef: String) -> Bool {
         (try? run(["-C", root, "merge-base", "--is-ancestor", branch, defaultRef])).map { $0.succeeded } ?? false
+    }
+
+    private func patchEquivalence(root: String, branch: String, defaultRef: String) -> MergeEvidence? {
+        let branchRef = "refs/heads/\(branch)"
+        guard let mergeCommits = try? run(["-C", root, "rev-list", "--merges", "\(defaultRef)..\(branchRef)"]),
+              mergeCommits.succeeded, mergeCommits.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let commits = try? run(["-C", root, "rev-list", "--no-merges", "\(defaultRef)..\(branchRef)"]), commits.succeeded else { return .verificationUnavailable }
+        guard !commits.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .some(.none) }
+        guard let cherry = try? run(["-C", root, "cherry", defaultRef, branchRef]), cherry.succeeded else { return .verificationUnavailable }
+        let statuses = cherry.stdout.split(whereSeparator: \.isNewline).compactMap { $0.first }
+        guard !statuses.isEmpty, statuses.allSatisfy({ $0 == "-" }) else { return .uniqueCommitsRemain }
+        return .rebasedEquivalent
     }
 
     private func defaultDelta(root: String, branch: String, defaultRef: String) -> (ahead: Int, behind: Int)? {

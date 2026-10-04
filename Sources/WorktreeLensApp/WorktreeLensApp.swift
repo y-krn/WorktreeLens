@@ -716,6 +716,12 @@ final class ApplicationModel: ObservableObject {
         requestPreview { cleanup.previewDeleteBranch(snapshot: snapshot, name: branch.name) }
     }
 
+    func requestDeleteSelectedBranchAndWorktrees() {
+        guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path, let branch = selectedBranch() else { return }
+        let cleanup = self.cleanup
+        requestPreview { cleanup.previewDeleteBranchAndWorktrees(snapshot: snapshot, name: branch.name) }
+    }
+
     func requestDeleteMergedBranches() {
         guard canRequestCleanup(), let path = selectedPath, let snapshot, snapshot.path == path else { return }
         let cleanup = self.cleanup
@@ -1014,6 +1020,12 @@ struct ContentView: View {
                                             Button("Delete Branch…") {
                                                 model.selectBranch(id: branch.id)
                                                 model.requestCleanupAfterMenuDismissal { model.requestDeleteSelectedBranch() }
+                                            }
+                                            if !branch.worktrees.isEmpty {
+                                                Button("Remove Worktree and Delete Branch…") {
+                                                    model.selectBranch(id: branch.id)
+                                                    model.requestCleanupAfterMenuDismissal { model.requestDeleteSelectedBranchAndWorktrees() }
+                                                }
                                             }
                                         }
                                     }
@@ -1323,7 +1335,14 @@ struct CleanupConfirmationView: View {
                 if let step = item.step { Text(step.rawValue).font(.subheadline.weight(.semibold)) }
                 Text(item.target).lineLimit(2)
                 if let detail = item.detail { Text(detail).font(.caption).foregroundStyle(item.allowed ? .green : .secondary) }
-                if let reason = item.reason { Text(reason.message).font(.caption).foregroundStyle(.orange) }
+                if let reason = item.reason {
+                    Text(reason.message).font(.caption).foregroundStyle(.orange)
+                    if case .processRunningDetails(let processes) = reason {
+                        ForEach(processes, id: \.self) { process in
+                            Text(process.summary).font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+                        }
+                    }
+                }
             }
         }
     }
